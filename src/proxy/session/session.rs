@@ -4,7 +4,10 @@ use crate::proxy::session::frame::{
     CMD_SETTINGS, CMD_SYN, CMD_SYNACK, CMD_UPDATE_PADDING_SCHEME,
 };
 use crate::proxy::session::Stream;
-use crate::util::{string_map::{StringMap, StringMapExt}, PROGRAM_VERSION_NAME};
+use crate::util::{
+    string_map::{StringMap, StringMapExt},
+    PROGRAM_VERSION_NAME,
+};
 use std::collections::HashMap;
 use std::io;
 use std::sync::Arc;
@@ -21,6 +24,7 @@ pub struct Session {
     buffering: Arc<Mutex<bool>>,
     buffer: Arc<Mutex<Vec<u8>>>,
     pkt_counter: Arc<Mutex<u32>>,
+    idle_notify: Arc<tokio::sync::Notify>,
 }
 
 impl Session {
@@ -39,6 +43,7 @@ impl Session {
             buffering: Arc::new(Mutex::new(false)),
             buffer: Arc::new(Mutex::new(Vec::new())),
             pkt_counter: Arc::new(Mutex::new(0)),
+            idle_notify: Arc::new(tokio::sync::Notify::new()),
         }
     }
     
@@ -58,6 +63,7 @@ impl Session {
             buffering: Arc::new(Mutex::new(false)),
             buffer: Arc::new(Mutex::new(Vec::new())),
             pkt_counter: Arc::new(Mutex::new(0)),
+            idle_notify: Arc::new(tokio::sync::Notify::new()),
         }
     }
     
@@ -122,6 +128,9 @@ impl Session {
                 let mut streams = self.streams.lock().await;
                 if let Some(stream) = streams.remove(&sid) {
                     stream.close().await?;
+                }
+                if streams.is_empty() {
+                    self.idle_notify.notify_waiters();
                 }
             }
             CMD_SETTINGS => {
@@ -204,6 +213,9 @@ impl Session {
         
         let mut streams = self.streams.lock().await;
         streams.remove(&sid);
+        if streams.is_empty() {
+            self.idle_notify.notify_waiters();
+        }
         
         Ok(())
     }
@@ -231,6 +243,10 @@ impl Session {
     pub async fn peer_version(&self) -> u8 {
         *self.peer_version.lock().await
     }
+
+    pub async fn wait_for_idle(&self) {
+        self.idle_notify.notified().await;
+    }
 }
 
 impl Clone for Session {
@@ -246,6 +262,7 @@ impl Clone for Session {
             buffering: self.buffering.clone(),
             buffer: self.buffer.clone(),
             pkt_counter: self.pkt_counter.clone(),
+            idle_notify: self.idle_notify.clone(),
         }
     }
 }
