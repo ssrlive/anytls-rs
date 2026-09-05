@@ -54,5 +54,5 @@ pub const PROGRAM_VERSION_NAME: &str = concat!(env!("CARGO_PKG_NAME"), "/", env!
 // protocol changes that affect the "v" settings field used during session
 // negotiation.
 pub const PROTOCOL_VERSION: u8 = 2;
-// Minimum protocol version we remain compatible with (legacy clients).
+// Minimum peer version required for the version-2 protocol features.
 pub const MIN_PROTOCOL_VERSION: u8 = 2;

@@ -706,7 +706,6 @@ async fn handle_uot_datagram_stream(
 
     let outbound = create_uot_udp_outbound(sid.into(), outbound_socks5).await?;
     session.handshake_success().await?;
-
     let result: Result<(), BoxError> = async {
         loop {
             tokio::select! {
@@ -767,8 +766,8 @@ async fn handle_uot_connected_stream(
     if let Err(err) = ensure_uot_udp_outbound_ready(&outbound, &request.destination).await {
         log::debug!("Failed to prepare UDP outbound to {fixed_destination}: {err}");
         session.handshake_failure(&err.to_string()).await?;
-        session.terminate().await?;
-        return Err(err.into());
+        let _ = session.terminate().await;
+        return Ok(());
     }
 
     session.handshake_success().await?;
@@ -835,8 +834,8 @@ async fn handle_tcp_stream(
         Err(e) => {
             log::debug!("Failed to connect to {destination}: {e}");
             session.handshake_failure(&e.to_string()).await?;
-            session.terminate().await?;
-            return Err(e.into());
+            let _ = session.terminate().await;
+            return Ok(());
         }
     };
     let dest = if let Some(proxy_addr) = outbound_socks5 {
@@ -848,9 +847,7 @@ async fn handle_tcp_stream(
     };
     log::info!("Session #{sid} TCP relay established from {client} to {dest}");
 
-    // Report success
     session.handshake_success().await?;
-
     log::debug!("Starting relay to destination {destination}");
     // Relay data. Keep using the reader that parsed the target address: it owns
     // the pipe receiver and may retain bytes that arrived with the address.

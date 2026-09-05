@@ -336,6 +336,20 @@ impl ProtocolHost for Session {
         Ok(())
     }
 
+    async fn resolve_stream_handshake(&self, sid: u32, message: String) -> std::io::Result<()> {
+        if message.is_empty() {
+            log::trace!("SYNACK succeeded for stream sid={sid}");
+            // The Go implementation closes the whole Session on a SYNACK error.
+            // That loses unrelated multiplexed streams, so isolate the failure to
+            // this stream and keep the Session available for the others.
+        } else if let Some(stream) = self.remove_stream(sid).await {
+            stream
+                .close_from_peer(Some(std::io::Error::other(format!("remote: {message}"))))
+                .await;
+        }
+        Ok(())
+    }
+
     async fn release_write_buffering(&self) {
         self.writer_state.set_buffering(false).await;
     }
@@ -348,7 +362,7 @@ mod tests {
     use bytes::Bytes;
     use std::sync::Arc;
     use std::time::Duration;
-    use tokio::io::duplex;
+    use tokio::io::{AsyncReadExt, duplex};
     use tokio::time::timeout;
 
     fn test_session() -> Session {
@@ -418,6 +432,22 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn stream_handshake_failure_does_not_terminate_session() {
+        let session = test_session();
+        session.ensure_incoming_stream(2).await.expect("first stream should be created");
+        session.ensure_incoming_stream(3).await.expect("second stream should be created");
+
+        session
+            .resolve_stream_handshake(2, "upstream refused".to_string())
+            .await
+            .expect("handshake failure should be routed");
+
+        assert!(!session.is_terminated().await);
+        assert!(session.stream_for_sid(2).await.is_none());
+        assert!(session.stream_for_sid(3).await.is_some());
+    }
+
+    #[tokio::test]
     async fn idle_waiter_observes_last_stream_closure() {
         let session = test_session();
         session.ensure_incoming_stream(7).await.expect("stream should be created");
@@ -453,7 +483,19 @@ mod tests {
 
     #[tokio::test]
     async fn stream_limit_rejects_extra_streams() {
-        let session = test_session();
+        let (io, mut peer) = duplex(1024);
+        tokio::spawn(async move {
+            let mut buffer = [0_u8; 1024];
+            while peer.read(&mut buffer).await.is_ok() {}
+        });
+        let session = Session::new_with_protocol(
+            Box::new(io),
+            false,
+            None,
+            Arc::new(crate::runtime::AnyTlsProtocol),
+            crate::core::State::new(crate::core::PaddingFactory::default()),
+            crate::runtime::WriterRuntimeState::new(false),
+        );
         session.open_stream(1).await.expect("first stream should open");
         let error = match session.open_stream(1).await {
             Ok(_) => panic!("second stream should exceed the limit"),

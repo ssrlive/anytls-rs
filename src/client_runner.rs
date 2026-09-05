@@ -361,6 +361,9 @@ pub async fn runner_execute(cancel_token: CancellationToken, args: ClientArgs) -
         Box::pin(async move {
             let proxy_stream = client.create_stream().await?;
             let addr_data: Vec<u8> = dst.into();
+            // Opening a stream is non-blocking in v2: queue the target
+            // address immediately and let the core SYNACK watchdog handle a
+            // missing or failed remote handshake.
             let mut adapter = StreamRw::new(proxy_stream);
             adapter.write_all(&addr_data).await?;
             let boxed: BoxedStream = Box::new(adapter);

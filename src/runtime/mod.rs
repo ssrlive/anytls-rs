@@ -309,6 +309,9 @@ impl Protocol for AnyTlsProtocol {
         tokio::spawn(async move {
             while let Some((frame, ack)) = rx.recv().await {
                 let res = async {
+                    if frame.cmd == Command::SynAck {
+                        log::debug!("Writing SYNACK frame sid={}", frame.sid);
+                    }
                     Self::write_conn(&mut writer, frame.to_bytes().to_vec(), &state, &writer_state).await?;
                     writer.flush().await
                 }
@@ -352,6 +355,13 @@ impl Protocol for AnyTlsProtocol {
                 log::error!("Alert from server: {}", message);
             }
             return Err(std::io::Error::other("Alert received"));
+        }
+
+        if host.is_client() && frame.cmd == Command::SynAck {
+            log::debug!("Received SYNACK frame sid={} len={}", frame.sid, frame.data.len());
+            let message = String::from_utf8_lossy(frame.data.as_ref()).to_string();
+            host.resolve_stream_handshake(frame.sid, message.clone()).await?;
+            return Ok(());
         }
 
         if should_warn {

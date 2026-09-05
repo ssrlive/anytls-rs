@@ -24,10 +24,6 @@ After authentication is completed, the client & server start a session layer eve
 
 **The client must immediately send `cmdSettings` when starting a new session.**
 
-Important: Multiplexing removed
-
-Starting with this release, the implementation has removed stream-level multiplexing. Each `Session` now provides a single logical stream (historically identified as `sid == 1`). The decision was made because multiplexing added implementation complexity and increased the risk of subtle bugs and deadlocks in production. If you need parallel logical channels, run multiple sessions or use an external connection-pool manager.
-
 #### command
 
 ```
@@ -258,21 +254,3 @@ Since version 2 clients can expect a reply from the server when opening a stream
 
 Current Go implementation note:
 The Go implementation starts this timeout only when `peerVersion >= 2` and the opened `streamId >= 2`, and the timeout is currently fixed at 3 seconds.
-
-**Compatibility Strategy**
-
-To make upgrades safer across implementations, this project exposes two version symbols used during session negotiation:
-
-- **PROTOCOL_VERSION**: the current protocol version implemented by this codebase (set to `2`).
-- **MIN_PROTOCOL_VERSION**: the minimum protocol version this implementation will accept for compatibility (set to `2`).
-
-Negotiation and runtime behavior:
-
-- A client advertises its supported version in `cmdSettings` (`v=<number>`). The server records the peer's declared version if it is >= `MIN_PROTOCOL_VERSION` and echoes that version back in `cmdServerSettings`.
-- Protocol features are gated by the negotiated peer version. For example, `cmdSYNACK`, heartbeats, and `cmdServerSettings` are only used when the negotiated version indicates support.
-- If a peer declares a version lower than `MIN_PROTOCOL_VERSION`, the server may reject the session and send `cmdAlert` explaining the reason.
-
-Upgrade guidance:
-
-- Bump `PROTOCOL_VERSION` only when introducing incompatible changes. Keep `MIN_PROTOCOL_VERSION` on a previous stable value to allow staged rollouts and interoperability with older clients/servers.
-- Add automated tests (unit/integration) that simulate older peers (e.g., `v=2`) to ensure compatibility is preserved; these tests are recommended to run in CI.

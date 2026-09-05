@@ -48,6 +48,12 @@ impl Engine {
                 });
             }
             Command::Syn if !is_client => {
+                log::debug!(
+                    "Server received SYN sid={} settings={} peer_version={}",
+                    frame.sid,
+                    state.received_settings_from_client(),
+                    state.peer_version()
+                );
                 if !state.received_settings_from_client() {
                     actions.push(ProtocolAction::AlertAndFail {
                         message: "client did not send its settings".to_string(),
@@ -126,4 +132,32 @@ impl Engine {
     }
 
     // `on_open_stream` removed — stream opening is handled locally by Session.
+}
+
+#[cfg(test)]
+mod tests {
+    use super::Engine;
+    use crate::core::{Command, Frame, PaddingFactory, State};
+
+    #[test]
+    fn server_accepts_syn_after_settings() {
+        let state = State::new(PaddingFactory::default());
+        state.mark_received_settings_from_client();
+
+        let actions = Engine::on_frame(&state, false, &Frame::new(Command::Syn, 7)).expect("server SYN should be accepted");
+
+        assert!(matches!(
+            actions.first(),
+            Some(crate::core::ProtocolAction::EnsureIncomingStream { sid: 7 })
+        ));
+    }
+
+    #[test]
+    fn server_rejects_syn_before_settings() {
+        let state = State::new(PaddingFactory::default());
+
+        let actions = Engine::on_frame(&state, false, &Frame::new(Command::Syn, 7)).expect("server SYN should be accepted");
+
+        assert!(matches!(actions.first(), Some(crate::core::ProtocolAction::AlertAndFail { .. })));
+    }
 }

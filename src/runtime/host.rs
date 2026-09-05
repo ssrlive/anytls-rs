@@ -25,5 +25,7 @@ pub trait ProtocolHost: Send + Sync {
     // indicated a protocol-level termination or when an unrecoverable error
     // occurs. `message` may contain an optional reason provided by the peer.
     async fn terminate_session(&self, sid: u32, message: Option<String>) -> std::io::Result<()>;
+
+    async fn resolve_stream_handshake(&self, sid: u32, message: String) -> std::io::Result<()>;
     async fn release_write_buffering(&self);
 }
