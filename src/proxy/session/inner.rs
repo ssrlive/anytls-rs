@@ -336,6 +336,13 @@ impl ProtocolHost for Session {
         Ok(())
     }
 
+    async fn resolve_stream_handshake(&self, sid: u32, message: String) -> std::io::Result<()> {
+        if let Some(stream) = self.stream_for_sid(sid).await {
+            stream.resolve_handshake(message).await;
+        }
+        Ok(())
+    }
+
     async fn release_write_buffering(&self) {
         self.writer_state.set_buffering(false).await;
     }

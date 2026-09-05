@@ -354,6 +354,15 @@ impl Protocol for AnyTlsProtocol {
             return Err(std::io::Error::other("Alert received"));
         }
 
+        if host.is_client() && frame.cmd == Command::SynAck {
+            let message = String::from_utf8_lossy(frame.data.as_ref()).to_string();
+            host.resolve_stream_handshake(frame.sid, message.clone()).await?;
+            if !message.is_empty() {
+                host.terminate_session(frame.sid, Some(message)).await?;
+            }
+            return Ok(());
+        }
+
         if should_warn {
             log::warn!(
                 "Session received unexpected command: cmd={}, sid={}, len={}",

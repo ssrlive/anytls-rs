@@ -4,7 +4,7 @@ use crate::runtime::StreamProtocolHooks;
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Weak};
-use tokio::sync::{Mutex, mpsc::Sender, watch};
+use tokio::sync::{Mutex, mpsc::Sender, oneshot, watch};
 
 pub struct Stream {
     id: u32,
@@ -14,6 +14,8 @@ pub struct Stream {
     streams: Weak<Mutex<HashMap<u32, Arc<Stream>>>>,
     idle_state: Weak<watch::Sender<bool>>,
     protocol_hooks: Arc<dyn StreamProtocolHooks>,
+    handshake_tx: Mutex<Option<oneshot::Sender<Result<(), String>>>>,
+    handshake_rx: Mutex<Option<oneshot::Receiver<Result<(), String>>>>,
     closed: AtomicBool,
 }
 
@@ -26,6 +28,7 @@ impl Stream {
         protocol_hooks: Arc<dyn StreamProtocolHooks>,
     ) -> Self {
         let (pipe_reader, pipe_writer) = pipe();
+        let (handshake_tx, handshake_rx) = oneshot::channel();
         Self {
             id,
             pipe_reader,
@@ -34,6 +37,8 @@ impl Stream {
             streams,
             idle_state,
             protocol_hooks,
+            handshake_tx: Mutex::new(Some(handshake_tx)),
+            handshake_rx: Mutex::new(Some(handshake_rx)),
             closed: AtomicBool::new(false),
         }
     }
@@ -71,6 +76,21 @@ impl Stream {
             .map_err(|_| std::io::Error::new(std::io::ErrorKind::BrokenPipe, "Session closed"))
     }
 
+    pub async fn wait_for_handshake(&self, timeout: std::time::Duration) -> std::io::Result<()> {
+        let receiver = self
+            .handshake_rx
+            .lock()
+            .await
+            .take()
+            .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::AlreadyExists, "Handshake already awaited"))?;
+        match tokio::time::timeout(timeout, receiver).await {
+            Ok(Ok(Ok(()))) => Ok(()),
+            Ok(Ok(Err(error))) => Err(std::io::Error::new(std::io::ErrorKind::ConnectionRefused, error)),
+            Ok(Err(_)) => Err(std::io::Error::new(std::io::ErrorKind::BrokenPipe, "Session closed")),
+            Err(_) => Err(std::io::Error::new(std::io::ErrorKind::TimedOut, "Stream handshake timed out")),
+        }
+    }
+
     pub async fn push_data(&self, buf: &[u8]) -> std::io::Result<usize> {
         if self.closed.load(Ordering::Acquire) {
             return Err(std::io::Error::new(std::io::ErrorKind::BrokenPipe, "Stream closed"));
@@ -83,6 +103,7 @@ impl Stream {
             return Ok(());
         }
 
+        self.resolve_handshake("Stream closed".to_string()).await;
         self.remove_from_session().await;
         self.pipe_reader.close_with_error(None);
         self.frame_tx
@@ -92,12 +113,20 @@ impl Stream {
     }
 
     pub(crate) async fn close_from_peer(&self, error: Option<std::io::Error>) {
+        self.resolve_handshake(
+            error
+                .as_ref()
+                .map_or_else(|| "Remote stream closed".to_string(), ToString::to_string),
+        )
+        .await;
         if self.mark_closed() {
             self.pipe_reader.finish_stream(error).await;
         }
     }
 
     pub(crate) async fn close_from_session(&self, error: Option<std::io::Error>) {
+        self.resolve_handshake(error.as_ref().map_or_else(|| "Session closed".to_string(), ToString::to_string))
+            .await;
         if self.mark_closed() {
             self.pipe_reader.finish_stream(error).await;
         }
@@ -109,6 +138,12 @@ impl Stream {
 
     pub async fn handshake_success(&self) -> std::io::Result<()> {
         self.protocol_hooks.handshake_success(self.id).await
+    }
+
+    pub(crate) async fn resolve_handshake(&self, message: String) {
+        if let Some(sender) = self.handshake_tx.lock().await.take() {
+            let _ = sender.send(if message.is_empty() { Ok(()) } else { Err(message) });
+        }
     }
 
     fn mark_closed(&self) -> bool {
