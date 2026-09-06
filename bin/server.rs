@@ -932,7 +932,7 @@ async fn handle_tcp_stream(
                     // handle the next target address.
                     Ok(0) => {
                         log::debug!("Outbound EOF from {}", destination);
-                        stream_write.close().await?;
+                        stream_write.shutdown_write().await?;
                         break Ok(());
                     }
                     Ok(n) => {

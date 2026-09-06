@@ -46,13 +46,41 @@ impl Engine {
                     format!("{} cannot use control sid 0", frame.cmd),
                 ));
             }
-            Command::Settings | Command::Alert | Command::UpdatePaddingScheme | Command::ServerSettings if frame.sid != 0 => {
+            Command::Settings
+            | Command::Alert
+            | Command::UpdatePaddingScheme
+            | Command::HeartRequest
+            | Command::HeartResponse
+            | Command::ServerSettings
+                if frame.sid != 0 =>
+            {
                 return Err(std::io::Error::new(
                     std::io::ErrorKind::InvalidData,
                     format!("{} must use control sid 0", frame.cmd),
                 ));
             }
             _ => {}
+        }
+
+        let payload_forbidden = matches!(
+            frame.cmd,
+            Command::Syn | Command::Fin | Command::HeartRequest | Command::HeartResponse
+        );
+        if payload_forbidden && !frame.data.is_empty() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!("{} cannot carry a payload", frame.cmd),
+            ));
+        }
+        if matches!(
+            frame.cmd,
+            Command::Settings | Command::ServerSettings | Command::UpdatePaddingScheme
+        ) && frame.data.is_empty()
+        {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!("{} requires a payload", frame.cmd),
+            ));
         }
 
         match frame.cmd {
@@ -81,7 +109,7 @@ impl Engine {
             Command::Fin => {
                 actions.push(ProtocolAction::CloseLocalStream { sid: frame.sid });
             }
-            Command::Settings if !is_client && !frame.data.is_empty() => {
+            Command::Settings if !is_client => {
                 if state.received_settings_from_client() {
                     actions.push(ProtocolAction::AlertAndFail {
                         message: "duplicate client settings".to_string(),
@@ -130,7 +158,7 @@ impl Engine {
                     server_settings.to_bytes().into(),
                 )));
             }
-            Command::UpdatePaddingScheme if !frame.data.is_empty() && is_client => {
+            Command::UpdatePaddingScheme if is_client => {
                 if let Some(factory) = PaddingFactory::new(frame.data.as_ref()) {
                     state.set_padding(factory);
                 }
@@ -138,7 +166,7 @@ impl Engine {
             Command::HeartRequest => {
                 actions.push(ProtocolAction::SendFrame(Frame::new(Command::HeartResponse, frame.sid)));
             }
-            Command::ServerSettings if !frame.data.is_empty() && is_client => {
+            Command::ServerSettings if is_client => {
                 let settings = StringMap::from_bytes(frame.data.as_ref());
                 if let Some(version) = settings.get("v").and_then(|value| value.parse::<u8>().ok()) {
                     state.set_peer_version(version);
@@ -195,6 +223,21 @@ mod tests {
     fn rejects_payload_on_control_sid() {
         let state = State::new(PaddingFactory::default());
         let error = Engine::on_frame(&state, false, &Frame::new(Command::Psh, 0)).expect_err("control SID must be rejected");
+        assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
+    }
+
+    #[test]
+    fn rejects_heartbeat_on_stream_sid() {
+        let state = State::new(PaddingFactory::default());
+        let error = Engine::on_frame(&state, false, &Frame::new(Command::HeartRequest, 1)).expect_err("heartbeat must use control SID");
+        assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
+    }
+
+    #[test]
+    fn rejects_payload_on_fin() {
+        let state = State::new(PaddingFactory::default());
+        let frame = Frame::with_data(Command::Fin, 1, bytes::Bytes::from_static(b"unexpected"));
+        let error = Engine::on_frame(&state, false, &frame).expect_err("FIN must not carry a payload");
         assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
     }
 

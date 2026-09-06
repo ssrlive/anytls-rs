@@ -237,8 +237,8 @@ This protocol update is mainly to deal with the problem of tunnel connection stu
 The following features should only be enabled when both your server and client support version 2. Otherwise, both ends will run according to version 1.
 
 - Can use cmdSYNACK to report server outbound connection status, and detect and recover stuck tunnel connections
-- `cmdHeartRequest` and `cmdHeartResponse` are defined for keep-alive, and the current Go implementation passively replies to `cmdHeartRequest`.
-  Active keepalive checking and recovery based on heartbeat responses are not implemented yet.
+- `cmdHeartRequest` and `cmdHeartResponse` are used for carrier keep-alive. This implementation sends periodic requests,
+  expects a response within the heartbeat timeout, and terminates the carrier when the peer stops responding.
 - Server can send negotiation information to client (cmdServerSettings)
 
 Version negotiation principle:

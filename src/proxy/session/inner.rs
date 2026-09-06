@@ -1,7 +1,10 @@
 use crate::AsyncReadWrite;
 use crate::core::{Command, Frame, HEADER_OVERHEAD_SIZE, State};
 use crate::proxy::session::Stream;
-use crate::runtime::{DataWrite, FrameWrite, MAX_QUEUED_FRAME_BYTES, Protocol, ProtocolHost, WriterRuntimeState, spawn_data_scheduler};
+use crate::runtime::{
+    DataWrite, FrameWrite, MAX_QUEUED_CONTROL_BYTES, MAX_QUEUED_FRAME_BYTES, MAX_QUEUED_INBOUND_BYTES, Protocol, ProtocolHost,
+    WriterRuntimeState, spawn_data_scheduler,
+};
 use async_trait::async_trait;
 use bytes::Bytes;
 use std::collections::HashMap;
@@ -32,6 +35,9 @@ pub struct Session {
     pub(crate) frame_tx: Sender<FrameWrite>,
     data_enqueue_tx: Sender<DataWrite>,
     write_budget: Arc<Semaphore>,
+    control_budget: Arc<Semaphore>,
+    inbound_budget: Arc<Semaphore>,
+    heartbeat_sent: Mutex<Option<tokio::time::Instant>>,
 }
 
 impl Session {
@@ -49,6 +55,8 @@ impl Session {
         let (data_enqueue_tx, data_enqueue_rx) = tokio::sync::mpsc::channel::<DataWrite>(100);
         spawn_data_scheduler(data_enqueue_rx, frame_tx.clone());
         let write_budget = Arc::new(Semaphore::new(MAX_QUEUED_FRAME_BYTES));
+        let control_budget = Arc::new(Semaphore::new(MAX_QUEUED_CONTROL_BYTES));
+        let inbound_budget = Arc::new(Semaphore::new(MAX_QUEUED_INBOUND_BYTES));
         let (idle_state, _) = watch::channel(true);
         protocol.spawn_writer_task(writer, control_rx, data_rx, protocol_state.clone(), writer_state.clone());
 
@@ -71,6 +79,9 @@ impl Session {
             frame_tx,
             data_enqueue_tx,
             write_budget,
+            control_budget,
+            inbound_budget,
+            heartbeat_sent: Mutex::new(None),
         }
     }
 
@@ -124,7 +135,7 @@ impl Session {
             (sid, stream)
         };
 
-        if let Err(error) = self.write_frame(Frame::new(Command::Syn, sid)).await {
+        if let Err(error) = self.write_frame_sync(Frame::new(Command::Syn, sid)).await {
             self.remove_stream(sid).await;
             stream.close_from_session(Some(std::io::Error::other(error.to_string()))).await;
             return Err(error);
@@ -135,7 +146,11 @@ impl Session {
 
     pub async fn write_frame(&self, frame: Frame) -> std::io::Result<usize> {
         let len = frame.data.len();
-        let budget = self.acquire_write_budget(len).await?;
+        let budget = if matches!(frame.cmd, Command::Psh) {
+            self.acquire_write_budget(len).await?
+        } else {
+            self.acquire_control_budget(len).await?
+        };
         if matches!(frame.cmd, Command::Psh) {
             self.data_enqueue_tx
                 .send(DataWrite {
@@ -156,7 +171,11 @@ impl Session {
 
     pub async fn write_frame_sync(&self, frame: Frame) -> std::io::Result<usize> {
         let len = frame.data.len();
-        let budget = self.acquire_write_budget(len).await?;
+        let budget = if matches!(frame.cmd, Command::Psh) {
+            self.acquire_write_budget(len).await?
+        } else {
+            self.acquire_control_budget(len).await?
+        };
         let (ack_tx, ack_rx) = tokio::sync::oneshot::channel();
         if matches!(frame.cmd, Command::Psh) {
             self.data_enqueue_tx
@@ -229,9 +248,9 @@ impl Session {
     fn new_stream(&self, sid: u32) -> Stream {
         Stream::new(
             sid,
-            self.control_tx.clone(),
             self.data_enqueue_tx.clone(),
             self.write_budget.clone(),
+            self.inbound_budget.clone(),
             Arc::downgrade(&self.streams),
             Arc::downgrade(&self.idle_state),
             self.protocol
@@ -240,8 +259,21 @@ impl Session {
     }
 
     async fn acquire_write_budget(&self, len: usize) -> std::io::Result<tokio::sync::OwnedSemaphorePermit> {
-        let permits = len.clamp(1, MAX_QUEUED_FRAME_BYTES) as u32;
-        self.write_budget
+        self.acquire_budget(&self.write_budget, len, MAX_QUEUED_FRAME_BYTES).await
+    }
+
+    async fn acquire_control_budget(&self, len: usize) -> std::io::Result<tokio::sync::OwnedSemaphorePermit> {
+        self.acquire_budget(&self.control_budget, len, MAX_QUEUED_CONTROL_BYTES).await
+    }
+
+    async fn acquire_budget(
+        &self,
+        budget: &Arc<Semaphore>,
+        len: usize,
+        capacity: usize,
+    ) -> std::io::Result<tokio::sync::OwnedSemaphorePermit> {
+        let permits = len.clamp(1, capacity) as u32;
+        budget
             .clone()
             .acquire_many_owned(permits)
             .await
@@ -252,6 +284,8 @@ impl Session {
         let mut buffer = vec![0_u8; 4096];
         let mut pending = Vec::new();
         let writer_failure = self.writer_state.failure_notified();
+        let mut heartbeat = tokio::time::interval(std::time::Duration::from_secs(30));
+        heartbeat.tick().await;
 
         loop {
             if self.closed.load(Ordering::Acquire) {
@@ -259,6 +293,17 @@ impl Session {
             }
 
             let bytes_read = tokio::select! {
+                _ = heartbeat.tick() => {
+                    let mut sent = self.heartbeat_sent.lock().await;
+                    if sent.is_some_and(|time| time.elapsed() >= std::time::Duration::from_secs(90)) {
+                        return Err(std::io::Error::new(std::io::ErrorKind::TimedOut, "session heartbeat timed out"));
+                    }
+                    if sent.is_none() {
+                        self.write_frame(Frame::new(Command::HeartRequest, 0)).await?;
+                        *sent = Some(tokio::time::Instant::now());
+                    }
+                    continue;
+                }
                 _ = self.close_notify.notified() => {
                     return Err(std::io::Error::new(std::io::ErrorKind::BrokenPipe, "Session closed"));
                 }
@@ -401,25 +446,43 @@ impl ProtocolHost for Session {
     }
 
     async fn resolve_stream_handshake(&self, sid: u32, message: String) -> std::io::Result<()> {
+        if sid == 0 {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "SYNACK cannot use control sid 0",
+            ));
+        }
         if message.is_empty() {
             log::trace!("SYNACK succeeded for stream sid={sid}");
             // The Go implementation closes the whole Session on a SYNACK error.
             // That loses unrelated multiplexed streams, so isolate the failure to
             // this stream and keep the Session available for the others.
             if let Some(stream) = self.stream_for_sid(sid).await {
-                stream.resolve_handshake(None);
+                if !stream.resolve_handshake(None) {
+                    return Err(std::io::Error::new(std::io::ErrorKind::InvalidData, "duplicate SYNACK"));
+                }
+            } else {
+                return Err(std::io::Error::new(std::io::ErrorKind::InvalidData, "SYNACK for unknown stream"));
             }
         } else if let Some(stream) = self.remove_stream(sid).await {
-            stream.resolve_handshake(Some(format!("remote: {message}")));
+            if !stream.resolve_handshake(Some(format!("remote: {message}"))) {
+                return Err(std::io::Error::new(std::io::ErrorKind::InvalidData, "duplicate SYNACK"));
+            }
             stream
-                .close_from_peer(Some(std::io::Error::other(format!("remote: {message}"))))
+                .close_from_session(Some(std::io::Error::other(format!("remote: {message}"))))
                 .await;
+        } else {
+            return Err(std::io::Error::new(std::io::ErrorKind::InvalidData, "SYNACK for unknown stream"));
         }
         Ok(())
     }
 
     async fn release_write_buffering(&self) {
         self.writer_state.set_buffering(false).await;
+    }
+
+    async fn heartbeat_response(&self) {
+        *self.heartbeat_sent.lock().await = None;
     }
 }
 

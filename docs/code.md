@@ -105,7 +105,9 @@ AnyTLS 是一个基于 TLS 1.3 的隧道代理工具，旨在将 SOCKS5 流量�
     - `CMD_FIN`: 关闭对应 `Stream` 的写入端。
     - `CMD_HEART_*`: 处理心跳，保持连接活跃。
 - **写操作**:
-  - 使用 `mpsc::channel` 接收各 `Stream` 发来的帧。
+  - 使用独立的 control queue 和按 SID 分组的 data scheduler 接收各 `Stream` 发来的帧。
+  - data queue 采用 round-robin 调度，control queue 使用有限 burst，避免任一类流量永久饥饿。
+  - Session 级 outbound/inbound byte budget 限制排队内存，单个 Stream 关闭时释放其资源。
   - 通过 `tokio::io::split` 分离出的 `WriteHalf` 写入 TLS 连接。
   - **关键优化**: 每次写入后强制 `flush()`，配合 `TCP_NODELAY` 消除缓冲延迟。
 
@@ -116,6 +118,7 @@ AnyTLS 是一个基于 TLS 1.3 的隧道代理工具，旨在将 SOCKS5 流量�
 - **写数据**: 将数据封装为 `CMD_PSH` 帧，通过 `frame_tx` 发送给 Session。
 - **读数据**: 从内部的 `PipeReader` 读取由 Session 分发来的数据。
 - **关闭**: 发送 `CMD_FIN` 帧。为防止死锁，发送操作在后台异步任务中执行。
+  - 读写方向独立关闭；peer FIN 只关闭本地读半部，Stream 仅在两端都关闭后从 Session 移除。
 
 ### 4.4 管道机制 (`proxy/pipe/io_pipe.rs`)
 
@@ -140,7 +143,7 @@ AnyTLS 是一个基于 TLS 1.3 的隧道代理工具，旨在将 SOCKS5 流量�
     - **Zero Copy**: 在可能的情况下尽量减少内存拷贝（虽然 Frame 封装不可避免会有一次拷贝）。
     - **即时发送**: 强制 Flush 避免 Nagle 算法和 TLS 缓冲带来的延迟。
 4.  **健壮性**:
-    - **Keepalive**: 应用层心跳 + TCP 层 Keepalive 双重保障，快速检测死链。
+    - **Keepalive**: 应用层主动 heartbeat + TCP 层 Keepalive 双重保障，90 秒无响应时回收 carrier。
     - **优雅关闭**: 确保 Session 和 Stream 的状态在网络异常时能正确同步，防止僵尸连接。
 
 ---

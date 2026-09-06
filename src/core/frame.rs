@@ -90,9 +90,6 @@ pub struct Frame {
     // Historical protocol design:
     //  - sid == 0 : session-level control frames (settings, alerts, padding updates, etc.)
     //  - sid >= 1  : per-logical-stream data frames (1 was the initial/default stream id)
-    // This crate has removed multiplexing and reserves a single data stream id
-    // (`DEFAULT_SID = 1`) used for actual payload data. Other sid values are
-    // treated as unsupported and will cause the session to be rejected.
     pub sid: u32,
     pub data: Bytes,
 }
@@ -116,13 +113,19 @@ impl Frame {
         Self { cmd, sid, data }
     }
 
-    pub fn to_bytes(&self) -> Bytes {
+    pub fn to_bytes(&self) -> std::io::Result<Bytes> {
+        if self.data.len() > MAX_FRAME_DATA_SIZE {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "frame payload exceeds protocol limit",
+            ));
+        }
         let mut buf = BytesMut::with_capacity(HEADER_OVERHEAD_SIZE + self.data.len());
         buf.put_u8(u8::from(self.cmd));
         buf.put_u32(self.sid);
         buf.put_u16(self.data.len() as u16);
         buf.put_slice(&self.data);
-        buf.freeze()
+        Ok(buf.freeze())
     }
 
     pub fn from_bytes(mut data: &[u8]) -> Option<Self> {
@@ -141,6 +144,18 @@ impl Frame {
             sid: header.sid,
             data: frame_data.into(),
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{Command, Frame, MAX_FRAME_DATA_SIZE};
+    use bytes::Bytes;
+
+    #[test]
+    fn rejects_oversized_payload_during_serialization() {
+        let frame = Frame::with_data(Command::Psh, 1, Bytes::from(vec![0; MAX_FRAME_DATA_SIZE + 1]));
+        assert_eq!(frame.to_bytes().unwrap_err().kind(), std::io::ErrorKind::InvalidInput);
     }
 }
 

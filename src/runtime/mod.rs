@@ -47,6 +47,10 @@ pub use padding::DefaultPaddingFactory;
 
 #[cfg(any(feature = "client", feature = "server"))]
 pub(crate) const MAX_QUEUED_FRAME_BYTES: usize = 4 * 1024 * 1024;
+#[cfg(any(feature = "client", feature = "server"))]
+pub(crate) const MAX_QUEUED_INBOUND_BYTES: usize = 4 * 1024 * 1024;
+#[cfg(any(feature = "client", feature = "server"))]
+pub(crate) const MAX_QUEUED_CONTROL_BYTES: usize = 256 * 1024;
 
 #[cfg(any(feature = "client", feature = "server"))]
 pub(crate) struct FrameWrite {
@@ -425,15 +429,18 @@ impl Protocol for AnyTlsProtocol {
         tokio::spawn(async move {
             let mut control_open = true;
             let mut data_open = true;
+            let mut control_burst = 0usize;
             while control_open || data_open {
+                let prefer_data = control_burst >= 32 && data_open;
                 let next = tokio::select! {
-                    biased;
-                    frame = control_rx.recv(), if control_open => {
+                    frame = control_rx.recv(), if control_open && !prefer_data => {
                         if frame.is_none() { control_open = false; }
+                        if frame.is_some() { control_burst += 1; }
                         frame
                     }
                     frame = data_rx.recv(), if data_open => {
                         if frame.is_none() { data_open = false; }
+                        if frame.is_some() { control_burst = 0; }
                         frame
                     }
                 };
@@ -449,7 +456,7 @@ impl Protocol for AnyTlsProtocol {
                     if frame.cmd == Command::SynAck {
                         log::debug!("Writing SYNACK frame sid={}", frame.sid);
                     }
-                    Self::write_conn(&mut writer, frame.to_bytes().to_vec(), &state, &writer_state).await?;
+                    Self::write_conn(&mut writer, frame.to_bytes()?.to_vec(), &state, &writer_state).await?;
                     writer.flush().await
                 }
                 .await;
@@ -496,7 +503,17 @@ impl Protocol for AnyTlsProtocol {
             return Err(std::io::Error::other("Alert received"));
         }
 
+        if frame.cmd == Command::HeartResponse {
+            host.heartbeat_response().await;
+        }
+
         if host.is_client() && frame.cmd == Command::SynAck {
+            if frame.sid == 0 {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "SYNACK cannot use control sid 0",
+                ));
+            }
             log::debug!("Received SYNACK frame sid={} len={}", frame.sid, frame.data.len());
             let message = String::from_utf8_lossy(frame.data.as_ref()).to_string();
             host.resolve_stream_handshake(frame.sid, message.clone()).await?;
@@ -545,5 +562,35 @@ mod tests {
         }
 
         assert_eq!(sent_sids, vec![1, 2, 1, 1]);
+    }
+
+    #[tokio::test]
+    async fn data_scheduler_preserves_fin_after_same_stream_data() {
+        let (input_tx, input_rx) = mpsc::channel(8);
+        let (output_tx, mut output_rx) = mpsc::channel(8);
+        spawn_data_scheduler(input_rx, output_tx);
+
+        input_tx
+            .send(DataWrite {
+                sid: 1,
+                frame: FrameWrite::new(Frame::new(Command::Psh, 1), None, None),
+            })
+            .await
+            .unwrap();
+        input_tx
+            .send(DataWrite {
+                sid: 1,
+                frame: FrameWrite::new(Frame::new(Command::Fin, 1), None, None),
+            })
+            .await
+            .unwrap();
+        drop(input_tx);
+
+        let mut commands = Vec::new();
+        while let Some(frame) = output_rx.recv().await {
+            commands.push(frame.frame.cmd);
+        }
+
+        assert_eq!(commands, vec![Command::Psh, Command::Fin]);
     }
 }

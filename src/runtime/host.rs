@@ -28,4 +28,6 @@ pub trait ProtocolHost: Send + Sync {
 
     async fn resolve_stream_handshake(&self, sid: u32, message: String) -> std::io::Result<()>;
     async fn release_write_buffering(&self);
+
+    async fn heartbeat_response(&self);
 }

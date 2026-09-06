@@ -1,10 +1,16 @@
 use crate::proxy::pipe::PipeDeadline;
+use std::collections::VecDeque;
 use std::sync::Arc;
-use tokio::sync::{Mutex, Notify, mpsc};
+use tokio::sync::{Mutex, Notify, OwnedSemaphorePermit, mpsc};
 
 enum PipeEvent {
-    Data(Vec<u8>),
+    Data(PipeChunk),
     StreamEnd(Option<std::io::Error>),
+}
+
+struct PipeChunk {
+    data: Vec<u8>,
+    _permit: Option<OwnedSemaphorePermit>,
 }
 
 pub struct PipeReader {
@@ -23,7 +29,7 @@ pub struct PipeInner {
     read_error: Option<std::io::Error>,
     data_sender: Option<mpsc::Sender<PipeEvent>>,
     data_receiver: Option<mpsc::Receiver<PipeEvent>>,
-    buffer: Vec<u8>,
+    buffer: VecDeque<PipeChunk>,
     // Notify to wake readers when receiver becomes available or pipe state changes
     read_waiter: Arc<Notify>,
 }
@@ -34,10 +40,14 @@ impl PipeReader {
             // 1) Fast path: if buffer has data, consume it immediately
             {
                 let mut inner = self.inner.lock().await;
-                if !inner.buffer.is_empty() {
-                    let len = inner.buffer.len().min(buf.len());
-                    buf[..len].copy_from_slice(&inner.buffer[..len]);
-                    inner.buffer.drain(0..len);
+                if let Some(chunk) = inner.buffer.front_mut() {
+                    let len = chunk.data.len().min(buf.len());
+                    buf[..len].copy_from_slice(&chunk.data[..len]);
+                    if len == chunk.data.len() {
+                        inner.buffer.pop_front();
+                    } else {
+                        chunk.data.drain(0..len);
+                    }
                     return Ok(len);
                 }
 
@@ -86,11 +96,12 @@ impl PipeReader {
             inner.data_receiver = Some(receiver);
 
             match res {
-                Some(PipeEvent::Data(data)) => {
-                    let len = data.len().min(buf.len());
-                    buf[..len].copy_from_slice(&data[..len]);
-                    if len < data.len() {
-                        inner.buffer.extend_from_slice(&data[len..]);
+                Some(PipeEvent::Data(mut chunk)) => {
+                    let len = chunk.data.len().min(buf.len());
+                    buf[..len].copy_from_slice(&chunk.data[..len]);
+                    if len < chunk.data.len() {
+                        chunk.data.drain(0..len);
+                        inner.buffer.push_back(chunk);
                     }
                     return Ok(len);
                 }
@@ -165,6 +176,14 @@ impl PipeReader {
 
 impl PipeWriter {
     pub async fn write(&self, buf: &[u8]) -> std::io::Result<usize> {
+        self.write_inner(buf, None).await
+    }
+
+    pub async fn write_with_permit(&self, buf: &[u8], permit: OwnedSemaphorePermit) -> std::io::Result<usize> {
+        self.write_inner(buf, Some(permit)).await
+    }
+
+    async fn write_inner(&self, buf: &[u8], permit: Option<OwnedSemaphorePermit>) -> std::io::Result<usize> {
         use std::io::{Error, ErrorKind::BrokenPipe};
         let (tx, waiter) = {
             let inner = self.inner.lock().await;
@@ -175,9 +194,12 @@ impl PipeWriter {
             (tx, inner.read_waiter.clone())
         };
 
-        tx.send(PipeEvent::Data(buf.to_vec()))
-            .await
-            .map_err(|error| Error::new(BrokenPipe, format!("Channel closed: {}", error)))?;
+        tx.send(PipeEvent::Data(PipeChunk {
+            data: buf.to_vec(),
+            _permit: permit,
+        }))
+        .await
+        .map_err(|error| Error::new(BrokenPipe, format!("Channel closed: {}", error)))?;
         waiter.notify_one();
         Ok(buf.len())
     }
@@ -201,7 +223,7 @@ pub fn pipe() -> (PipeReader, PipeWriter) {
         read_error: None,
         data_sender: Some(tx),
         data_receiver: Some(rx),
-        buffer: Vec::new(),
+        buffer: VecDeque::new(),
         read_waiter: Arc::new(Notify::new()),
     }));
 

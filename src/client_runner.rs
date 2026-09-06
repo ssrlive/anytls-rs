@@ -68,7 +68,10 @@ impl AsyncRead for StreamRw {
             }));
         }
 
-        match self.read_fut.as_mut().unwrap().as_mut().poll(cx) {
+        let Some(read_fut) = self.read_fut.as_mut() else {
+            return std::task::Poll::Ready(Err(std::io::Error::new(std::io::ErrorKind::BrokenPipe, "read future missing")));
+        };
+        match read_fut.as_mut().poll(cx) {
             std::task::Poll::Ready(Ok((tmp, n))) => {
                 self.read_fut = None;
                 buf.put_slice(&tmp[..n]);
@@ -91,7 +94,10 @@ impl AsyncWrite for StreamRw {
             self.write_fut = Some(Box::pin(async move { inner.write(&data).await }));
         }
 
-        match self.write_fut.as_mut().unwrap().as_mut().poll(cx) {
+        let Some(write_fut) = self.write_fut.as_mut() else {
+            return std::task::Poll::Ready(Err(std::io::Error::new(std::io::ErrorKind::BrokenPipe, "write future missing")));
+        };
+        match write_fut.as_mut().poll(cx) {
             std::task::Poll::Ready(Ok(n)) => {
                 self.write_fut = None;
                 std::task::Poll::Ready(Ok(n))
@@ -111,10 +117,13 @@ impl AsyncWrite for StreamRw {
     fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut std::task::Context<'_>) -> std::task::Poll<std::io::Result<()>> {
         if self.shutdown_fut.is_none() {
             let inner = self.inner.clone();
-            self.shutdown_fut = Some(Box::pin(async move { inner.close().await }));
+            self.shutdown_fut = Some(Box::pin(async move { inner.shutdown_write().await }));
         }
 
-        match self.shutdown_fut.as_mut().unwrap().as_mut().poll(cx) {
+        let Some(shutdown_fut) = self.shutdown_fut.as_mut() else {
+            return std::task::Poll::Ready(Err(std::io::Error::new(std::io::ErrorKind::BrokenPipe, "shutdown future missing")));
+        };
+        match shutdown_fut.as_mut().poll(cx) {
             std::task::Poll::Ready(Ok(())) => {
                 self.shutdown_fut = None;
                 std::task::Poll::Ready(Ok(()))
@@ -367,9 +376,14 @@ pub async fn runner_execute(cancel_token: CancellationToken, args: ClientArgs) -
             let handshake_stream = proxy_stream.clone();
             let mut adapter = StreamRw::new(proxy_stream);
             adapter.write_all(&addr_data).await?;
-            tokio::time::timeout(std::time::Duration::from_secs(10), handshake_stream.wait_for_handshake())
+            let handshake_result = tokio::time::timeout(std::time::Duration::from_secs(10), handshake_stream.wait_for_handshake())
                 .await
-                .map_err(|_| std::io::Error::new(std::io::ErrorKind::TimedOut, "stream handshake timed out"))??;
+                .map_err(|_| std::io::Error::new(std::io::ErrorKind::TimedOut, "stream handshake timed out"))
+                .and_then(|result| result);
+            if let Err(error) = handshake_result {
+                let _ = handshake_stream.terminate().await;
+                return Err(error);
+            }
             let boxed: BoxedStream = Box::new(adapter);
             Ok(boxed)
         })
@@ -744,7 +758,7 @@ async fn s5_connect(conn_ready: connect::Connect<connect::Ready>, target_addr: A
             log::debug!("Session #{sid}: client to proxy error: {e}");
         } else if local_eof {
             log::debug!("Session #{sid}: local EOF, sending FIN");
-            let _ = proxy_stream_write.close().await;
+            let _ = proxy_stream_write.shutdown_write().await;
         }
     });
 
@@ -757,9 +771,13 @@ async fn s5_connect(conn_ready: connect::Connect<connect::Ready>, target_addr: A
                 Ok(0) => break,
                 Ok(n) => {
                     log::trace!("s5_connect: proxy->client forwarding {} bytes", n);
-                    if let Err(e) = client_write.write_all(&buf[..n]).await {
-                        err = Some(e);
-                        break;
+                    match client_write.write_all(&buf[..n]).await {
+                        Ok(()) => log::trace!("s5_connect: proxy->client wrote {} bytes", n),
+                        Err(e) => {
+                            log::debug!("Session #{sid}: proxy to client write failed after {} bytes: {e}", n);
+                            err = Some(e);
+                            break;
+                        }
                     }
                 }
                 Err(e) => {
@@ -856,7 +874,10 @@ async fn handle_udp_associate(
                     continue;
                 }
 
-                listen_udp.send_to(&payload, 0, source.unwrap(), incoming).await?;
+                let Some(source) = source else {
+                    break Err(std::io::Error::new(std::io::ErrorKind::InvalidData, "UOT datagram response missing source address").into());
+                };
+                listen_udp.send_to(&payload, 0, source, incoming).await?;
             }
             res = reply_listener.wait_until_closed() => {
                 res?;

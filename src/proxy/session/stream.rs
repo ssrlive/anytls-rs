@@ -1,6 +1,6 @@
 use crate::core::{Command, Frame};
 use crate::proxy::pipe::{PipeReader, PipeWriter, pipe};
-use crate::runtime::{DataWrite, FrameWrite, MAX_QUEUED_FRAME_BYTES, StreamProtocolHooks};
+use crate::runtime::{DataWrite, FrameWrite, MAX_QUEUED_FRAME_BYTES, MAX_QUEUED_INBOUND_BYTES, StreamProtocolHooks};
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Weak};
@@ -17,9 +17,9 @@ pub struct Stream {
     id: u32,
     pipe_reader: PipeReader,
     pipe_writer: PipeWriter,
-    control_tx: Sender<FrameWrite>,
     data_enqueue_tx: Sender<DataWrite>,
     write_budget: Arc<Semaphore>,
+    inbound_budget: Arc<Semaphore>,
     streams: Weak<Mutex<HashMap<u32, Arc<Stream>>>>,
     idle_state: Weak<watch::Sender<bool>>,
     protocol_hooks: Arc<dyn StreamProtocolHooks>,
@@ -30,11 +30,12 @@ pub struct Stream {
 }
 
 impl Stream {
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn new(
         id: u32,
-        control_tx: Sender<FrameWrite>,
         data_enqueue_tx: Sender<DataWrite>,
         write_budget: Arc<Semaphore>,
+        inbound_budget: Arc<Semaphore>,
         streams: Weak<Mutex<HashMap<u32, Arc<Stream>>>>,
         idle_state: Weak<watch::Sender<bool>>,
         protocol_hooks: Arc<dyn StreamProtocolHooks>,
@@ -45,9 +46,9 @@ impl Stream {
             id,
             pipe_reader,
             pipe_writer,
-            control_tx,
             data_enqueue_tx,
             write_budget,
+            inbound_budget,
             streams,
             idle_state,
             protocol_hooks,
@@ -129,7 +130,14 @@ impl Stream {
         if self.read_closed.load(Ordering::Acquire) {
             return Err(std::io::Error::new(std::io::ErrorKind::BrokenPipe, "Stream closed"));
         }
-        self.pipe_writer.write(buf).await
+        let permits = buf.len().clamp(1, MAX_QUEUED_INBOUND_BYTES) as u32;
+        let permit = self
+            .inbound_budget
+            .clone()
+            .acquire_many_owned(permits)
+            .await
+            .map_err(|_| std::io::Error::new(std::io::ErrorKind::BrokenPipe, "Session inbound budget closed"))?;
+        self.pipe_writer.write_with_permit(buf, permit).await
     }
 
     pub async fn close(&self) -> std::io::Result<()> {
@@ -145,12 +153,11 @@ impl Stream {
         }
 
         let result = self
-            .control_tx
-            .send(FrameWrite::new(
-                Frame::new(Command::Fin, self.id),
-                None,
-                Some(self.acquire_write_budget(0).await?),
-            ))
+            .data_enqueue_tx
+            .send(DataWrite {
+                sid: self.id,
+                frame: FrameWrite::new(Frame::new(Command::Fin, self.id), None, None),
+            })
             .await
             .map_err(|_| std::io::Error::new(std::io::ErrorKind::BrokenPipe, "Session closed"));
         self.maybe_finalize().await;
@@ -190,11 +197,17 @@ impl Stream {
         }
     }
 
-    pub(crate) fn resolve_handshake(&self, error: Option<String>) {
-        self.handshake.send_replace(match error {
-            Some(error) => HandshakeState::Failed(error),
-            None => HandshakeState::Succeeded,
-        });
+    pub(crate) fn resolve_handshake(&self, error: Option<String>) -> bool {
+        self.handshake.send_if_modified(|state| {
+            if !matches!(state, HandshakeState::Pending) {
+                return false;
+            }
+            *state = match error {
+                Some(error) => HandshakeState::Failed(error),
+                None => HandshakeState::Succeeded,
+            };
+            true
+        })
     }
 
     pub async fn handshake_failure(&self, error: &str) -> std::io::Result<()> {
@@ -241,8 +254,17 @@ impl Stream {
     }
 
     async fn acquire_write_budget(&self, len: usize) -> std::io::Result<tokio::sync::OwnedSemaphorePermit> {
-        let permits = len.clamp(1, MAX_QUEUED_FRAME_BYTES) as u32;
-        self.write_budget
+        self.acquire_budget(&self.write_budget, len, MAX_QUEUED_FRAME_BYTES).await
+    }
+
+    async fn acquire_budget(
+        &self,
+        budget: &Arc<Semaphore>,
+        len: usize,
+        capacity: usize,
+    ) -> std::io::Result<tokio::sync::OwnedSemaphorePermit> {
+        let permits = len.clamp(1, capacity) as u32;
+        budget
             .clone()
             .acquire_many_owned(permits)
             .await

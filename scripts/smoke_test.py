@@ -27,6 +27,7 @@ KEY = SCRIPTS / "selfsigned.key"
 SERVER_LOG = SCRIPTS / "server.log"
 S_CLIENT_OUT = SCRIPTS / "s_client.out"
 INTEGRATION_OUT = SCRIPTS / "integration_client.out"
+INTEGRATION_ERR = SCRIPTS / "integration_client.err"
 LOG_LEVEL = os.environ.get('SMOKE_LOG', 'info')
 INTERACTIVE = os.environ.get('SMOKE_INTERACTIVE', '0') == '1'
 KEEP_PROCS = os.environ.get('SMOKE_KEEP_PROCS', '0') == '1'
@@ -129,13 +130,13 @@ def main():
     socks_port = find_free_port()
     print(f"HTTP {http_port}, SOCKS {socks_port}")
 
-    www_dir = SCRIPTS / 'integration-www'
-    www_dir.mkdir(parents=True, exist_ok=True)
-    (www_dir / 'index.html').write_text('hello-from-backend')
-
     print(f"Starting local HTTP server on 127.0.0.1:{http_port}")
-    http_proc, _ = start_proc([sys.executable, '-m', 'http.server', str(http_port), '--bind', '127.0.0.1', '--directory', str(www_dir)])
-    time.sleep(0.5)
+    http_proc, _ = start_proc([sys.executable, str(SCRIPTS / 'integration_server.py'), str(http_port)])
+    if not wait_for_port('127.0.0.1', http_port, timeout=3.0):
+        print('HTTP backend did not start in time')
+        terminate_proc(http_proc, name='python.exe' if os.name == 'nt' else 'python')
+        terminate_proc(srv_proc, name=bin_server.name)
+        sys.exit(1)
 
     if not wait_for_port('127.0.0.1', port, timeout=3.0):
         print('Server did not start in time; dumping server log')
@@ -203,7 +204,16 @@ def main():
     used = False
     if shutil.which('curl'):
         try:
-            run(['curl', '--socks5', f'127.0.0.1:{socks_port}', '--max-time', '10', '-sS', f'http://127.0.0.1:{http_port}/'], stdout=open(INTEGRATION_OUT, 'wb'), timeout=12)
+            with open(INTEGRATION_OUT, 'wb') as stdout, open(INTEGRATION_ERR, 'wb') as stderr:
+                curl = run(
+                    ['curl', '--socks5', f'127.0.0.1:{socks_port}', '--max-time', '10', '-sS', f'http://127.0.0.1:{http_port}/'],
+                    stdout=stdout,
+                    stderr=stderr,
+                    timeout=12,
+                )
+            print(f'curl exit code: {curl.returncode}')
+            if curl.returncode != 0:
+                print(Path(INTEGRATION_ERR).read_text(errors='replace'))
             used = True
         except subprocess.TimeoutExpired:
             print('curl timed out')
