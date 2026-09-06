@@ -1,14 +1,14 @@
 use crate::AsyncReadWrite;
 use crate::core::{Command, Frame, HEADER_OVERHEAD_SIZE, State};
 use crate::proxy::session::Stream;
-use crate::runtime::{FrameWrite, Protocol, ProtocolHost, WriterRuntimeState};
+use crate::runtime::{FrameWrite, MAX_QUEUED_FRAME_BYTES, Protocol, ProtocolHost, WriterRuntimeState};
 use async_trait::async_trait;
 use bytes::Bytes;
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use tokio::io::AsyncReadExt;
-use tokio::sync::{Mutex, Notify, mpsc::Sender, watch};
+use tokio::sync::{Mutex, Notify, Semaphore, mpsc::Sender, watch};
 
 static SESSION_ID_COUNTER: AtomicU64 = AtomicU64::new(1);
 
@@ -28,7 +28,9 @@ pub struct Session {
     #[allow(clippy::type_complexity)]
     on_new_stream: Option<Arc<Box<dyn Fn(Arc<Stream>) + Send + Sync>>>,
     protocol: Arc<dyn Protocol>,
+    control_tx: Sender<FrameWrite>,
     pub(crate) frame_tx: Sender<FrameWrite>,
+    write_budget: Arc<Semaphore>,
 }
 
 impl Session {
@@ -41,9 +43,11 @@ impl Session {
         writer_state: Arc<WriterRuntimeState>,
     ) -> Self {
         let (reader, writer) = tokio::io::split(conn);
-        let (frame_tx, frame_rx) = tokio::sync::mpsc::channel::<FrameWrite>(100);
+        let (control_tx, control_rx) = tokio::sync::mpsc::channel::<FrameWrite>(32);
+        let (frame_tx, data_rx) = tokio::sync::mpsc::channel::<FrameWrite>(100);
+        let write_budget = Arc::new(Semaphore::new(MAX_QUEUED_FRAME_BYTES));
         let (idle_state, _) = watch::channel(true);
-        protocol.spawn_writer_task(writer, frame_rx, protocol_state.clone(), writer_state.clone());
+        protocol.spawn_writer_task(writer, control_rx, data_rx, protocol_state.clone(), writer_state.clone());
 
         Self {
             id: SESSION_ID_COUNTER.fetch_add(1, Ordering::Relaxed),
@@ -60,7 +64,9 @@ impl Session {
             close_notify: Arc::new(Notify::new()),
             on_new_stream: on_new_stream.map(Arc::new),
             protocol,
+            control_tx,
             frame_tx,
+            write_budget,
         }
     }
 
@@ -125,8 +131,14 @@ impl Session {
 
     pub async fn write_frame(&self, frame: Frame) -> std::io::Result<usize> {
         let len = frame.data.len();
-        self.frame_tx
-            .send((frame, None))
+        let budget = self.acquire_write_budget(len).await?;
+        let sender = if matches!(frame.cmd, Command::Psh) {
+            &self.frame_tx
+        } else {
+            &self.control_tx
+        };
+        sender
+            .send(FrameWrite::new(frame, None, Some(budget)))
             .await
             .map(|_| len)
             .map_err(|_| std::io::Error::new(std::io::ErrorKind::BrokenPipe, "Session closed"))
@@ -134,9 +146,15 @@ impl Session {
 
     pub async fn write_frame_sync(&self, frame: Frame) -> std::io::Result<usize> {
         let len = frame.data.len();
+        let budget = self.acquire_write_budget(len).await?;
         let (ack_tx, ack_rx) = tokio::sync::oneshot::channel();
-        self.frame_tx
-            .send((frame, Some(ack_tx)))
+        let sender = if matches!(frame.cmd, Command::Psh) {
+            &self.frame_tx
+        } else {
+            &self.control_tx
+        };
+        sender
+            .send(FrameWrite::new(frame, Some(ack_tx), Some(budget)))
             .await
             .map_err(|_| std::io::Error::new(std::io::ErrorKind::BrokenPipe, "Session closed"))?;
         ack_rx
@@ -166,7 +184,7 @@ impl Session {
     }
 
     pub async fn is_terminated(&self) -> bool {
-        self.closed.load(Ordering::Acquire) || self.frame_tx.is_closed() || self.writer_state.is_failed()
+        self.closed.load(Ordering::Acquire) || self.frame_tx.is_closed() || self.control_tx.is_closed() || self.writer_state.is_failed()
     }
 
     pub async fn peer_version(&self) -> u8 {
@@ -196,12 +214,23 @@ impl Session {
     fn new_stream(&self, sid: u32) -> Stream {
         Stream::new(
             sid,
+            self.control_tx.clone(),
             self.frame_tx.clone(),
+            self.write_budget.clone(),
             Arc::downgrade(&self.streams),
             Arc::downgrade(&self.idle_state),
             self.protocol
-                .make_stream_protocol_hooks(self.frame_tx.clone(), self.protocol_state.clone()),
+                .make_stream_protocol_hooks(self.control_tx.clone(), self.protocol_state.clone()),
         )
+    }
+
+    async fn acquire_write_budget(&self, len: usize) -> std::io::Result<tokio::sync::OwnedSemaphorePermit> {
+        let permits = len.clamp(1, MAX_QUEUED_FRAME_BYTES) as u32;
+        self.write_budget
+            .clone()
+            .acquire_many_owned(permits)
+            .await
+            .map_err(|_| std::io::Error::new(std::io::ErrorKind::BrokenPipe, "Session write budget closed"))
     }
 
     async fn recv_loop(&self) -> std::io::Result<()> {

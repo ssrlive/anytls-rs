@@ -44,7 +44,25 @@ pub use host::ProtocolHost;
 pub use padding::DefaultPaddingFactory;
 
 #[cfg(any(feature = "client", feature = "server"))]
-pub(crate) type FrameWrite = (Frame, Option<tokio::sync::oneshot::Sender<std::io::Result<()>>>);
+pub(crate) const MAX_QUEUED_FRAME_BYTES: usize = 4 * 1024 * 1024;
+
+#[cfg(any(feature = "client", feature = "server"))]
+pub(crate) struct FrameWrite {
+    pub(crate) frame: Frame,
+    pub(crate) ack: Option<tokio::sync::oneshot::Sender<std::io::Result<()>>>,
+    pub(crate) budget: Option<tokio::sync::OwnedSemaphorePermit>,
+}
+
+#[cfg(any(feature = "client", feature = "server"))]
+impl FrameWrite {
+    pub(crate) fn new(
+        frame: Frame,
+        ack: Option<tokio::sync::oneshot::Sender<std::io::Result<()>>>,
+        budget: Option<tokio::sync::OwnedSemaphorePermit>,
+    ) -> Self {
+        Self { frame, ack, budget }
+    }
+}
 
 #[cfg(any(feature = "client", feature = "server"))]
 pub(crate) struct WriterRuntimeState {
@@ -152,12 +170,13 @@ pub(crate) trait Protocol: Send + Sync {
     fn spawn_writer_task(
         &self,
         writer: tokio::io::WriteHalf<Box<dyn AsyncReadWrite>>,
-        rx: Receiver<FrameWrite>,
+        control_rx: Receiver<FrameWrite>,
+        data_rx: Receiver<FrameWrite>,
         state: Arc<State>,
         writer_state: Arc<WriterRuntimeState>,
     );
 
-    fn make_stream_protocol_hooks(&self, frame_tx: Sender<FrameWrite>, state: Arc<State>) -> Arc<dyn StreamProtocolHooks>;
+    fn make_stream_protocol_hooks(&self, control_tx: Sender<FrameWrite>, state: Arc<State>) -> Arc<dyn StreamProtocolHooks>;
 
     async fn on_session_start(&self, host: &dyn ProtocolHost) -> std::io::Result<()>;
 
@@ -170,7 +189,7 @@ pub(crate) struct AnyTlsProtocol;
 
 #[cfg(any(feature = "client", feature = "server"))]
 struct AnyTlsStreamProtocolHooks {
-    frame_tx: Sender<FrameWrite>,
+    control_tx: Sender<FrameWrite>,
     peer_version: Arc<BlockingMutex<u8>>,
 }
 
@@ -180,7 +199,7 @@ impl StreamProtocolHooks for AnyTlsStreamProtocolHooks {
     async fn handshake_failure(&self, sid: u32, error: &str) -> std::io::Result<()> {
         if *self.peer_version.lock() >= MIN_PROTOCOL_VERSION {
             let frame = Frame::with_data(Command::SynAck, sid, bytes::Bytes::copy_from_slice(error.as_bytes()));
-            match self.frame_tx.send((frame, None)).await {
+            match self.control_tx.send(FrameWrite::new(frame, None, None)).await {
                 Ok(_) => {}
                 Err(_) => return Err(std::io::Error::new(std::io::ErrorKind::BrokenPipe, "Session closed")),
             }
@@ -192,7 +211,7 @@ impl StreamProtocolHooks for AnyTlsStreamProtocolHooks {
     async fn handshake_success(&self, sid: u32) -> std::io::Result<()> {
         if *self.peer_version.lock() >= MIN_PROTOCOL_VERSION {
             let frame = Frame::new(Command::SynAck, sid);
-            match self.frame_tx.send((frame, None)).await {
+            match self.control_tx.send(FrameWrite::new(frame, None, None)).await {
                 Ok(_) => {}
                 Err(_) => return Err(std::io::Error::new(std::io::ErrorKind::BrokenPipe, "Session closed")),
             }
@@ -334,13 +353,35 @@ impl Protocol for AnyTlsProtocol {
     fn spawn_writer_task(
         &self,
         mut writer: tokio::io::WriteHalf<Box<dyn AsyncReadWrite>>,
-        mut rx: Receiver<FrameWrite>,
+        mut control_rx: Receiver<FrameWrite>,
+        mut data_rx: Receiver<FrameWrite>,
         state: Arc<State>,
         writer_state: Arc<WriterRuntimeState>,
     ) {
         let writer_state_for_task = writer_state.clone();
         tokio::spawn(async move {
-            while let Some((frame, ack)) = rx.recv().await {
+            let mut control_open = true;
+            let mut data_open = true;
+            while control_open || data_open {
+                let next = tokio::select! {
+                    biased;
+                    frame = control_rx.recv(), if control_open => {
+                        if frame.is_none() { control_open = false; }
+                        frame
+                    }
+                    frame = data_rx.recv(), if data_open => {
+                        if frame.is_none() { data_open = false; }
+                        frame
+                    }
+                };
+                let Some(FrameWrite {
+                    frame,
+                    ack,
+                    budget: _budget,
+                }) = next
+                else {
+                    continue;
+                };
                 let res = async {
                     if frame.cmd == Command::SynAck {
                         log::debug!("Writing SYNACK frame sid={}", frame.sid);
@@ -364,16 +405,14 @@ impl Protocol for AnyTlsProtocol {
                     break;
                 }
             }
-            if rx.is_closed() {
-                writer_state_for_task.mark_failed();
-            }
+            writer_state_for_task.mark_failed();
             log::debug!("Session writer task exiting (writer loop ended)");
         });
     }
 
-    fn make_stream_protocol_hooks(&self, frame_tx: Sender<FrameWrite>, state: Arc<State>) -> Arc<dyn StreamProtocolHooks> {
+    fn make_stream_protocol_hooks(&self, control_tx: Sender<FrameWrite>, state: Arc<State>) -> Arc<dyn StreamProtocolHooks> {
         Arc::new(AnyTlsStreamProtocolHooks {
-            frame_tx,
+            control_tx,
             peer_version: state.peer_version_handle(),
         })
     }

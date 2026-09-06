@@ -1,10 +1,10 @@
 use crate::core::{Command, Frame};
 use crate::proxy::pipe::{PipeReader, PipeWriter, pipe};
-use crate::runtime::StreamProtocolHooks;
+use crate::runtime::{FrameWrite, MAX_QUEUED_FRAME_BYTES, StreamProtocolHooks};
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Weak};
-use tokio::sync::{Mutex, mpsc::Sender, watch};
+use tokio::sync::{Mutex, Semaphore, mpsc::Sender, watch};
 
 #[derive(Clone)]
 pub(crate) enum HandshakeState {
@@ -17,7 +17,9 @@ pub struct Stream {
     id: u32,
     pipe_reader: PipeReader,
     pipe_writer: PipeWriter,
-    frame_tx: Sender<(Frame, Option<tokio::sync::oneshot::Sender<std::io::Result<()>>>)>,
+    control_tx: Sender<FrameWrite>,
+    frame_tx: Sender<FrameWrite>,
+    write_budget: Arc<Semaphore>,
     streams: Weak<Mutex<HashMap<u32, Arc<Stream>>>>,
     idle_state: Weak<watch::Sender<bool>>,
     protocol_hooks: Arc<dyn StreamProtocolHooks>,
@@ -28,7 +30,9 @@ pub struct Stream {
 impl Stream {
     pub(crate) fn new(
         id: u32,
-        frame_tx: Sender<(Frame, Option<tokio::sync::oneshot::Sender<std::io::Result<()>>>)>,
+        control_tx: Sender<FrameWrite>,
+        frame_tx: Sender<FrameWrite>,
+        write_budget: Arc<Semaphore>,
         streams: Weak<Mutex<HashMap<u32, Arc<Stream>>>>,
         idle_state: Weak<watch::Sender<bool>>,
         protocol_hooks: Arc<dyn StreamProtocolHooks>,
@@ -39,7 +43,9 @@ impl Stream {
             id,
             pipe_reader,
             pipe_writer,
+            control_tx,
             frame_tx,
+            write_budget,
             streams,
             idle_state,
             protocol_hooks,
@@ -94,8 +100,9 @@ impl Stream {
 
         for chunk in buf.chunks(crate::core::MAX_FRAME_DATA_SIZE) {
             let frame = Frame::with_data(Command::Psh, self.id, bytes::Bytes::copy_from_slice(chunk));
+            let budget = self.acquire_write_budget(chunk.len()).await?;
             self.frame_tx
-                .send((frame, None))
+                .send(FrameWrite::new(frame, None, Some(budget)))
                 .await
                 .map_err(|_| std::io::Error::new(std::io::ErrorKind::BrokenPipe, "Session closed"))?;
         }
@@ -117,8 +124,12 @@ impl Stream {
 
         self.remove_from_session().await;
         self.pipe_reader.close_with_error(None);
-        self.frame_tx
-            .send((Frame::new(Command::Fin, self.id), None))
+        self.control_tx
+            .send(FrameWrite::new(
+                Frame::new(Command::Fin, self.id),
+                None,
+                Some(self.acquire_write_budget(0).await?),
+            ))
             .await
             .map_err(|_| std::io::Error::new(std::io::ErrorKind::BrokenPipe, "Session closed"))
     }
@@ -182,5 +193,14 @@ impl Stream {
         if is_idle && let Some(idle_state) = self.idle_state.upgrade() {
             idle_state.send_replace(true);
         }
+    }
+
+    async fn acquire_write_budget(&self, len: usize) -> std::io::Result<tokio::sync::OwnedSemaphorePermit> {
+        let permits = len.clamp(1, MAX_QUEUED_FRAME_BYTES) as u32;
+        self.write_budget
+            .clone()
+            .acquire_many_owned(permits)
+            .await
+            .map_err(|_| std::io::Error::new(std::io::ErrorKind::BrokenPipe, "Session write budget closed"))
     }
 }
