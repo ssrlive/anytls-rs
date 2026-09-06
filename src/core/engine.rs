@@ -40,6 +40,22 @@ impl Engine {
         log::debug!("Engine::on_frame is_client={} {}", is_client, frame);
 
         match frame.cmd {
+            Command::Psh | Command::Syn | Command::Fin | Command::SynAck if frame.sid == 0 => {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    format!("{} cannot use control sid 0", frame.cmd),
+                ));
+            }
+            Command::Settings | Command::Alert | Command::UpdatePaddingScheme | Command::ServerSettings if frame.sid != 0 => {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    format!("{} must use control sid 0", frame.cmd),
+                ));
+            }
+            _ => {}
+        }
+
+        match frame.cmd {
             Command::Waste | Command::HeartResponse => {}
             Command::Psh if !frame.data.is_empty() => {
                 actions.push(ProtocolAction::PushStreamData {
@@ -67,6 +83,18 @@ impl Engine {
             }
             Command::Settings if !is_client && !frame.data.is_empty() => {
                 let settings = StringMap::from_bytes(frame.data.as_ref());
+                let Some(version) = settings.get("v").and_then(|value| value.parse::<u8>().ok()) else {
+                    actions.push(ProtocolAction::AlertAndFail {
+                        message: "client settings missing a valid protocol version".to_string(),
+                    });
+                    return Ok(actions);
+                };
+                if version < crate::MIN_PROTOCOL_VERSION {
+                    actions.push(ProtocolAction::AlertAndFail {
+                        message: format!("unsupported protocol version: {version}"),
+                    });
+                    return Ok(actions);
+                }
                 state.mark_received_settings_from_client();
 
                 let padding = state.padding();
@@ -83,22 +111,18 @@ impl Engine {
                     )));
                 }
 
-                if let Some(version) = settings.get("v").and_then(|value| value.parse::<u8>().ok())
-                    && version >= crate::MIN_PROTOCOL_VERSION
-                {
-                    // Accept peer versions >= MIN_PROTOCOL_VERSION for
-                    // backwards compatibility. Record the peer's declared
-                    // version and echo it back in ServerSettings so both
-                    // sides agree on the negotiated version.
-                    state.set_peer_version(version);
-                    let mut server_settings = StringMap::new();
-                    server_settings.insert("v".to_string(), version.to_string());
-                    actions.push(ProtocolAction::SendFrameSync(Frame::with_data(
-                        Command::ServerSettings,
-                        0,
-                        server_settings.to_bytes().into(),
-                    )));
-                }
+                // Accept peer versions >= MIN_PROTOCOL_VERSION for
+                // backwards compatibility. Record the peer's declared
+                // version and echo it back in ServerSettings so both
+                // sides agree on the negotiated version.
+                state.set_peer_version(version);
+                let mut server_settings = StringMap::new();
+                server_settings.insert("v".to_string(), version.to_string());
+                actions.push(ProtocolAction::SendFrameSync(Frame::with_data(
+                    Command::ServerSettings,
+                    0,
+                    server_settings.to_bytes().into(),
+                )));
             }
             Command::UpdatePaddingScheme if !frame.data.is_empty() && is_client => {
                 if let Some(factory) = PaddingFactory::new(frame.data.as_ref()) {
@@ -159,5 +183,22 @@ mod tests {
         let actions = Engine::on_frame(&state, false, &Frame::new(Command::Syn, 7)).expect("server SYN should be accepted");
 
         assert!(matches!(actions.first(), Some(crate::core::ProtocolAction::AlertAndFail { .. })));
+    }
+
+    #[test]
+    fn rejects_payload_on_control_sid() {
+        let state = State::new(PaddingFactory::default());
+        let error = Engine::on_frame(&state, false, &Frame::new(Command::Psh, 0)).expect_err("control SID must be rejected");
+        assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
+    }
+
+    #[test]
+    fn rejects_settings_without_protocol_version() {
+        let state = State::new(PaddingFactory::default());
+        let frame = Frame::with_data(Command::Settings, 0, bytes::Bytes::from_static(b"client=test"));
+        let actions = Engine::on_frame(&state, false, &frame).expect("invalid settings should produce an alert action");
+
+        assert!(matches!(actions.first(), Some(crate::core::ProtocolAction::AlertAndFail { .. })));
+        assert!(!state.received_settings_from_client());
     }
 }

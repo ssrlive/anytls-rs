@@ -364,8 +364,12 @@ pub async fn runner_execute(cancel_token: CancellationToken, args: ClientArgs) -
             // Opening a stream is non-blocking in v2: queue the target
             // address immediately and let the core SYNACK watchdog handle a
             // missing or failed remote handshake.
+            let handshake_stream = proxy_stream.clone();
             let mut adapter = StreamRw::new(proxy_stream);
             adapter.write_all(&addr_data).await?;
+            tokio::time::timeout(std::time::Duration::from_secs(10), handshake_stream.wait_for_handshake())
+                .await
+                .map_err(|_| std::io::Error::new(std::io::ErrorKind::TimedOut, "stream handshake timed out"))??;
             let boxed: BoxedStream = Box::new(adapter);
             Ok(boxed)
         })

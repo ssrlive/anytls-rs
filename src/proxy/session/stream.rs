@@ -68,19 +68,13 @@ impl Stream {
                 HandshakeState::Succeeded => return Ok(()),
                 HandshakeState::Failed(error) => return Err(std::io::Error::other(error)),
                 HandshakeState::Pending if self.is_terminated().await => {
-                    return Err(std::io::Error::new(
-                        std::io::ErrorKind::BrokenPipe,
-                        "Stream closed before SYNACK",
-                    ));
+                    return Err(std::io::Error::new(std::io::ErrorKind::BrokenPipe, "Stream closed before SYNACK"));
                 }
                 HandshakeState::Pending => {}
             }
 
             if handshake.changed().await.is_err() {
-                return Err(std::io::Error::new(
-                    std::io::ErrorKind::BrokenPipe,
-                    "Stream closed before SYNACK",
-                ));
+                return Err(std::io::Error::new(std::io::ErrorKind::BrokenPipe, "Stream closed before SYNACK"));
             }
         }
     }
@@ -98,12 +92,15 @@ impl Stream {
             return Err(std::io::Error::new(std::io::ErrorKind::BrokenPipe, "Stream closed"));
         }
 
-        let frame = Frame::with_data(Command::Psh, self.id, bytes::Bytes::copy_from_slice(buf));
-        self.frame_tx
-            .send((frame, None))
-            .await
-            .map(|_| buf.len())
-            .map_err(|_| std::io::Error::new(std::io::ErrorKind::BrokenPipe, "Session closed"))
+        for chunk in buf.chunks(crate::core::MAX_FRAME_DATA_SIZE) {
+            let frame = Frame::with_data(Command::Psh, self.id, bytes::Bytes::copy_from_slice(chunk));
+            self.frame_tx
+                .send((frame, None))
+                .await
+                .map_err(|_| std::io::Error::new(std::io::ErrorKind::BrokenPipe, "Session closed"))?;
+        }
+
+        Ok(buf.len())
     }
 
     pub async fn push_data(&self, buf: &[u8]) -> std::io::Result<usize> {

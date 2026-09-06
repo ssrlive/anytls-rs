@@ -27,6 +27,7 @@ pub async fn new_server_session(
     conn: Box<dyn AsyncReadWrite>,
     on_new_stream: Box<dyn Fn(Arc<Stream>) + Send + Sync>,
     padding: Arc<RwLock<PaddingFactory>>,
+    max_streams: usize,
 ) -> Session {
-    crate::runtime::new_server_session(conn, on_new_stream, padding).await
+    crate::runtime::new_server_session(conn, on_new_stream, padding, max_streams).await
 }

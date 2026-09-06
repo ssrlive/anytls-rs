@@ -47,6 +47,10 @@ struct Args {
     #[arg(long, value_name = "URL")]
     forward: Option<Url>,
 
+    /// Maximum logical streams accepted on one authenticated TLS session.
+    #[arg(long, default_value_t = 1024, value_name = "N")]
+    max_streams_per_session: usize,
+
     #[serde(skip_serializing_if = "Option::is_none")]
     #[arg(long, value_name = "FILE", help = "TLS certificate PEM file (optional)")]
     cert: Option<PathBuf>,
@@ -289,6 +293,7 @@ async fn run(cancel_token: CancellationToken) -> Result<(), BoxError> {
                 forward_target,
                 traffic_audit,
                 panel_sync_enabled,
+                args.max_streams_per_session,
             )
             .await
             {
@@ -358,6 +363,7 @@ async fn handle_connection(
     forward_target: Option<Url>,
     traffic_audit: TrafficAuditPtr,
     panel_sync_enabled: bool,
+    max_streams_per_session: usize,
 ) -> Result<(), BoxError> {
     let client_addr = stream.peer_addr()?;
     let mut tls_stream = acceptor.accept(stream).await?;
@@ -426,6 +432,7 @@ async fn handle_connection(
             });
         }),
         padding,
+        max_streams_per_session,
     )
     .await;
 
@@ -750,7 +757,7 @@ async fn handle_uot_datagram_stream(
 
 #[allow(clippy::too_many_arguments)]
 async fn handle_uot_connected_stream(
-    session: Arc<Stream>,
+    stream: Arc<Stream>,
     client: SocketAddr,
     reader: &mut StreamReader,
     request: &UotRequest,
@@ -759,18 +766,18 @@ async fn handle_uot_connected_stream(
     client_id: Option<Uuid>,
     panel_sync_enabled: bool,
 ) -> Result<(), BoxError> {
-    let sid = session.id();
+    let sid = stream.id();
     let outbound = create_uot_udp_outbound(sid.into(), outbound_socks5).await?;
 
     let fixed_destination = request.destination.to_string();
     if let Err(err) = ensure_uot_udp_outbound_ready(&outbound, &request.destination).await {
         log::debug!("Failed to prepare UDP outbound to {fixed_destination}: {err}");
-        session.handshake_failure(&err.to_string()).await?;
-        let _ = session.terminate().await;
+        stream.handshake_failure(&err.to_string()).await?;
+        let _ = stream.close().await;
         return Ok(());
     }
 
-    session.handshake_success().await?;
+    stream.handshake_success().await?;
     log::info!("Session #{sid} UOT connected session established from {client} to {fixed_destination}");
 
     let mut outbound_buf = vec![0u8; 65_535];
@@ -781,7 +788,7 @@ async fn handle_uot_connected_stream(
             tokio::select! {
                 _ = enable_check.tick() => {
                     if !check_incoming_client_approved(panel_sync_enabled, &traffic_audit, client_id).await {
-                        let _ = session.terminate().await;
+                        let _ = stream.terminate().await;
                         break Ok(());
                     }
                 }
@@ -802,7 +809,7 @@ async fn handle_uot_connected_stream(
                     if let Some(client_id) = client_id {
                         traffic_audit.lock().await.add_downstream_traffic_of(&client_id, n as u64);
                     }
-                    session.write(&frame).await?;
+                    stream.write(&frame).await?;
                 }
             }
         }
@@ -818,7 +825,7 @@ async fn handle_uot_connected_stream(
 
 #[allow(clippy::too_many_arguments)]
 async fn handle_tcp_stream(
-    session: Arc<Stream>,
+    stream: Arc<Stream>,
     client: SocketAddr,
     reader: &mut StreamReader,
     destination: socks5_impl::protocol::Address,
@@ -827,14 +834,14 @@ async fn handle_tcp_stream(
     client_id: Option<Uuid>,
     panel_sync_enabled: bool,
 ) -> Result<(), BoxError> {
-    let sid = session.id();
+    let sid = stream.id();
     log::debug!("Connecting to {}", destination);
     let mut outbound = match connect_outbound_tcp(&destination, outbound_socks5.clone()).await {
         Ok(s) => s,
         Err(e) => {
             log::debug!("Failed to connect to {destination}: {e}");
-            session.handshake_failure(&e.to_string()).await?;
-            let _ = session.terminate().await;
+            stream.handshake_failure(&e.to_string()).await?;
+            let _ = stream.close().await;
             return Ok(());
         }
     };
@@ -847,11 +854,11 @@ async fn handle_tcp_stream(
     };
     log::info!("Session #{sid} TCP relay established from {client} to {dest}");
 
-    session.handshake_success().await?;
+    stream.handshake_success().await?;
     log::debug!("Starting relay to destination {destination}");
     // Relay data. Keep using the reader that parsed the target address: it owns
     // the pipe receiver and may retain bytes that arrived with the address.
-    let stream_write = session.clone();
+    let stream_write = stream.clone();
     let (mut outbound_read, mut outbound_write) = outbound.split();
     let relay_cancel = tokio_util::sync::CancellationToken::new();
 
@@ -868,7 +875,7 @@ async fn handle_tcp_stream(
                 },
                 _ = enable_check.tick() => {
                     if !check_incoming_client_approved(panel_sync_enabled, &traffic_audit, client_id).await {
-                        let _ = session.terminate().await;
+                        let _ = stream.terminate().await;
                         break Ok(());
                     }
                 },
@@ -915,7 +922,7 @@ async fn handle_tcp_stream(
                 _ = relay_cancel.cancelled() => break Ok(()),
                 _ = enable_check.tick() => {
                     if !check_incoming_client_approved(panel_sync_enabled, &traffic_audit, client_id).await {
-                        let _ = session.terminate().await;
+                        let _ = stream.terminate().await;
                         break Ok(());
                     }
                 },
@@ -1016,14 +1023,20 @@ async fn recv_uot_udp_payload(outbound: &UotUdpOutbound, outbound_buf: &mut [u8]
 }
 
 async fn connect_outbound_tcp(destination: &Address, outbound_socks5: Option<ProxyParameters>) -> std::io::Result<TcpStream> {
-    if let Some(parameters) = outbound_socks5 {
-        let proxy_addr: SocketAddr = parameters.addr.try_into()?;
-        let mut stream = TcpStream::connect(proxy_addr).await?;
-        client::connect(&mut stream, destination.clone(), parameters.credentials).await?;
-        Ok(stream)
-    } else {
-        TcpStream::connect(destination.to_string()).await
-    }
+    const OUTBOUND_CONNECT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+
+    tokio::time::timeout(OUTBOUND_CONNECT_TIMEOUT, async {
+        if let Some(parameters) = outbound_socks5 {
+            let proxy_addr: SocketAddr = parameters.addr.try_into()?;
+            let mut stream = TcpStream::connect(proxy_addr).await?;
+            client::connect(&mut stream, destination.clone(), parameters.credentials).await?;
+            Ok(stream)
+        } else {
+            TcpStream::connect(destination.to_string()).await
+        }
+    })
+    .await
+    .map_err(|_| std::io::Error::new(std::io::ErrorKind::TimedOut, "outbound connect timed out"))?
 }
 
 async fn print_anytls_url(args: &Args) -> Result<(), BoxError> {

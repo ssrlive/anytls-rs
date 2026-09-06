@@ -21,6 +21,8 @@ use crate::proxy::session::Stream;
 #[cfg(any(feature = "client", feature = "server"))]
 use async_trait::async_trait;
 #[cfg(any(feature = "client", feature = "server"))]
+use bytes::Bytes;
+#[cfg(any(feature = "client", feature = "server"))]
 use parking_lot::Mutex as BlockingMutex;
 #[cfg(any(feature = "client", feature = "server"))]
 use std::sync::Arc;
@@ -106,11 +108,14 @@ pub(crate) async fn new_server_session(
     conn: Box<dyn AsyncReadWrite>,
     on_new_stream: Box<dyn Fn(Arc<Stream>) + Send + Sync>,
     padding: Arc<RwLock<PaddingFactory>>,
+    max_streams: usize,
 ) -> Session {
     let protocol: Arc<dyn Protocol> = Arc::new(AnyTlsProtocol);
     let protocol_state = State::new(padding.read().await.clone());
     let writer_state = WriterRuntimeState::new(false);
-    Session::new_with_protocol(conn, false, Some(on_new_stream), protocol, protocol_state, writer_state)
+    let session = Session::new_with_protocol(conn, false, Some(on_new_stream), protocol, protocol_state, writer_state);
+    session.set_max_incoming_streams(max_streams);
+    session
 }
 
 #[cfg(any(feature = "client", feature = "server"))]
@@ -268,7 +273,14 @@ impl AnyTlsProtocol {
                 }
                 ProtocolAction::EnsureIncomingStream { sid } => {
                     log::debug!("apply_actions: EnsureIncomingStream sid={}", sid);
-                    host.ensure_incoming_stream(sid).await?;
+                    if let Err(error) = host.ensure_incoming_stream(sid).await {
+                        if error.kind() == std::io::ErrorKind::WouldBlock {
+                            let frame = Frame::with_data(Command::SynAck, sid, Bytes::copy_from_slice(b"session stream limit reached"));
+                            host.send_frame(frame).await?;
+                        } else {
+                            return Err(error);
+                        }
+                    }
                 }
                 ProtocolAction::CloseLocalStream { sid } => {
                     log::debug!("apply_actions: CloseLocalStream sid={}", sid);

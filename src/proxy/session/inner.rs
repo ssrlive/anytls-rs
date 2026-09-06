@@ -6,7 +6,7 @@ use async_trait::async_trait;
 use bytes::Bytes;
 use std::collections::HashMap;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use tokio::io::AsyncReadExt;
 use tokio::sync::{Mutex, Notify, mpsc::Sender, watch};
 
@@ -17,6 +17,7 @@ pub struct Session {
     reader: Mutex<tokio::io::ReadHalf<Box<dyn AsyncReadWrite>>>,
     streams: Arc<Mutex<HashMap<u32, Arc<Stream>>>>,
     next_stream_id: AtomicU32,
+    max_incoming_streams: AtomicUsize,
     closed: AtomicBool,
     started: Mutex<bool>,
     pub(crate) is_client: bool,
@@ -49,6 +50,7 @@ impl Session {
             reader: Mutex::new(reader),
             streams: Arc::new(Mutex::new(HashMap::new())),
             next_stream_id: AtomicU32::new(0),
+            max_incoming_streams: AtomicUsize::new(1024),
             closed: AtomicBool::new(false),
             started: Mutex::new(false),
             is_client,
@@ -248,15 +250,25 @@ impl Session {
         stream
     }
 
-    async fn create_incoming_stream(&self, sid: u32) -> Option<Arc<Stream>> {
+    pub(crate) fn set_max_incoming_streams(&self, max_streams: usize) {
+        self.max_incoming_streams.store(max_streams.max(1), Ordering::Release);
+    }
+
+    async fn create_incoming_stream(&self, sid: u32) -> std::io::Result<Option<Arc<Stream>>> {
         if sid == 0 || self.is_terminated().await {
-            return None;
+            return Ok(None);
         }
 
         let stream = {
             let mut streams = self.streams.lock().await;
             if let Some(stream) = streams.get(&sid) {
-                return Some(stream.clone());
+                return Ok(Some(stream.clone()));
+            }
+            if streams.len() >= self.max_incoming_streams.load(Ordering::Acquire) {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::WouldBlock,
+                    "session incoming stream limit reached",
+                ));
             }
             let stream = Arc::new(self.new_stream(sid));
             streams.insert(sid, stream.clone());
@@ -271,7 +283,7 @@ impl Session {
                 callback(callback_stream);
             });
         }
-        Some(stream)
+        Ok(Some(stream))
     }
 }
 
@@ -316,7 +328,7 @@ impl ProtocolHost for Session {
         if sid == 0 {
             return Err(std::io::Error::new(std::io::ErrorKind::InvalidData, "SYN cannot use control sid 0"));
         }
-        self.create_incoming_stream(sid).await;
+        self.create_incoming_stream(sid).await?;
         Ok(())
     }
 

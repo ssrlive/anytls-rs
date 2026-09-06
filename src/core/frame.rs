@@ -1,6 +1,7 @@
 use bytes::{Buf, BufMut, Bytes, BytesMut};
 
 pub const HEADER_OVERHEAD_SIZE: usize = 1 + 4 + 2;
+pub const MAX_FRAME_DATA_SIZE: usize = u16::MAX as usize;
 
 #[repr(u8)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

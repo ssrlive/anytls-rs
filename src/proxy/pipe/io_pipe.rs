@@ -21,8 +21,8 @@ pub struct PipeInner {
     closed: bool,
     stream_end_queued: bool,
     read_error: Option<std::io::Error>,
-    data_sender: Option<mpsc::UnboundedSender<PipeEvent>>,
-    data_receiver: Option<mpsc::UnboundedReceiver<PipeEvent>>,
+    data_sender: Option<mpsc::Sender<PipeEvent>>,
+    data_receiver: Option<mpsc::Receiver<PipeEvent>>,
     buffer: Vec<u8>,
     // Notify to wake readers when receiver becomes available or pipe state changes
     read_waiter: Arc<Notify>,
@@ -131,24 +131,29 @@ impl PipeReader {
     }
 
     pub async fn finish_stream(&self, error: Option<std::io::Error>) {
-        let mut inner = self.inner.lock().await;
-        if inner.closed || inner.stream_end_queued {
-            return;
-        }
+        let (sender, waiter) = {
+            let mut inner = self.inner.lock().await;
+            if inner.closed || inner.stream_end_queued {
+                return;
+            }
 
-        inner.stream_end_queued = true;
+            inner.stream_end_queued = true;
+            (inner.data_sender.clone(), inner.read_waiter.clone())
+        };
 
-        let sent = inner
-            .data_sender
-            .as_ref()
-            .is_some_and(|sender| sender.send(PipeEvent::StreamEnd(error)).is_ok());
+        let sent = if let Some(sender) = sender {
+            sender.send(PipeEvent::StreamEnd(error)).await.is_ok()
+        } else {
+            false
+        };
 
         if !sent {
+            let mut inner = self.inner.lock().await;
             inner.closed = true;
             inner.data_sender = None;
         }
 
-        inner.read_waiter.notify_one();
+        waiter.notify_one();
     }
 
     pub async fn set_read_deadline(&self, deadline: std::time::SystemTime) -> std::io::Result<()> {
@@ -161,22 +166,20 @@ impl PipeReader {
 impl PipeWriter {
     pub async fn write(&self, buf: &[u8]) -> std::io::Result<usize> {
         use std::io::{Error, ErrorKind::BrokenPipe};
-        let inner = self.inner.lock().await;
-
-        if inner.closed || inner.stream_end_queued {
-            return Err(Error::new(BrokenPipe, "Pipe closed"));
-        }
-
-        if let Some(tx) = &inner.data_sender {
-            if let Err(e) = tx.send(PipeEvent::Data(buf.to_vec())) {
-                return Err(Error::new(BrokenPipe, format!("Channel closed: {}", e)));
+        let (tx, waiter) = {
+            let inner = self.inner.lock().await;
+            if inner.closed || inner.stream_end_queued {
+                return Err(Error::new(BrokenPipe, "Pipe closed"));
             }
-            // Notify any waiting readers that data is available
-            inner.read_waiter.notify_one();
-            Ok(buf.len())
-        } else {
-            Err(Error::new(BrokenPipe, "Pipe closed"))
-        }
+            let tx = inner.data_sender.clone().ok_or_else(|| Error::new(BrokenPipe, "Pipe closed"))?;
+            (tx, inner.read_waiter.clone())
+        };
+
+        tx.send(PipeEvent::Data(buf.to_vec()))
+            .await
+            .map_err(|error| Error::new(BrokenPipe, format!("Channel closed: {}", error)))?;
+        waiter.notify_one();
+        Ok(buf.len())
     }
 
     pub async fn set_write_deadline(&self, deadline: std::time::SystemTime) -> std::io::Result<()> {
@@ -187,7 +190,8 @@ impl PipeWriter {
 }
 
 pub fn pipe() -> (PipeReader, PipeWriter) {
-    let (tx, rx) = mpsc::unbounded_channel();
+    const PIPE_QUEUE_CAPACITY: usize = 64;
+    let (tx, rx) = mpsc::channel(PIPE_QUEUE_CAPACITY);
 
     let inner = Arc::new(Mutex::new(PipeInner {
         read_deadline: PipeDeadline::new(),
@@ -207,6 +211,8 @@ pub fn pipe() -> (PipeReader, PipeWriter) {
 #[cfg(test)]
 mod tests {
     use super::pipe;
+    use std::time::Duration;
+    use tokio::time::timeout;
 
     #[tokio::test]
     async fn finish_stream_drains_queued_data_before_eof() {
@@ -244,5 +250,19 @@ mod tests {
         let error = reader.read(&mut buffer).await.unwrap_err();
         assert_eq!(error.kind(), std::io::ErrorKind::Other);
         assert_eq!(reader.read(&mut buffer).await.unwrap(), 0);
+    }
+
+    #[tokio::test]
+    async fn writer_applies_backpressure_when_reader_is_slow() {
+        let (reader, writer) = pipe();
+        for _ in 0..64 {
+            writer.write(b"queued").await.expect("queue should accept its capacity");
+        }
+
+        let blocked_write = tokio::spawn(async move { writer.write(b"blocked").await });
+        assert!(timeout(Duration::from_millis(20), blocked_write).await.is_err());
+
+        let mut buffer = [0_u8; 16];
+        assert_eq!(reader.read(&mut buffer).await.expect("reader should drain one item"), 6);
     }
 }
