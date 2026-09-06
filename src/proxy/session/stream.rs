@@ -1,6 +1,6 @@
 use crate::core::{Command, Frame};
 use crate::proxy::pipe::{PipeReader, PipeWriter, pipe};
-use crate::runtime::{FrameWrite, MAX_QUEUED_FRAME_BYTES, StreamProtocolHooks};
+use crate::runtime::{DataWrite, FrameWrite, MAX_QUEUED_FRAME_BYTES, StreamProtocolHooks};
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Weak};
@@ -18,12 +18,14 @@ pub struct Stream {
     pipe_reader: PipeReader,
     pipe_writer: PipeWriter,
     control_tx: Sender<FrameWrite>,
-    frame_tx: Sender<FrameWrite>,
+    data_enqueue_tx: Sender<DataWrite>,
     write_budget: Arc<Semaphore>,
     streams: Weak<Mutex<HashMap<u32, Arc<Stream>>>>,
     idle_state: Weak<watch::Sender<bool>>,
     protocol_hooks: Arc<dyn StreamProtocolHooks>,
-    closed: AtomicBool,
+    read_closed: AtomicBool,
+    write_closed: AtomicBool,
+    terminated: AtomicBool,
     handshake: watch::Sender<HandshakeState>,
 }
 
@@ -31,7 +33,7 @@ impl Stream {
     pub(crate) fn new(
         id: u32,
         control_tx: Sender<FrameWrite>,
-        frame_tx: Sender<FrameWrite>,
+        data_enqueue_tx: Sender<DataWrite>,
         write_budget: Arc<Semaphore>,
         streams: Weak<Mutex<HashMap<u32, Arc<Stream>>>>,
         idle_state: Weak<watch::Sender<bool>>,
@@ -44,12 +46,14 @@ impl Stream {
             pipe_reader,
             pipe_writer,
             control_tx,
-            frame_tx,
+            data_enqueue_tx,
             write_budget,
             streams,
             idle_state,
             protocol_hooks,
-            closed: AtomicBool::new(false),
+            read_closed: AtomicBool::new(false),
+            write_closed: AtomicBool::new(false),
+            terminated: AtomicBool::new(false),
             handshake,
         }
     }
@@ -59,11 +63,19 @@ impl Stream {
     }
 
     pub fn is_closed(&self) -> bool {
-        self.closed.load(Ordering::Acquire)
+        self.terminated.load(Ordering::Acquire)
+    }
+
+    pub fn is_read_closed(&self) -> bool {
+        self.read_closed.load(Ordering::Acquire)
+    }
+
+    pub fn is_write_closed(&self) -> bool {
+        self.write_closed.load(Ordering::Acquire)
     }
 
     pub async fn is_terminated(&self) -> bool {
-        self.closed.load(Ordering::Acquire) || self.frame_tx.is_closed()
+        self.terminated.load(Ordering::Acquire) || self.data_enqueue_tx.is_closed()
     }
 
     pub async fn wait_for_handshake(&self) -> std::io::Result<()> {
@@ -94,15 +106,18 @@ impl Stream {
     }
 
     pub async fn write(&self, buf: &[u8]) -> std::io::Result<usize> {
-        if self.closed.load(Ordering::Acquire) {
+        if self.write_closed.load(Ordering::Acquire) {
             return Err(std::io::Error::new(std::io::ErrorKind::BrokenPipe, "Stream closed"));
         }
 
         for chunk in buf.chunks(crate::core::MAX_FRAME_DATA_SIZE) {
             let frame = Frame::with_data(Command::Psh, self.id, bytes::Bytes::copy_from_slice(chunk));
             let budget = self.acquire_write_budget(chunk.len()).await?;
-            self.frame_tx
-                .send(FrameWrite::new(frame, None, Some(budget)))
+            self.data_enqueue_tx
+                .send(DataWrite {
+                    sid: self.id,
+                    frame: FrameWrite::new(frame, None, Some(budget)),
+                })
                 .await
                 .map_err(|_| std::io::Error::new(std::io::ErrorKind::BrokenPipe, "Session closed"))?;
         }
@@ -111,43 +126,60 @@ impl Stream {
     }
 
     pub async fn push_data(&self, buf: &[u8]) -> std::io::Result<usize> {
-        if self.closed.load(Ordering::Acquire) {
+        if self.read_closed.load(Ordering::Acquire) {
             return Err(std::io::Error::new(std::io::ErrorKind::BrokenPipe, "Stream closed"));
         }
         self.pipe_writer.write(buf).await
     }
 
     pub async fn close(&self) -> std::io::Result<()> {
-        if !self.mark_closed() {
+        self.read_closed.store(true, Ordering::Release);
+        self.pipe_reader.close_with_error(None);
+        self.shutdown_write().await
+    }
+
+    pub async fn shutdown_write(&self) -> std::io::Result<()> {
+        if !self.mark_write_closed() {
+            self.maybe_finalize().await;
             return Ok(());
         }
 
-        self.remove_from_session().await;
-        self.pipe_reader.close_with_error(None);
-        self.control_tx
+        let result = self
+            .control_tx
             .send(FrameWrite::new(
                 Frame::new(Command::Fin, self.id),
                 None,
                 Some(self.acquire_write_budget(0).await?),
             ))
             .await
-            .map_err(|_| std::io::Error::new(std::io::ErrorKind::BrokenPipe, "Session closed"))
+            .map_err(|_| std::io::Error::new(std::io::ErrorKind::BrokenPipe, "Session closed"));
+        self.maybe_finalize().await;
+        result
     }
 
     pub(crate) async fn close_from_peer(&self, error: Option<std::io::Error>) {
-        if self.mark_closed() {
-            self.handshake.send_replace(HandshakeState::Failed(
-                error
-                    .as_ref()
-                    .map(ToString::to_string)
-                    .unwrap_or_else(|| "Stream closed before SYNACK".to_string()),
-            ));
+        if self.mark_read_closed() {
+            let handshake_error = error
+                .as_ref()
+                .map(ToString::to_string)
+                .unwrap_or_else(|| "Stream closed before SYNACK".to_string());
+            self.handshake.send_if_modified(|state| {
+                if matches!(state, HandshakeState::Pending) {
+                    *state = HandshakeState::Failed(handshake_error);
+                    true
+                } else {
+                    false
+                }
+            });
             self.pipe_reader.finish_stream(error).await;
         }
+        self.maybe_finalize().await;
     }
 
     pub(crate) async fn close_from_session(&self, error: Option<std::io::Error>) {
-        if self.mark_closed() {
+        if !self.terminated.swap(true, Ordering::AcqRel) {
+            self.read_closed.store(true, Ordering::Release);
+            self.write_closed.store(true, Ordering::Release);
             self.handshake.send_replace(HandshakeState::Failed(
                 error
                     .as_ref()
@@ -173,13 +205,26 @@ impl Stream {
         self.protocol_hooks.handshake_success(self.id).await
     }
 
-    fn mark_closed(&self) -> bool {
-        self.closed
+    fn mark_read_closed(&self) -> bool {
+        self.read_closed
             .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
             .is_ok()
     }
 
-    async fn remove_from_session(&self) {
+    fn mark_write_closed(&self) -> bool {
+        self.write_closed
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .is_ok()
+    }
+
+    async fn maybe_finalize(&self) {
+        if !self.read_closed.load(Ordering::Acquire) || !self.write_closed.load(Ordering::Acquire) {
+            return;
+        }
+        if self.terminated.swap(true, Ordering::AcqRel) {
+            return;
+        }
+
         let Some(streams) = self.streams.upgrade() else {
             return;
         };

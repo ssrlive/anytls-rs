@@ -25,6 +25,8 @@ use bytes::Bytes;
 #[cfg(any(feature = "client", feature = "server"))]
 use parking_lot::Mutex as BlockingMutex;
 #[cfg(any(feature = "client", feature = "server"))]
+use std::collections::{HashMap, VecDeque};
+#[cfg(any(feature = "client", feature = "server"))]
 use std::sync::Arc;
 #[cfg(any(feature = "client", feature = "server"))]
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -54,6 +56,12 @@ pub(crate) struct FrameWrite {
 }
 
 #[cfg(any(feature = "client", feature = "server"))]
+pub(crate) struct DataWrite {
+    pub(crate) sid: u32,
+    pub(crate) frame: FrameWrite,
+}
+
+#[cfg(any(feature = "client", feature = "server"))]
 impl FrameWrite {
     pub(crate) fn new(
         frame: Frame,
@@ -72,6 +80,61 @@ pub(crate) struct WriterRuntimeState {
     pkt_counter: Arc<Mutex<u32>>,
     failed: Arc<AtomicBool>,
     failure_notify: Arc<tokio::sync::Notify>,
+}
+
+#[cfg(any(feature = "client", feature = "server"))]
+pub(crate) fn spawn_data_scheduler(mut input: Receiver<DataWrite>, output: Sender<FrameWrite>) {
+    tokio::spawn(async move {
+        let mut queues: HashMap<u32, VecDeque<FrameWrite>> = HashMap::new();
+        let mut ready = VecDeque::new();
+        let mut input_open = true;
+
+        while input_open || !ready.is_empty() {
+            for _ in 0..32 {
+                if !input_open {
+                    break;
+                }
+                match input.try_recv() {
+                    Ok(DataWrite { sid, frame }) => {
+                        let queue = queues.entry(sid).or_default();
+                        if queue.is_empty() {
+                            ready.push_back(sid);
+                        }
+                        queue.push_back(frame);
+                    }
+                    Err(tokio::sync::mpsc::error::TryRecvError::Empty) => break,
+                    Err(tokio::sync::mpsc::error::TryRecvError::Disconnected) => input_open = false,
+                }
+            }
+
+            if let Some(sid) = ready.pop_front() {
+                let Some(queue) = queues.get_mut(&sid) else {
+                    continue;
+                };
+                let frame = queue.pop_front().expect("ready data queue must not be empty");
+                if queue.is_empty() {
+                    queues.remove(&sid);
+                } else {
+                    ready.push_back(sid);
+                }
+                if output.send(frame).await.is_err() {
+                    return;
+                }
+                continue;
+            }
+
+            match input.recv().await {
+                Some(DataWrite { sid, frame }) => {
+                    let queue = queues.entry(sid).or_default();
+                    if queue.is_empty() {
+                        ready.push_back(sid);
+                    }
+                    queue.push_back(frame);
+                }
+                None => input_open = false,
+            }
+        }
+    });
 }
 
 #[cfg(any(feature = "client", feature = "server"))]
@@ -451,5 +514,36 @@ impl Protocol for AnyTlsProtocol {
 
         let actions = Engine::on_frame(&host.protocol_state(), host.is_client(), &frame)?;
         self.apply_actions(host, actions).await
+    }
+}
+
+#[cfg(all(test, any(feature = "client", feature = "server")))]
+mod tests {
+    use super::*;
+    use tokio::sync::mpsc;
+
+    #[tokio::test]
+    async fn data_scheduler_round_robins_active_streams() {
+        let (input_tx, input_rx) = mpsc::channel(8);
+        let (output_tx, mut output_rx) = mpsc::channel(8);
+        spawn_data_scheduler(input_rx, output_tx);
+
+        for sid in [1, 1, 1, 2] {
+            input_tx
+                .send(DataWrite {
+                    sid,
+                    frame: FrameWrite::new(Frame::new(Command::Psh, sid), None, None),
+                })
+                .await
+                .unwrap();
+        }
+        drop(input_tx);
+
+        let mut sent_sids = Vec::new();
+        while let Some(frame) = output_rx.recv().await {
+            sent_sids.push(frame.frame.sid);
+        }
+
+        assert_eq!(sent_sids, vec![1, 2, 1, 1]);
     }
 }

@@ -1,7 +1,7 @@
 use crate::AsyncReadWrite;
 use crate::core::{Command, Frame, HEADER_OVERHEAD_SIZE, State};
 use crate::proxy::session::Stream;
-use crate::runtime::{FrameWrite, MAX_QUEUED_FRAME_BYTES, Protocol, ProtocolHost, WriterRuntimeState};
+use crate::runtime::{DataWrite, FrameWrite, MAX_QUEUED_FRAME_BYTES, Protocol, ProtocolHost, WriterRuntimeState, spawn_data_scheduler};
 use async_trait::async_trait;
 use bytes::Bytes;
 use std::collections::HashMap;
@@ -30,6 +30,7 @@ pub struct Session {
     protocol: Arc<dyn Protocol>,
     control_tx: Sender<FrameWrite>,
     pub(crate) frame_tx: Sender<FrameWrite>,
+    data_enqueue_tx: Sender<DataWrite>,
     write_budget: Arc<Semaphore>,
 }
 
@@ -45,6 +46,8 @@ impl Session {
         let (reader, writer) = tokio::io::split(conn);
         let (control_tx, control_rx) = tokio::sync::mpsc::channel::<FrameWrite>(32);
         let (frame_tx, data_rx) = tokio::sync::mpsc::channel::<FrameWrite>(100);
+        let (data_enqueue_tx, data_enqueue_rx) = tokio::sync::mpsc::channel::<DataWrite>(100);
+        spawn_data_scheduler(data_enqueue_rx, frame_tx.clone());
         let write_budget = Arc::new(Semaphore::new(MAX_QUEUED_FRAME_BYTES));
         let (idle_state, _) = watch::channel(true);
         protocol.spawn_writer_task(writer, control_rx, data_rx, protocol_state.clone(), writer_state.clone());
@@ -66,6 +69,7 @@ impl Session {
             protocol,
             control_tx,
             frame_tx,
+            data_enqueue_tx,
             write_budget,
         }
     }
@@ -132,31 +136,42 @@ impl Session {
     pub async fn write_frame(&self, frame: Frame) -> std::io::Result<usize> {
         let len = frame.data.len();
         let budget = self.acquire_write_budget(len).await?;
-        let sender = if matches!(frame.cmd, Command::Psh) {
-            &self.frame_tx
+        if matches!(frame.cmd, Command::Psh) {
+            self.data_enqueue_tx
+                .send(DataWrite {
+                    sid: frame.sid,
+                    frame: FrameWrite::new(frame, None, Some(budget)),
+                })
+                .await
+                .map(|_| len)
+                .map_err(|_| std::io::Error::new(std::io::ErrorKind::BrokenPipe, "Session closed"))
         } else {
-            &self.control_tx
-        };
-        sender
-            .send(FrameWrite::new(frame, None, Some(budget)))
-            .await
-            .map(|_| len)
-            .map_err(|_| std::io::Error::new(std::io::ErrorKind::BrokenPipe, "Session closed"))
+            self.control_tx
+                .send(FrameWrite::new(frame, None, Some(budget)))
+                .await
+                .map(|_| len)
+                .map_err(|_| std::io::Error::new(std::io::ErrorKind::BrokenPipe, "Session closed"))
+        }
     }
 
     pub async fn write_frame_sync(&self, frame: Frame) -> std::io::Result<usize> {
         let len = frame.data.len();
         let budget = self.acquire_write_budget(len).await?;
         let (ack_tx, ack_rx) = tokio::sync::oneshot::channel();
-        let sender = if matches!(frame.cmd, Command::Psh) {
-            &self.frame_tx
+        if matches!(frame.cmd, Command::Psh) {
+            self.data_enqueue_tx
+                .send(DataWrite {
+                    sid: frame.sid,
+                    frame: FrameWrite::new(frame, Some(ack_tx), Some(budget)),
+                })
+                .await
+                .map_err(|_| std::io::Error::new(std::io::ErrorKind::BrokenPipe, "Session closed"))
         } else {
-            &self.control_tx
-        };
-        sender
-            .send(FrameWrite::new(frame, Some(ack_tx), Some(budget)))
-            .await
-            .map_err(|_| std::io::Error::new(std::io::ErrorKind::BrokenPipe, "Session closed"))?;
+            self.control_tx
+                .send(FrameWrite::new(frame, Some(ack_tx), Some(budget)))
+                .await
+                .map_err(|_| std::io::Error::new(std::io::ErrorKind::BrokenPipe, "Session closed"))
+        }?;
         ack_rx
             .await
             .map_err(|_| std::io::Error::new(std::io::ErrorKind::BrokenPipe, "Writer dropped"))??;
@@ -215,7 +230,7 @@ impl Session {
         Stream::new(
             sid,
             self.control_tx.clone(),
-            self.frame_tx.clone(),
+            self.data_enqueue_tx.clone(),
             self.write_budget.clone(),
             Arc::downgrade(&self.streams),
             Arc::downgrade(&self.idle_state),
@@ -344,7 +359,7 @@ impl ProtocolHost for Session {
 
     async fn push_stream_data(&self, sid: u32, data: Bytes) -> std::io::Result<()> {
         if let Some(stream) = self.stream_for_sid(sid).await {
-            if stream.is_closed() {
+            if stream.is_read_closed() {
                 log::debug!("Ignoring payload for locally closed stream sid={sid}");
                 return Ok(());
             }
@@ -370,7 +385,7 @@ impl ProtocolHost for Session {
     }
 
     async fn close_logical_stream(&self, sid: u32) -> std::io::Result<()> {
-        if let Some(stream) = self.remove_stream(sid).await {
+        if let Some(stream) = self.stream_for_sid(sid).await {
             stream.close_from_peer(None).await;
         }
         Ok(())
@@ -469,6 +484,11 @@ mod tests {
         let len = stream.read(&mut buffer).await.expect("queued payload should be readable");
         assert_eq!(&buffer[..len], b"payload");
         assert_eq!(stream.read(&mut buffer).await.expect("FIN should produce EOF"), 0);
+        assert!(
+            session.stream_for_sid(7).await.is_some(),
+            "peer FIN should only close the read direction"
+        );
+        stream.close().await.expect("local close should finish the stream");
         assert!(session.stream_for_sid(7).await.is_none());
     }
 
@@ -504,8 +524,11 @@ mod tests {
     async fn idle_waiter_observes_last_stream_closure() {
         let session = test_session();
         session.ensure_incoming_stream(7).await.expect("stream should be created");
+        let stream = session.stream_for_sid(7).await.expect("stream should exist");
         let wait_for_idle = session.wait_for_idle();
         session.close_logical_stream(7).await.expect("peer FIN should close stream");
+        assert!(!stream.is_write_closed(), "peer FIN must preserve the local write direction");
+        stream.close().await.expect("local close should finish the stream");
         timeout(Duration::from_secs(1), wait_for_idle)
             .await
             .expect("idle state should be observed without a missed notification");
