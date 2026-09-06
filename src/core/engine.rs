@@ -82,6 +82,12 @@ impl Engine {
                 actions.push(ProtocolAction::CloseLocalStream { sid: frame.sid });
             }
             Command::Settings if !is_client && !frame.data.is_empty() => {
+                if state.received_settings_from_client() {
+                    actions.push(ProtocolAction::AlertAndFail {
+                        message: "duplicate client settings".to_string(),
+                    });
+                    return Ok(actions);
+                }
                 let settings = StringMap::from_bytes(frame.data.as_ref());
                 let Some(version) = settings.get("v").and_then(|value| value.parse::<u8>().ok()) else {
                     actions.push(ProtocolAction::AlertAndFail {
@@ -200,5 +206,15 @@ mod tests {
 
         assert!(matches!(actions.first(), Some(crate::core::ProtocolAction::AlertAndFail { .. })));
         assert!(!state.received_settings_from_client());
+    }
+
+    #[test]
+    fn rejects_duplicate_settings() {
+        let state = State::new(PaddingFactory::default());
+        state.mark_received_settings_from_client();
+        let frame = Frame::with_data(Command::Settings, 0, bytes::Bytes::from_static(b"v=2"));
+        let actions = Engine::on_frame(&state, false, &frame).expect("duplicate settings should produce an alert action");
+
+        assert!(matches!(actions.first(), Some(crate::core::ProtocolAction::AlertAndFail { .. })));
     }
 }

@@ -166,7 +166,7 @@ impl Session {
     }
 
     pub async fn is_terminated(&self) -> bool {
-        self.closed.load(Ordering::Acquire) || self.frame_tx.is_closed()
+        self.closed.load(Ordering::Acquire) || self.frame_tx.is_closed() || self.writer_state.is_failed()
     }
 
     pub async fn peer_version(&self) -> u8 {
@@ -207,6 +207,7 @@ impl Session {
     async fn recv_loop(&self) -> std::io::Result<()> {
         let mut buffer = vec![0_u8; 4096];
         let mut pending = Vec::new();
+        let writer_failure = self.writer_state.failure_notified();
 
         loop {
             if self.closed.load(Ordering::Acquire) {
@@ -216,6 +217,10 @@ impl Session {
             let bytes_read = tokio::select! {
                 _ = self.close_notify.notified() => {
                     return Err(std::io::Error::new(std::io::ErrorKind::BrokenPipe, "Session closed"));
+                }
+                _ = writer_failure.notified() => {
+                    let _ = self.terminate().await;
+                    return Err(std::io::Error::new(std::io::ErrorKind::BrokenPipe, "Session writer failed"));
                 }
                 result = async {
                     self.reader.lock().await.read(&mut buffer).await
@@ -261,8 +266,11 @@ impl Session {
 
         let stream = {
             let mut streams = self.streams.lock().await;
-            if let Some(stream) = streams.get(&sid) {
-                return Ok(Some(stream.clone()));
+            if streams.contains_key(&sid) {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::AlreadyExists,
+                    "duplicate incoming stream identifier",
+                ));
             }
             if streams.len() >= self.max_incoming_streams.load(Ordering::Acquire) {
                 return Err(std::io::Error::new(
@@ -498,6 +506,36 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn writer_failure_marks_session_terminated() {
+        let (io, peer) = duplex(1024);
+        drop(peer);
+        let session = Session::new_with_protocol(
+            Box::new(io),
+            true,
+            None,
+            Arc::new(crate::runtime::AnyTlsProtocol),
+            crate::core::State::new(crate::core::PaddingFactory::default()),
+            crate::runtime::WriterRuntimeState::new(true),
+        );
+
+        session
+            .write_frame(crate::core::Frame::new(crate::core::Command::Waste, 0))
+            .await
+            .expect("frame should be queued before writer observes the closed peer");
+
+        timeout(Duration::from_secs(1), async {
+            loop {
+                if session.is_terminated().await {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("writer failure should terminate the session");
+    }
+
+    #[tokio::test]
     async fn stream_limit_rejects_extra_streams() {
         let (io, mut peer) = duplex(1024);
         tokio::spawn(async move {
@@ -518,5 +556,30 @@ mod tests {
             Err(error) => error,
         };
         assert_eq!(error.kind(), std::io::ErrorKind::WouldBlock);
+    }
+
+    #[tokio::test]
+    async fn incoming_stream_limit_rejects_new_sid() {
+        let session = test_session();
+        session.set_max_incoming_streams(1);
+        session.ensure_incoming_stream(1).await.expect("first incoming stream should open");
+
+        let error = session
+            .ensure_incoming_stream(2)
+            .await
+            .expect_err("incoming stream limit should reject a new SID");
+        assert_eq!(error.kind(), std::io::ErrorKind::WouldBlock);
+    }
+
+    #[tokio::test]
+    async fn duplicate_incoming_sid_is_rejected() {
+        let session = test_session();
+        session.ensure_incoming_stream(1).await.expect("first incoming stream should open");
+
+        let error = session
+            .ensure_incoming_stream(1)
+            .await
+            .expect_err("duplicate incoming SID should be rejected");
+        assert_eq!(error.kind(), std::io::ErrorKind::AlreadyExists);
     }
 }

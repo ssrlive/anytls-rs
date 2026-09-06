@@ -27,6 +27,8 @@ use parking_lot::Mutex as BlockingMutex;
 #[cfg(any(feature = "client", feature = "server"))]
 use std::sync::Arc;
 #[cfg(any(feature = "client", feature = "server"))]
+use std::sync::atomic::{AtomicBool, Ordering};
+#[cfg(any(feature = "client", feature = "server"))]
 use tokio::io::AsyncWriteExt;
 #[cfg(any(feature = "client", feature = "server"))]
 use tokio::sync::Mutex;
@@ -50,6 +52,8 @@ pub(crate) struct WriterRuntimeState {
     buffering: Arc<Mutex<bool>>,
     buffer: Arc<Mutex<Vec<u8>>>,
     pkt_counter: Arc<Mutex<u32>>,
+    failed: Arc<AtomicBool>,
+    failure_notify: Arc<tokio::sync::Notify>,
 }
 
 #[cfg(any(feature = "client", feature = "server"))]
@@ -60,6 +64,8 @@ impl WriterRuntimeState {
             buffering: Arc::new(Mutex::new(false)),
             buffer: Arc::new(Mutex::new(Vec::new())),
             pkt_counter: Arc::new(Mutex::new(0)),
+            failed: Arc::new(AtomicBool::new(false)),
+            failure_notify: Arc::new(tokio::sync::Notify::new()),
         })
     }
 
@@ -92,6 +98,20 @@ impl WriterRuntimeState {
         let mut counter = self.pkt_counter.lock().await;
         *counter += 1;
         *counter
+    }
+
+    pub(crate) fn is_failed(&self) -> bool {
+        self.failed.load(Ordering::Acquire)
+    }
+
+    pub(crate) fn failure_notified(&self) -> Arc<tokio::sync::Notify> {
+        self.failure_notify.clone()
+    }
+
+    pub(crate) fn mark_failed(&self) {
+        if !self.failed.swap(true, Ordering::AcqRel) {
+            self.failure_notify.notify_waiters();
+        }
     }
 }
 
@@ -318,6 +338,7 @@ impl Protocol for AnyTlsProtocol {
         state: Arc<State>,
         writer_state: Arc<WriterRuntimeState>,
     ) {
+        let writer_state_for_task = writer_state.clone();
         tokio::spawn(async move {
             while let Some((frame, ack)) = rx.recv().await {
                 let res = async {
@@ -339,8 +360,12 @@ impl Protocol for AnyTlsProtocol {
 
                 if let Err(error) = res {
                     log::warn!("Failed to write frame to peer: {error}");
+                    writer_state_for_task.mark_failed();
                     break;
                 }
+            }
+            if rx.is_closed() {
+                writer_state_for_task.mark_failed();
             }
             log::debug!("Session writer task exiting (writer loop ended)");
         });
