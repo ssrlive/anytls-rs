@@ -190,13 +190,8 @@ pub struct ClientArgs {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub root_cert: Option<PathBuf>,
 
-    /// Enable multiple logical streams per AnyTLS session
-    #[arg(short, long)]
-    #[serde(skip)]
-    pub multiplexing: bool,
-
-    /// Maximum logical streams per AnyTLS session, forced to 1 when multiplexing is disabled
-    #[arg(short = 'x', long, default_value_t = 5, value_name = "N")]
+    /// Maximum logical streams per AnyTLS session, if is 1 then multiplexing is disabled
+    #[arg(short, long, default_value_t = 5, value_name = "N")]
     #[serde(skip)]
     pub max_streams_per_session: usize,
 
@@ -325,11 +320,7 @@ pub async fn runner_execute(cancel_token: CancellationToken, args: ClientArgs) -
 
     let tls_config = create_tls_config(args.root_cert.as_deref(), config.insecure)?;
     let padding = DefaultPaddingFactory::load();
-    let max_streams_per_session = if args.multiplexing {
-        args.max_streams_per_session.max(1)
-    } else {
-        1
-    };
+    let max_streams_per_session = args.max_streams_per_session.max(1);
 
     let padding_clone = padding.clone();
     let server = config.server.clone();
