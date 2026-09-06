@@ -342,7 +342,11 @@ impl ProtocolHost for Session {
             // The Go implementation closes the whole Session on a SYNACK error.
             // That loses unrelated multiplexed streams, so isolate the failure to
             // this stream and keep the Session available for the others.
+            if let Some(stream) = self.stream_for_sid(sid).await {
+                stream.resolve_handshake(None);
+            }
         } else if let Some(stream) = self.remove_stream(sid).await {
+            stream.resolve_handshake(Some(format!("remote: {message}")));
             stream
                 .close_from_peer(Some(std::io::Error::other(format!("remote: {message}"))))
                 .await;
