@@ -606,6 +606,72 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn recv_loop_preserves_payload_order_before_fin() {
+        let (io, mut peer) = duplex(4096);
+        let session = Session::new_with_protocol(
+            Box::new(io),
+            false,
+            None,
+            Arc::new(crate::runtime::AnyTlsProtocol),
+            crate::core::State::new(crate::core::PaddingFactory::default()),
+            crate::runtime::WriterRuntimeState::new(false),
+        );
+        for sid in [1, 2] {
+            session.ensure_incoming_stream(sid).await.unwrap();
+        }
+        let mut wire = Vec::new();
+        for index in 0..48_u8 {
+            for sid in [1, 2] {
+                let frame = Frame::with_data(Command::Psh, sid, Bytes::from(vec![sid as u8, index]));
+                wire.extend_from_slice(&frame.to_bytes().unwrap());
+            }
+        }
+        for sid in [1, 2] {
+            wire.extend_from_slice(&Frame::new(Command::Fin, sid).to_bytes().unwrap());
+        }
+        peer.write_all(&wire).await.unwrap();
+        peer.shutdown().await.unwrap();
+        let error = timeout(Duration::from_secs(1), session.recv_loop()).await.unwrap().unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::UnexpectedEof);
+        for sid in [1, 2] {
+            let stream = session.stream_for_sid(sid).await.unwrap();
+            let mut received = Vec::new();
+            timeout(Duration::from_secs(1), async {
+                let mut buffer = [0; 16];
+                loop {
+                    let count = stream.read(&mut buffer).await.unwrap();
+                    if count == 0 {
+                        break;
+                    }
+                    received.extend_from_slice(&buffer[..count]);
+                }
+            })
+            .await
+            .unwrap();
+            let expected: Vec<u8> = (0..48_u8).flat_map(|index| [sid as u8, index]).collect();
+            assert_eq!(received, expected);
+        }
+    }
+
+    #[tokio::test]
+    async fn recv_loop_rejects_payload_on_control_sid() {
+        let (io, mut peer) = duplex(1024);
+        let session = Session::new_with_protocol(
+            Box::new(io),
+            false,
+            None,
+            Arc::new(crate::runtime::AnyTlsProtocol),
+            crate::core::State::new(crate::core::PaddingFactory::default()),
+            crate::runtime::WriterRuntimeState::new(false),
+        );
+        let frame = Frame::with_data(Command::Psh, 0, Bytes::from_static(b"invalid"));
+        peer.write_all(&frame.to_bytes().unwrap()).await.unwrap();
+        peer.shutdown().await.unwrap();
+        let error = timeout(Duration::from_secs(1), session.recv_loop()).await.unwrap().unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
+    }
+
+    #[tokio::test]
     async fn late_payload_for_closed_stream_does_not_fail_session() {
         let session = test_session();
         session.ensure_incoming_stream(7).await.expect("stream should be created");

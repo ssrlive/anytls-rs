@@ -431,17 +431,29 @@ impl Protocol for AnyTlsProtocol {
             let mut data_open = true;
             let mut control_burst = 0usize;
             while control_open || data_open {
-                let prefer_data = control_burst >= 32 && data_open;
-                let next = tokio::select! {
-                    frame = control_rx.recv(), if control_open && !prefer_data => {
-                        if frame.is_none() { control_open = false; }
-                        if frame.is_some() { control_burst += 1; }
-                        frame
+                let next = if control_burst >= 32 && data_open {
+                    control_burst = 0;
+                    match data_rx.try_recv() {
+                        Ok(frame) => Some(frame),
+                        Err(tokio::sync::mpsc::error::TryRecvError::Empty) => continue,
+                        Err(tokio::sync::mpsc::error::TryRecvError::Disconnected) => {
+                            data_open = false;
+                            continue;
+                        }
                     }
-                    frame = data_rx.recv(), if data_open => {
-                        if frame.is_none() { data_open = false; }
-                        if frame.is_some() { control_burst = 0; }
-                        frame
+                } else {
+                    tokio::select! {
+                        biased;
+                        frame = control_rx.recv(), if control_open => {
+                            if frame.is_none() { control_open = false; }
+                            if frame.is_some() { control_burst = control_burst.saturating_add(1); }
+                            frame
+                        }
+                        frame = data_rx.recv(), if data_open => {
+                            if frame.is_none() { data_open = false; }
+                            if frame.is_some() { control_burst = 0; }
+                            frame
+                        }
                     }
                 };
                 let Some(FrameWrite {
@@ -537,7 +549,88 @@ impl Protocol for AnyTlsProtocol {
 #[cfg(all(test, any(feature = "client", feature = "server")))]
 mod tests {
     use super::*;
+    use tokio::io::AsyncReadExt;
     use tokio::sync::mpsc;
+
+    #[tokio::test]
+    async fn writer_sends_control_frames_past_burst_limit_without_data() {
+        let (io, mut peer) = tokio::io::duplex(4096);
+        let (_, writer) = tokio::io::split(Box::new(io) as Box<dyn AsyncReadWrite>);
+        let (control_tx, control_rx) = mpsc::channel(32);
+        let (data_tx, data_rx) = mpsc::channel(32);
+        AnyTlsProtocol.spawn_writer_task(
+            writer,
+            control_rx,
+            data_rx,
+            State::new(PaddingFactory::default()),
+            WriterRuntimeState::new(false),
+        );
+
+        let mut expected = Vec::new();
+        for index in 0..96 {
+            let frame = match index % 3 {
+                0 => Frame::new(Command::HeartRequest, 0),
+                1 => Frame::new(Command::HeartResponse, 0),
+                _ => Frame::new(Command::SynAck, 1),
+            };
+            expected.extend_from_slice(&frame.to_bytes().unwrap());
+            let (ack_tx, ack_rx) = tokio::sync::oneshot::channel();
+            control_tx.send(FrameWrite::new(frame, Some(ack_tx), None)).await.unwrap();
+            tokio::time::timeout(std::time::Duration::from_secs(1), ack_rx)
+                .await
+                .unwrap_or_else(|_| panic!("control frame {} stalled with an empty data queue", index + 1))
+                .unwrap()
+                .unwrap();
+        }
+        let mut received = vec![0; expected.len()];
+        tokio::time::timeout(std::time::Duration::from_secs(1), peer.read_exact(&mut received))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(received, expected);
+        drop(control_tx);
+        drop(data_tx);
+    }
+
+    #[tokio::test]
+    async fn writer_bounds_control_bursts_and_drains_closed_queues_in_order() {
+        let (io, mut peer) = tokio::io::duplex(4096);
+        let (_, writer) = tokio::io::split(Box::new(io) as Box<dyn AsyncReadWrite>);
+        let (control_tx, control_rx) = mpsc::channel(96);
+        let (data_tx, data_rx) = mpsc::channel(2);
+        let control = Frame::new(Command::HeartResponse, 0);
+        for _ in 0..65 {
+            control_tx.send(FrameWrite::new(control.clone(), None, None)).await.unwrap();
+        }
+        let payload = Frame::with_data(Command::Psh, 1, Bytes::from_static(b"payload"));
+        let fin = Frame::new(Command::Fin, 1);
+        data_tx.send(FrameWrite::new(payload.clone(), None, None)).await.unwrap();
+        data_tx.send(FrameWrite::new(fin.clone(), None, None)).await.unwrap();
+        drop(control_tx);
+        drop(data_tx);
+        AnyTlsProtocol.spawn_writer_task(
+            writer,
+            control_rx,
+            data_rx,
+            State::new(PaddingFactory::default()),
+            WriterRuntimeState::new(false),
+        );
+
+        let mut expected = Vec::new();
+        for data in [payload, fin] {
+            for _ in 0..32 {
+                expected.extend_from_slice(&control.to_bytes().unwrap());
+            }
+            expected.extend_from_slice(&data.to_bytes().unwrap());
+        }
+        expected.extend_from_slice(&control.to_bytes().unwrap());
+        let mut received = Vec::new();
+        tokio::time::timeout(std::time::Duration::from_secs(1), peer.read_to_end(&mut received))
+            .await
+            .expect("writer must drain and exit when both queues are closed")
+            .unwrap();
+        assert_eq!(received, expected);
+    }
 
     #[tokio::test]
     async fn data_scheduler_round_robins_active_streams() {
