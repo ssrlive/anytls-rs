@@ -3,11 +3,6 @@ use std::collections::VecDeque;
 use std::sync::Arc;
 use tokio::sync::{Mutex, Notify, OwnedSemaphorePermit, mpsc};
 
-enum PipeEvent {
-    Data(PipeChunk),
-    StreamEnd(Option<std::io::Error>),
-}
-
 struct PipeChunk {
     data: Vec<u8>,
     _permit: Option<OwnedSemaphorePermit>,
@@ -27,8 +22,8 @@ pub struct PipeInner {
     closed: bool,
     stream_end_queued: bool,
     read_error: Option<std::io::Error>,
-    data_sender: Option<mpsc::Sender<PipeEvent>>,
-    data_receiver: Option<mpsc::Receiver<PipeEvent>>,
+    data_sender: Option<mpsc::Sender<PipeChunk>>,
+    data_receiver: Option<mpsc::Receiver<PipeChunk>>,
     buffer: VecDeque<PipeChunk>,
     // Notify to wake readers when receiver becomes available or pipe state changes
     read_waiter: Arc<Notify>,
@@ -93,10 +88,17 @@ impl PipeReader {
 
             // Restore receiver
             let mut inner = self.inner.lock().await;
+            if inner.closed {
+                drop(receiver);
+                return match inner.read_error.take() {
+                    Some(error) => Err(error),
+                    None => Ok(0),
+                };
+            }
             inner.data_receiver = Some(receiver);
 
             match res {
-                Some(PipeEvent::Data(mut chunk)) => {
+                Some(mut chunk) => {
                     let len = chunk.data.len().min(buf.len());
                     buf[..len].copy_from_slice(&chunk.data[..len]);
                     if len < chunk.data.len() {
@@ -104,14 +106,6 @@ impl PipeReader {
                         inner.buffer.push_back(chunk);
                     }
                     return Ok(len);
-                }
-                Some(PipeEvent::StreamEnd(error)) => {
-                    inner.closed = true;
-                    inner.data_sender = None;
-                    if let Some(err) = error {
-                        return Err(err);
-                    }
-                    return Ok(0);
                 }
                 None => {
                     // Either sender dropped (EOF) or deadline
@@ -136,35 +130,23 @@ impl PipeReader {
             inner.read_error = error;
             inner.closed = true;
             inner.data_sender = None;
+            inner.data_receiver = None;
+            inner.buffer.clear();
             // Wake any readers waiting on `read_waiter` so they observe closure/error.
             inner.read_waiter.notify_one();
         });
     }
 
     pub async fn finish_stream(&self, error: Option<std::io::Error>) {
-        let (sender, waiter) = {
-            let mut inner = self.inner.lock().await;
-            if inner.closed || inner.stream_end_queued {
-                return;
-            }
-
-            inner.stream_end_queued = true;
-            (inner.data_sender.clone(), inner.read_waiter.clone())
-        };
-
-        let sent = if let Some(sender) = sender {
-            sender.send(PipeEvent::StreamEnd(error)).await.is_ok()
-        } else {
-            false
-        };
-
-        if !sent {
-            let mut inner = self.inner.lock().await;
-            inner.closed = true;
-            inner.data_sender = None;
+        let mut inner = self.inner.lock().await;
+        if inner.closed || inner.stream_end_queued {
+            return;
         }
 
-        waiter.notify_one();
+        inner.stream_end_queued = true;
+        inner.read_error = error;
+        inner.data_sender = None;
+        inner.read_waiter.notify_one();
     }
 
     pub async fn set_read_deadline(&self, deadline: std::time::SystemTime) -> std::io::Result<()> {
@@ -194,10 +176,10 @@ impl PipeWriter {
             (tx, inner.read_waiter.clone())
         };
 
-        tx.send(PipeEvent::Data(PipeChunk {
+        tx.send(PipeChunk {
             data: buf.to_vec(),
             _permit: permit,
-        }))
+        })
         .await
         .map_err(|error| Error::new(BrokenPipe, format!("Channel closed: {}", error)))?;
         waiter.notify_one();
@@ -272,6 +254,57 @@ mod tests {
         let error = reader.read(&mut buffer).await.unwrap_err();
         assert_eq!(error.kind(), std::io::ErrorKind::Other);
         assert_eq!(reader.read(&mut buffer).await.unwrap(), 0);
+    }
+
+    #[tokio::test]
+    async fn closing_full_pipe_releases_blocked_writer_and_inbound_budget() {
+        let (reader, writer) = pipe();
+        let budget = std::sync::Arc::new(tokio::sync::Semaphore::new(64));
+        for _ in 0..64 {
+            let permit = budget.clone().acquire_owned().await.unwrap();
+            writer.write_with_permit(b"queued", permit).await.unwrap();
+        }
+        let mut blocked_write = Box::pin(writer.write(b"blocked"));
+        assert!(timeout(Duration::from_millis(20), &mut blocked_write).await.is_err());
+
+        reader.close_with_error(None);
+
+        let error = timeout(Duration::from_secs(1), blocked_write)
+            .await
+            .expect("local close must wake a writer blocked on the full queue")
+            .expect_err("writes to a closed pipe must fail");
+        assert_eq!(error.kind(), std::io::ErrorKind::BrokenPipe);
+        assert_eq!(budget.available_permits(), 64, "close must release queued inbound bytes");
+        let mut buffer = [0_u8; 16];
+        assert_eq!(reader.read(&mut buffer).await.unwrap(), 0);
+    }
+
+    #[tokio::test]
+    async fn finish_full_pipe_does_not_block_and_preserves_queued_data() {
+        for failed in [false, true] {
+            let (reader, writer) = pipe();
+            for _ in 0..64 {
+                writer.write(b"queued").await.unwrap();
+            }
+            let error = failed.then(|| std::io::Error::other("peer failed"));
+            timeout(Duration::from_secs(1), reader.finish_stream(error))
+                .await
+                .expect("EOF must not wait for space in a full data queue");
+            assert_eq!(writer.write(b"after-fin").await.unwrap_err().kind(), std::io::ErrorKind::BrokenPipe);
+
+            let mut buffer = [0_u8; 16];
+            for _ in 0..64 {
+                let count = reader.read(&mut buffer).await.unwrap();
+                assert_eq!(&buffer[..count], b"queued");
+            }
+            let result = reader.read(&mut buffer).await;
+            if failed {
+                assert_eq!(result.unwrap_err().to_string(), "peer failed");
+            } else {
+                assert_eq!(result.unwrap(), 0);
+            }
+            assert_eq!(reader.read(&mut buffer).await.unwrap(), 0);
+        }
     }
 
     #[tokio::test]

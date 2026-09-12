@@ -409,7 +409,7 @@ impl ProtocolHost for Session {
                 return Ok(());
             }
             if let Err(error) = stream.push_data(data.as_ref()).await {
-                if stream.is_closed() {
+                if stream.is_read_closed() {
                     log::debug!("Ignoring push_data error for closed stream sid={sid}: {error}");
                     return Ok(());
                 }
@@ -452,27 +452,29 @@ impl ProtocolHost for Session {
                 "SYNACK cannot use control sid 0",
             ));
         }
+        let Some(stream) = self.stream_for_sid(sid).await else {
+            if self.is_client && sid <= self.next_stream_id.load(Ordering::Relaxed) {
+                log::debug!("Ignoring late SYNACK for closed stream sid={sid}");
+                return Ok(());
+            }
+            return Err(std::io::Error::new(std::io::ErrorKind::InvalidData, "SYNACK for unknown stream"));
+        };
         if message.is_empty() {
             log::trace!("SYNACK succeeded for stream sid={sid}");
             // The Go implementation closes the whole Session on a SYNACK error.
             // That loses unrelated multiplexed streams, so isolate the failure to
             // this stream and keep the Session available for the others.
-            if let Some(stream) = self.stream_for_sid(sid).await {
-                if !stream.resolve_handshake(None) {
-                    return Err(std::io::Error::new(std::io::ErrorKind::InvalidData, "duplicate SYNACK"));
-                }
-            } else {
-                return Err(std::io::Error::new(std::io::ErrorKind::InvalidData, "SYNACK for unknown stream"));
+            if !stream.resolve_handshake(None) {
+                return Err(std::io::Error::new(std::io::ErrorKind::InvalidData, "duplicate SYNACK"));
             }
-        } else if let Some(stream) = self.remove_stream(sid).await {
+        } else {
             if !stream.resolve_handshake(Some(format!("remote: {message}"))) {
                 return Err(std::io::Error::new(std::io::ErrorKind::InvalidData, "duplicate SYNACK"));
             }
+            self.remove_stream(sid).await;
             stream
                 .close_from_session(Some(std::io::Error::other(format!("remote: {message}"))))
                 .await;
-        } else {
-            return Err(std::io::Error::new(std::io::ErrorKind::InvalidData, "SYNACK for unknown stream"));
         }
         Ok(())
     }
@@ -489,11 +491,12 @@ impl ProtocolHost for Session {
 #[cfg(test)]
 mod tests {
     use super::Session;
+    use crate::core::{Command, Frame};
     use crate::runtime::ProtocolHost;
     use bytes::Bytes;
     use std::sync::Arc;
     use std::time::Duration;
-    use tokio::io::{AsyncReadExt, duplex};
+    use tokio::io::{AsyncReadExt, AsyncWriteExt, duplex};
     use tokio::time::timeout;
 
     fn test_session() -> Session {
@@ -581,6 +584,128 @@ mod tests {
         assert!(!session.is_terminated().await);
         assert!(session.stream_for_sid(2).await.is_none());
         assert!(session.stream_for_sid(3).await.is_some());
+    }
+
+    #[tokio::test]
+    async fn late_synack_for_cancelled_stream_preserves_reused_session() {
+        for message in ["", "upstream timed out"] {
+            let (io, _peer) = duplex(1024);
+            let session = Session::new_with_protocol(
+                Box::new(io),
+                true,
+                None,
+                Arc::new(crate::runtime::AnyTlsProtocol),
+                crate::core::State::new(crate::core::PaddingFactory::default()),
+                crate::runtime::WriterRuntimeState::new(false),
+            );
+            let cancelled = session.open_stream(1).await.expect("first stream should open");
+            cancelled.terminate().await.expect("timed out stream should close");
+            let active = session.open_stream(1).await.expect("session should be reusable");
+
+            session
+                .protocol
+                .handle_frame(
+                    &session,
+                    crate::core::Frame::with_data(
+                        crate::core::Command::SynAck,
+                        cancelled.id(),
+                        Bytes::copy_from_slice(message.as_bytes()),
+                    ),
+                )
+                .await
+                .expect("late SYNACK must not fail the receive loop");
+
+            assert!(!session.is_terminated().await);
+            assert!(session.stream_for_sid(active.id()).await.is_some());
+            session
+                .resolve_stream_handshake(active.id(), String::new())
+                .await
+                .expect("new stream handshake should succeed");
+            timeout(Duration::from_secs(1), active.wait_for_handshake())
+                .await
+                .expect("handshake waiter should wake")
+                .expect("new stream should remain usable");
+        }
+    }
+
+    #[tokio::test]
+    async fn invalid_synack_is_still_rejected() {
+        let (io, _peer) = duplex(1024);
+        let session = Session::new_with_protocol(
+            Box::new(io),
+            true,
+            None,
+            Arc::new(crate::runtime::AnyTlsProtocol),
+            crate::core::State::new(crate::core::PaddingFactory::default()),
+            crate::runtime::WriterRuntimeState::new(false),
+        );
+        let stream = session.open_stream(1).await.expect("stream should open");
+        for message in ["", "upstream refused"] {
+            for sid in [0, stream.id() + 1] {
+                let error = session
+                    .resolve_stream_handshake(sid, message.to_string())
+                    .await
+                    .expect_err("unallocated and control stream IDs must be rejected");
+                assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
+            }
+        }
+        session
+            .resolve_stream_handshake(stream.id(), String::new())
+            .await
+            .expect("first SYNACK should succeed");
+        for message in ["", "upstream refused"] {
+            let error = session
+                .resolve_stream_handshake(stream.id(), message.to_string())
+                .await
+                .expect_err("duplicate SYNACK must be rejected");
+            assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
+        }
+    }
+
+    #[tokio::test]
+    async fn full_stream_closure_does_not_stall_other_stream_handshakes() {
+        for local_close in [false, true] {
+            let (io, mut peer) = duplex(4096);
+            let session = Arc::new(Session::new_with_protocol(
+                Box::new(io),
+                true,
+                None,
+                Arc::new(crate::runtime::AnyTlsProtocol),
+                crate::core::State::new(crate::core::PaddingFactory::default()),
+                crate::runtime::WriterRuntimeState::new(false),
+            ));
+            let slow = session.open_stream(2).await.unwrap();
+            let pending = session.open_stream(2).await.unwrap();
+            for _ in 0..64 {
+                session.push_stream_data(slow.id(), Bytes::from_static(b"queued")).await.unwrap();
+            }
+            let frame = if local_close {
+                Frame::with_data(Command::Psh, slow.id(), Bytes::from_static(b"blocked"))
+            } else {
+                Frame::new(Command::Fin, slow.id())
+            };
+            peer.write_all(&frame.to_bytes().unwrap()).await.unwrap();
+            peer.write_all(&Frame::new(Command::SynAck, pending.id()).to_bytes().unwrap())
+                .await
+                .unwrap();
+            let running = session.clone();
+            let task = tokio::spawn(async move { running.run().await });
+
+            if local_close {
+                assert!(timeout(Duration::from_millis(20), pending.wait_for_handshake()).await.is_err());
+                timeout(Duration::from_secs(1), slow.close()).await.unwrap().unwrap();
+            }
+            timeout(Duration::from_secs(1), pending.wait_for_handshake())
+                .await
+                .expect("closing a full stream must not stall the next SYNACK")
+                .expect("other stream handshake must succeed");
+            assert!(!session.is_terminated().await);
+            timeout(Duration::from_secs(1), session.terminate())
+                .await
+                .expect("session termination must not wait for a full stream queue")
+                .unwrap();
+            assert!(timeout(Duration::from_secs(1), task).await.unwrap().unwrap().is_err());
+        }
     }
 
     #[tokio::test]
