@@ -15,6 +15,7 @@ pub(crate) enum HandshakeState {
 
 pub struct Stream {
     id: u32,
+    session_id: u64,
     pipe_reader: PipeReader,
     pipe_writer: PipeWriter,
     data_enqueue_tx: Sender<DataWrite>,
@@ -33,6 +34,7 @@ impl Stream {
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn new(
         id: u32,
+        session_id: u64,
         data_enqueue_tx: Sender<DataWrite>,
         write_budget: Arc<Semaphore>,
         inbound_budget: Arc<Semaphore>,
@@ -44,6 +46,7 @@ impl Stream {
         let (handshake, _) = watch::channel(HandshakeState::Pending);
         Self {
             id,
+            session_id,
             pipe_reader,
             pipe_writer,
             data_enqueue_tx,
@@ -61,6 +64,10 @@ impl Stream {
 
     pub fn id(&self) -> u32 {
         self.id
+    }
+
+    pub fn session_id(&self) -> u64 {
+        self.session_id
     }
 
     pub fn is_closed(&self) -> bool {
@@ -211,11 +218,25 @@ impl Stream {
     }
 
     pub async fn handshake_failure(&self, error: &str) -> std::io::Result<()> {
-        self.protocol_hooks.handshake_failure(self.id, error).await
+        log::debug!("session={} stream={} stage=synack_failure_submit", self.session_id, self.id);
+        let result = self.protocol_hooks.handshake_failure(self.id, error).await;
+        log::debug!(
+            "session={} stream={} stage=synack_failure_complete result={result:?}",
+            self.session_id,
+            self.id
+        );
+        result
     }
 
     pub async fn handshake_success(&self) -> std::io::Result<()> {
-        self.protocol_hooks.handshake_success(self.id).await
+        log::debug!("session={} stream={} stage=synack_success_submit", self.session_id, self.id);
+        let result = self.protocol_hooks.handshake_success(self.id).await;
+        log::debug!(
+            "session={} stream={} stage=synack_success_complete result={result:?}",
+            self.session_id,
+            self.id
+        );
+        result
     }
 
     fn mark_read_closed(&self) -> bool {

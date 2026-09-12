@@ -104,9 +104,13 @@ impl Session {
     }
 
     pub async fn run(&self) -> std::io::Result<()> {
-        self.ensure_started().await?;
-        let result = self.recv_loop().await;
-        let _ = self.terminate().await;
+        log::debug!("session={} client={} stage=session_run", self.id, self.is_client);
+        let result = async {
+            self.ensure_started().await?;
+            self.recv_loop().await
+        }
+        .await;
+        let _ = self.terminate_with_error(result.as_ref().err()).await;
         result
     }
 
@@ -135,12 +139,14 @@ impl Session {
             (sid, stream)
         };
 
+        log::debug!("session={} stream={sid} stage=syn_submit", self.id);
         if let Err(error) = self.write_frame_sync(Frame::new(Command::Syn, sid)).await {
             self.remove_stream(sid).await;
             stream.close_from_session(Some(std::io::Error::other(error.to_string()))).await;
             return Err(error);
         }
 
+        log::debug!("session={} stream={sid} stage=syn_written", self.id);
         Ok(stream)
     }
 
@@ -198,6 +204,10 @@ impl Session {
     }
 
     pub async fn terminate(&self) -> std::io::Result<()> {
+        self.terminate_with_error(None).await
+    }
+
+    async fn terminate_with_error(&self, error: Option<&std::io::Error>) -> std::io::Result<()> {
         if self.closed.swap(true, Ordering::AcqRel) {
             return Ok(());
         }
@@ -211,8 +221,19 @@ impl Session {
             self.idle_state.send_replace(true);
             stream_list
         };
+        if let Some(error) = error {
+            log::warn!(
+                "session={} client={} stage=session_failed active_streams={} reason={error}",
+                self.id,
+                self.is_client,
+                streams.len()
+            );
+        } else {
+            log::debug!("session={} stage=session_terminated active_streams={}", self.id, streams.len());
+        }
         for stream in streams {
-            stream.close_from_session(None).await;
+            let reason = error.map(|error| std::io::Error::new(error.kind(), format!("session {} ended: {error}", self.id)));
+            stream.close_from_session(reason).await;
         }
         Ok(())
     }
@@ -248,6 +269,7 @@ impl Session {
     fn new_stream(&self, sid: u32) -> Stream {
         Stream::new(
             sid,
+            self.id,
             self.data_enqueue_tx.clone(),
             self.write_budget.clone(),
             self.inbound_budget.clone(),
@@ -308,7 +330,6 @@ impl Session {
                     return Err(std::io::Error::new(std::io::ErrorKind::BrokenPipe, "Session closed"));
                 }
                 _ = writer_failure.notified() => {
-                    let _ = self.terminate().await;
                     return Err(std::io::Error::new(std::io::ErrorKind::BrokenPipe, "Session writer failed"));
                 }
                 result = async {
@@ -323,7 +344,33 @@ impl Session {
             while let Some(frame) = Frame::from_bytes(&pending) {
                 let frame_len = HEADER_OVERHEAD_SIZE + frame.data.len();
                 pending.drain(..frame_len);
-                self.protocol.handle_frame(self, frame).await?;
+                let command = frame.cmd;
+                let sid = frame.sid;
+                let started = tokio::time::Instant::now();
+                log::debug!(
+                    "session={} stream={sid} stage=frame_received command={command} bytes={}",
+                    self.id,
+                    frame.data.len()
+                );
+                let handling = self.protocol.handle_frame(self, frame);
+                tokio::pin!(handling);
+                match tokio::time::timeout(std::time::Duration::from_secs(1), &mut handling).await {
+                    Ok(result) => result?,
+                    Err(_) => {
+                        log::warn!(
+                            "session={} stream={sid} stage=frame_handler_blocked command={command} elapsed_ms={} inbound_available={}",
+                            self.id,
+                            started.elapsed().as_millis(),
+                            self.inbound_budget.available_permits()
+                        );
+                        handling.await?;
+                        log::debug!(
+                            "session={} stream={sid} stage=frame_handler_resumed elapsed_ms={}",
+                            self.id,
+                            started.elapsed().as_millis()
+                        );
+                    }
+                }
             }
         }
     }
@@ -692,7 +739,7 @@ mod tests {
             let task = tokio::spawn(async move { running.run().await });
 
             if local_close {
-                assert!(timeout(Duration::from_millis(20), pending.wait_for_handshake()).await.is_err());
+                assert!(timeout(Duration::from_millis(1100), pending.wait_for_handshake()).await.is_err());
                 timeout(Duration::from_secs(1), slow.close()).await.unwrap().unwrap();
             }
             timeout(Duration::from_secs(1), pending.wait_for_handshake())
@@ -705,6 +752,36 @@ mod tests {
                 .expect("session termination must not wait for a full stream queue")
                 .unwrap();
             assert!(timeout(Duration::from_secs(1), task).await.unwrap().unwrap().is_err());
+        }
+    }
+
+    #[tokio::test]
+    async fn session_failure_reason_reaches_pending_handshake() {
+        for invalid_frame in [false, true] {
+            let (io, mut peer) = duplex(4096);
+            let session = Session::new_with_protocol(
+                Box::new(io),
+                true,
+                None,
+                Arc::new(crate::runtime::AnyTlsProtocol),
+                crate::core::State::new(crate::core::PaddingFactory::default()),
+                crate::runtime::WriterRuntimeState::new(false),
+            );
+            let stream = session.open_stream(1).await.unwrap();
+            assert_eq!(stream.session_id(), session.id);
+            if invalid_frame {
+                peer.write_all(&Frame::new(Command::SynAck, 0).to_bytes().unwrap()).await.unwrap();
+            } else {
+                peer.shutdown().await.unwrap();
+            }
+            let reason = timeout(Duration::from_secs(1), session.run()).await.unwrap().unwrap_err();
+            let failure = timeout(Duration::from_secs(1), stream.wait_for_handshake())
+                .await
+                .unwrap()
+                .unwrap_err();
+            assert!(failure.to_string().contains(&reason.to_string()));
+            assert!(failure.to_string().contains(&format!("session {} ended", session.id)));
+            assert!(session.is_terminated().await);
         }
     }
 
