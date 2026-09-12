@@ -11,7 +11,8 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use tokio::io::AsyncReadExt;
-use tokio::sync::{Mutex, Notify, Semaphore, mpsc::Sender, watch};
+use tokio::sync::{Mutex, Semaphore, mpsc::Sender, watch};
+use tokio_util::sync::CancellationToken;
 
 static SESSION_ID_COUNTER: AtomicU64 = AtomicU64::new(1);
 
@@ -27,7 +28,7 @@ pub struct Session {
     pub(crate) protocol_state: Arc<State>,
     writer_state: Arc<WriterRuntimeState>,
     idle_state: Arc<watch::Sender<bool>>,
-    close_notify: Arc<Notify>,
+    close_notify: CancellationToken,
     #[allow(clippy::type_complexity)]
     on_new_stream: Option<Arc<Box<dyn Fn(Arc<Stream>) + Send + Sync>>>,
     protocol: Arc<dyn Protocol>,
@@ -72,7 +73,7 @@ impl Session {
             protocol_state,
             writer_state,
             idle_state: Arc::new(idle_state),
-            close_notify: Arc::new(Notify::new()),
+            close_notify: CancellationToken::new(),
             on_new_stream: on_new_stream.map(Arc::new),
             protocol,
             control_tx,
@@ -105,11 +106,16 @@ impl Session {
 
     pub async fn run(&self) -> std::io::Result<()> {
         log::debug!("session={} client={} stage=session_run", self.id, self.is_client);
-        let result = async {
-            self.ensure_started().await?;
-            self.recv_loop().await
-        }
-        .await;
+        let writer_failure = self.writer_state.failure_notified();
+        let result = tokio::select! {
+            biased;
+            _ = self.close_notify.cancelled() => Err(std::io::Error::new(std::io::ErrorKind::BrokenPipe, "Session closed")),
+            _ = writer_failure.cancelled() => Err(std::io::Error::new(std::io::ErrorKind::BrokenPipe, "Session writer failed")),
+            result = async {
+                self.ensure_started().await?;
+                self.recv_loop().await
+            } => result,
+        };
         let _ = self.terminate_with_error(result.as_ref().err()).await;
         result
     }
@@ -212,7 +218,11 @@ impl Session {
             return Ok(());
         }
 
-        self.close_notify.notify_waiters();
+        self.close_notify.cancel();
+        self.writer_state.stopped.cancel();
+        self.write_budget.close();
+        self.control_budget.close();
+        self.inbound_budget.close();
 
         let streams = {
             let mut streams = self.streams.lock().await;
@@ -326,10 +336,10 @@ impl Session {
                     }
                     continue;
                 }
-                _ = self.close_notify.notified() => {
+                _ = self.close_notify.cancelled() => {
                     return Err(std::io::Error::new(std::io::ErrorKind::BrokenPipe, "Session closed"));
                 }
-                _ = writer_failure.notified() => {
+                _ = writer_failure.cancelled() => {
                     return Err(std::io::Error::new(std::io::ErrorKind::BrokenPipe, "Session writer failed"));
                 }
                 result = async {
@@ -863,6 +873,138 @@ mod tests {
         timeout(Duration::from_secs(1), wait_for_idle)
             .await
             .expect("idle state should be observed without a missed notification");
+    }
+
+    #[tokio::test]
+    async fn terminate_interrupts_full_inbound_delivery() {
+        let (io, mut peer) = duplex(4096);
+        let session = Arc::new(Session::new_with_protocol(
+            Box::new(io),
+            false,
+            None,
+            Arc::new(crate::runtime::AnyTlsProtocol),
+            crate::core::State::new(crate::core::PaddingFactory::default()),
+            crate::runtime::WriterRuntimeState::new(false),
+        ));
+        session.ensure_incoming_stream(1).await.unwrap();
+        for _ in 0..64 {
+            session.push_stream_data(1, Bytes::from_static(b"queued")).await.unwrap();
+        }
+        peer.write_all(
+            &Frame::with_data(Command::Psh, 1, Bytes::from_static(b"blocked"))
+                .to_bytes()
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+        let running = session.clone();
+        let task = tokio::spawn(async move { running.run().await });
+        timeout(Duration::from_secs(1), async {
+            while session.inbound_budget.available_permits() != crate::runtime::MAX_QUEUED_INBOUND_BYTES - 64 * 6 - 7 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        session.terminate().await.unwrap();
+        timeout(Duration::from_secs(1), task)
+            .await
+            .expect("termination must interrupt blocked delivery")
+            .unwrap()
+            .unwrap_err();
+        assert_eq!(session.inbound_budget.available_permits(), crate::runtime::MAX_QUEUED_INBOUND_BYTES);
+    }
+
+    #[tokio::test]
+    async fn stream_close_cancels_wait_for_shared_inbound_budget() {
+        let (io, _peer) = duplex(1024);
+        let session = Arc::new(Session::new_with_protocol(
+            Box::new(io),
+            false,
+            None,
+            Arc::new(crate::runtime::AnyTlsProtocol),
+            crate::core::State::new(crate::core::PaddingFactory::default()),
+            crate::runtime::WriterRuntimeState::new(false),
+        ));
+        session.ensure_incoming_stream(1).await.unwrap();
+        let stream = session.stream_for_sid(1).await.unwrap();
+        let held = session
+            .inbound_budget
+            .clone()
+            .acquire_many_owned(crate::runtime::MAX_QUEUED_INBOUND_BYTES as u32)
+            .await
+            .unwrap();
+        let delivery_session = session.clone();
+        let delivering = tokio::spawn(async move { delivery_session.push_stream_data(1, Bytes::from_static(b"pending")).await });
+        tokio::task::yield_now().await;
+        stream.close().await.unwrap();
+        timeout(Duration::from_secs(1), delivering).await.unwrap().unwrap().unwrap();
+        assert!(!session.is_terminated().await);
+        drop(held);
+        session.terminate().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn terminate_stops_blocked_writer_and_budget_waiters() {
+        let (io, mut peer) = duplex(1);
+        let session = Arc::new(Session::new_with_protocol(
+            Box::new(io),
+            false,
+            None,
+            Arc::new(crate::runtime::AnyTlsProtocol),
+            crate::core::State::new(crate::core::PaddingFactory::default()),
+            crate::runtime::WriterRuntimeState::new(false),
+        ));
+        session.ensure_incoming_stream(1).await.unwrap();
+        let stream = session.stream_for_sid(1).await.unwrap();
+        let held = session
+            .write_budget
+            .clone()
+            .acquire_many_owned(crate::runtime::MAX_QUEUED_FRAME_BYTES as u32)
+            .await
+            .unwrap();
+        let writing_stream = stream.clone();
+        let waiting = tokio::spawn(async move { writing_stream.write(b"waiting for budget").await });
+        let writing_session = session.clone();
+        let writing = tokio::spawn(async move {
+            writing_session
+                .write_frame_sync(Frame::with_data(Command::Waste, 0, Bytes::from(vec![0; 4096])))
+                .await
+        });
+        let mut first = [0; 1];
+        timeout(Duration::from_secs(1), peer.read_exact(&mut first)).await.unwrap().unwrap();
+        session.terminate().await.unwrap();
+        timeout(Duration::from_secs(1), waiting).await.unwrap().unwrap().unwrap_err();
+        timeout(Duration::from_secs(1), writing).await.unwrap().unwrap().unwrap_err();
+        timeout(Duration::from_secs(1), session.data_enqueue_tx.closed())
+            .await
+            .expect("scheduler must stop without new input");
+        let mut remaining = Vec::new();
+        timeout(Duration::from_secs(1), peer.read_to_end(&mut remaining))
+            .await
+            .expect("writer must shut down the transport")
+            .unwrap();
+        drop(held);
+        assert!(stream.is_closed());
+    }
+
+    #[tokio::test]
+    async fn writer_failure_before_run_is_observed() {
+        let (io, _peer) = duplex(1024);
+        let session = Session::new_with_protocol(
+            Box::new(io),
+            false,
+            None,
+            Arc::new(crate::runtime::AnyTlsProtocol),
+            crate::core::State::new(crate::core::PaddingFactory::default()),
+            crate::runtime::WriterRuntimeState::new(false),
+        );
+        session.writer_state.mark_failed();
+        let error = timeout(Duration::from_secs(1), session.run())
+            .await
+            .expect("failure must persist until observed")
+            .unwrap_err();
+        assert!(error.to_string().contains("writer"));
     }
 
     #[tokio::test]

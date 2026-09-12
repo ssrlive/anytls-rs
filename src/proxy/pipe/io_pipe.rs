@@ -126,15 +126,18 @@ impl PipeReader {
     pub fn close_with_error(&self, error: Option<std::io::Error>) {
         let inner = self.inner.clone();
         tokio::spawn(async move {
-            let mut inner = inner.lock().await;
-            inner.read_error = error;
-            inner.closed = true;
-            inner.data_sender = None;
-            inner.data_receiver = None;
-            inner.buffer.clear();
-            // Wake any readers waiting on `read_waiter` so they observe closure/error.
-            inner.read_waiter.notify_one();
+            PipeReader { inner }.abort(error).await;
         });
+    }
+
+    pub async fn abort(&self, error: Option<std::io::Error>) {
+        let mut inner = self.inner.lock().await;
+        inner.read_error = error;
+        inner.closed = true;
+        inner.data_sender = None;
+        inner.data_receiver = None;
+        inner.buffer.clear();
+        inner.read_waiter.notify_one();
     }
 
     pub async fn finish_stream(&self, error: Option<std::io::Error>) {

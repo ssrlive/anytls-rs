@@ -28,6 +28,7 @@ pub struct Stream {
     write_closed: AtomicBool,
     terminated: AtomicBool,
     handshake: watch::Sender<HandshakeState>,
+    aborted: tokio_util::sync::CancellationToken,
 }
 
 impl Stream {
@@ -59,6 +60,7 @@ impl Stream {
             write_closed: AtomicBool::new(false),
             terminated: AtomicBool::new(false),
             handshake,
+            aborted: tokio_util::sync::CancellationToken::new(),
         }
     }
 
@@ -109,6 +111,10 @@ impl Stream {
         self.close().await
     }
 
+    pub async fn wait_for_abort(&self) {
+        self.aborted.cancelled().await;
+    }
+
     pub async fn read(&self, buf: &mut [u8]) -> std::io::Result<usize> {
         self.pipe_reader.read(buf).await
     }
@@ -118,39 +124,56 @@ impl Stream {
             return Err(std::io::Error::new(std::io::ErrorKind::BrokenPipe, "Stream closed"));
         }
 
-        for chunk in buf.chunks(crate::core::MAX_FRAME_DATA_SIZE) {
-            let frame = Frame::with_data(Command::Psh, self.id, bytes::Bytes::copy_from_slice(chunk));
-            let budget = self.acquire_write_budget(chunk.len()).await?;
-            self.data_enqueue_tx
-                .send(DataWrite {
-                    sid: self.id,
-                    frame: FrameWrite::new(frame, None, Some(budget)),
-                })
-                .await
-                .map_err(|_| std::io::Error::new(std::io::ErrorKind::BrokenPipe, "Session closed"))?;
-        }
+        let writing = async {
+            for chunk in buf.chunks(crate::core::MAX_FRAME_DATA_SIZE) {
+                let frame = Frame::with_data(Command::Psh, self.id, bytes::Bytes::copy_from_slice(chunk));
+                let budget = self.acquire_write_budget(chunk.len()).await?;
+                self.data_enqueue_tx
+                    .send(DataWrite {
+                        sid: self.id,
+                        frame: FrameWrite::new(frame, None, Some(budget)),
+                    })
+                    .await
+                    .map_err(|_| std::io::Error::new(std::io::ErrorKind::BrokenPipe, "Session closed"))?;
+            }
 
-        Ok(buf.len())
+            Ok(buf.len())
+        };
+        tokio::select! {
+            biased;
+            _ = self.aborted.cancelled() => Err(std::io::Error::new(std::io::ErrorKind::BrokenPipe, "Stream aborted")),
+            result = writing => result,
+        }
     }
 
     pub async fn push_data(&self, buf: &[u8]) -> std::io::Result<usize> {
         if self.read_closed.load(Ordering::Acquire) {
             return Err(std::io::Error::new(std::io::ErrorKind::BrokenPipe, "Stream closed"));
         }
-        let permits = buf.len().clamp(1, MAX_QUEUED_INBOUND_BYTES) as u32;
-        let permit = self
-            .inbound_budget
-            .clone()
-            .acquire_many_owned(permits)
-            .await
-            .map_err(|_| std::io::Error::new(std::io::ErrorKind::BrokenPipe, "Session inbound budget closed"))?;
-        self.pipe_writer.write_with_permit(buf, permit).await
+        let delivering = async {
+            let permits = buf.len().clamp(1, MAX_QUEUED_INBOUND_BYTES) as u32;
+            let permit = self
+                .inbound_budget
+                .clone()
+                .acquire_many_owned(permits)
+                .await
+                .map_err(|_| std::io::Error::new(std::io::ErrorKind::BrokenPipe, "Session inbound budget closed"))?;
+            self.pipe_writer.write_with_permit(buf, permit).await
+        };
+        tokio::select! {
+            biased;
+            _ = self.aborted.cancelled() => Err(std::io::Error::new(std::io::ErrorKind::BrokenPipe, "Stream aborted")),
+            result = delivering => result,
+        }
     }
 
     pub async fn close(&self) -> std::io::Result<()> {
+        self.aborted.cancel();
         self.read_closed.store(true, Ordering::Release);
-        self.pipe_reader.close_with_error(None);
-        self.shutdown_write().await
+        self.pipe_reader.abort(None).await;
+        tokio::time::timeout(std::time::Duration::from_secs(1), self.shutdown_write())
+            .await
+            .map_err(|_| std::io::Error::new(std::io::ErrorKind::TimedOut, "Stream FIN enqueue timed out"))?
     }
 
     pub async fn shutdown_write(&self) -> std::io::Result<()> {
@@ -159,6 +182,7 @@ impl Stream {
             return Ok(());
         }
 
+        self.maybe_finalize().await;
         let result = self
             .data_enqueue_tx
             .send(DataWrite {
@@ -192,6 +216,7 @@ impl Stream {
 
     pub(crate) async fn close_from_session(&self, error: Option<std::io::Error>) {
         if !self.terminated.swap(true, Ordering::AcqRel) {
+            self.aborted.cancel();
             self.read_closed.store(true, Ordering::Release);
             self.write_closed.store(true, Ordering::Release);
             self.handshake.send_replace(HandshakeState::Failed(
@@ -200,7 +225,7 @@ impl Stream {
                     .map(ToString::to_string)
                     .unwrap_or_else(|| "Session closed before SYNACK".to_string()),
             ));
-            self.pipe_reader.finish_stream(error).await;
+            self.pipe_reader.abort(error).await;
         }
     }
 

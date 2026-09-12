@@ -83,7 +83,8 @@ pub(crate) struct WriterRuntimeState {
     buffer: Arc<Mutex<Vec<u8>>>,
     pkt_counter: Arc<Mutex<u32>>,
     failed: Arc<AtomicBool>,
-    failure_notify: Arc<tokio::sync::Notify>,
+    failure_notify: tokio_util::sync::CancellationToken,
+    pub(crate) stopped: tokio_util::sync::CancellationToken,
 }
 
 #[cfg(any(feature = "client", feature = "server"))]
@@ -127,7 +128,11 @@ pub(crate) fn spawn_data_scheduler(mut input: Receiver<DataWrite>, output: Sende
                 continue;
             }
 
-            match input.recv().await {
+            let next = tokio::select! {
+                _ = output.closed() => return,
+                next = input.recv() => next,
+            };
+            match next {
                 Some(DataWrite { sid, frame }) => {
                     let queue = queues.entry(sid).or_default();
                     if queue.is_empty() {
@@ -150,7 +155,8 @@ impl WriterRuntimeState {
             buffer: Arc::new(Mutex::new(Vec::new())),
             pkt_counter: Arc::new(Mutex::new(0)),
             failed: Arc::new(AtomicBool::new(false)),
-            failure_notify: Arc::new(tokio::sync::Notify::new()),
+            failure_notify: tokio_util::sync::CancellationToken::new(),
+            stopped: tokio_util::sync::CancellationToken::new(),
         })
     }
 
@@ -189,13 +195,13 @@ impl WriterRuntimeState {
         self.failed.load(Ordering::Acquire)
     }
 
-    pub(crate) fn failure_notified(&self) -> Arc<tokio::sync::Notify> {
+    pub(crate) fn failure_notified(&self) -> tokio_util::sync::CancellationToken {
         self.failure_notify.clone()
     }
 
     pub(crate) fn mark_failed(&self) {
         if !self.failed.swap(true, Ordering::AcqRel) {
-            self.failure_notify.notify_waiters();
+            self.failure_notify.cancel();
         }
     }
 }
@@ -427,67 +433,74 @@ impl Protocol for AnyTlsProtocol {
     ) {
         let writer_state_for_task = writer_state.clone();
         tokio::spawn(async move {
-            let mut control_open = true;
-            let mut data_open = true;
-            let mut control_burst = 0usize;
-            while control_open || data_open {
-                let next = if control_burst >= 32 && data_open {
-                    control_burst = 0;
-                    match data_rx.try_recv() {
-                        Ok(frame) => Some(frame),
-                        Err(tokio::sync::mpsc::error::TryRecvError::Empty) => continue,
-                        Err(tokio::sync::mpsc::error::TryRecvError::Disconnected) => {
-                            data_open = false;
-                            continue;
+            let writing = async {
+                let mut control_open = true;
+                let mut data_open = true;
+                let mut control_burst = 0usize;
+                while control_open || data_open {
+                    let next = if control_burst >= 32 && data_open {
+                        control_burst = 0;
+                        match data_rx.try_recv() {
+                            Ok(frame) => Some(frame),
+                            Err(tokio::sync::mpsc::error::TryRecvError::Empty) => continue,
+                            Err(tokio::sync::mpsc::error::TryRecvError::Disconnected) => {
+                                data_open = false;
+                                continue;
+                            }
                         }
-                    }
-                } else {
-                    tokio::select! {
-                        biased;
-                        frame = control_rx.recv(), if control_open => {
-                            if frame.is_none() { control_open = false; }
-                            if frame.is_some() { control_burst = control_burst.saturating_add(1); }
-                            frame
-                        }
-                        frame = data_rx.recv(), if data_open => {
-                            if frame.is_none() { data_open = false; }
-                            if frame.is_some() { control_burst = 0; }
-                            frame
-                        }
-                    }
-                };
-                let Some(FrameWrite {
-                    frame,
-                    ack,
-                    budget: _budget,
-                }) = next
-                else {
-                    continue;
-                };
-                let res = async {
-                    if frame.cmd == Command::SynAck {
-                        log::debug!("Writing SYNACK frame sid={}", frame.sid);
-                    }
-                    Self::write_conn(&mut writer, frame.to_bytes()?.to_vec(), &state, &writer_state).await?;
-                    writer.flush().await
-                }
-                .await;
-
-                if let Some(ack_tx) = ack {
-                    let _ = ack_tx.send(if res.is_ok() {
-                        Ok(())
                     } else {
-                        Err(std::io::Error::new(std::io::ErrorKind::BrokenPipe, "Write failed"))
-                    });
-                }
+                        tokio::select! {
+                            biased;
+                            frame = control_rx.recv(), if control_open => {
+                                if frame.is_none() { control_open = false; }
+                                if frame.is_some() { control_burst = control_burst.saturating_add(1); }
+                                frame
+                            }
+                            frame = data_rx.recv(), if data_open => {
+                                if frame.is_none() { data_open = false; }
+                                if frame.is_some() { control_burst = 0; }
+                                frame
+                            }
+                        }
+                    };
+                    let Some(FrameWrite {
+                        frame,
+                        ack,
+                        budget: _budget,
+                    }) = next
+                    else {
+                        continue;
+                    };
+                    let res = async {
+                        if frame.cmd == Command::SynAck {
+                            log::debug!("Writing SYNACK frame sid={}", frame.sid);
+                        }
+                        Self::write_conn(&mut writer, frame.to_bytes()?.to_vec(), &state, &writer_state).await?;
+                        writer.flush().await
+                    }
+                    .await;
 
-                if let Err(error) = res {
-                    log::warn!("Failed to write frame to peer: {error}");
-                    writer_state_for_task.mark_failed();
-                    break;
+                    if let Some(ack_tx) = ack {
+                        let _ = ack_tx.send(if res.is_ok() {
+                            Ok(())
+                        } else {
+                            Err(std::io::Error::new(std::io::ErrorKind::BrokenPipe, "Write failed"))
+                        });
+                    }
+
+                    if let Err(error) = res {
+                        log::warn!("Failed to write frame to peer: {error}");
+                        writer_state_for_task.mark_failed();
+                        break;
+                    }
                 }
+            };
+            tokio::select! {
+                biased;
+                _ = writer_state.stopped.cancelled() => {}
+                _ = writing => { writer_state_for_task.mark_failed(); }
             }
-            writer_state_for_task.mark_failed();
+            let _ = tokio::time::timeout(std::time::Duration::from_secs(1), writer.shutdown()).await;
             log::debug!("Session writer task exiting (writer loop ended)");
         });
     }
