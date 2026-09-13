@@ -191,7 +191,7 @@ pub struct ClientArgs {
     pub root_cert: Option<PathBuf>,
 
     /// Maximum logical streams per AnyTLS session, if is 1 then multiplexing is disabled
-    #[arg(short, long, default_value_t = 5, value_name = "N")]
+    #[arg(short, long, default_value_t = 1, value_name = "N")]
     #[serde(skip)]
     pub max_streams_per_session: usize,
 

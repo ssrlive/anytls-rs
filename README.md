@@ -112,8 +112,7 @@ The client listens on `socks5://127.0.0.1:1080` by default, it's enable mixed SO
 - `--log <LOG>`: Log level (off, error, warn, info, debug, trace)
 - `--root-cert <FILE>`: Path to root CA certificate PEM file for server verification (optional)
 - `--mitm <IP:PORT>`: Optional man in the middle (MITM) HTTP CONNECT proxy used for the client's outbound connection to the AnyTLS server
-- `--multiplexing`: Enable multiple logical streams per AnyTLS session [default: `false`]
-- `--max-streams-per-session <N>`: Maximum logical streams per AnyTLS session [default: `5`]; forced to `1` when multiplexing is disabled
+- `--max-streams-per-session <N>`: Maximum logical streams per AnyTLS session [default: `1`]; The `1` means multiplexing is disabled
 
 ## Examples
 

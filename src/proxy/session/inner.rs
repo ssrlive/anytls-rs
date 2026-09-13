@@ -134,10 +134,11 @@ impl Session {
                 return Err(std::io::Error::new(std::io::ErrorKind::WouldBlock, "Session stream limit reached"));
             }
 
-            let sid = self.next_stream_id.fetch_add(1, Ordering::Relaxed).wrapping_add(1);
-            if sid == 0 {
-                return Err(std::io::Error::other("Stream identifier exhausted"));
-            }
+            let sid = self
+                .next_stream_id
+                .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| current.checked_add(1))
+                .map(|sid| sid + 1)
+                .map_err(|_| std::io::Error::other("Stream identifier exhausted, please restart your client"))?;
 
             let stream = Arc::new(self.new_stream(sid));
             streams.insert(sid, stream.clone());
