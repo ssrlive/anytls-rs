@@ -194,6 +194,21 @@ impl PipeWriter {
         inner.write_deadline.set(deadline);
         Ok(())
     }
+
+    /// Signal a graceful end-of-stream to the reader, preserving any data that
+    /// is still queued in the pipe. Mirrors [`PipeReader::finish_stream`] but is
+    /// callable from the writer side so a per-stream delivery pump can close the
+    /// read half once it has drained all pending inbound frames.
+    pub async fn finish(&self, error: Option<std::io::Error>) {
+        let mut inner = self.inner.lock().await;
+        if inner.closed || inner.stream_end_queued {
+            return;
+        }
+        inner.stream_end_queued = true;
+        inner.read_error = error;
+        inner.data_sender = None;
+        inner.read_waiter.notify_one();
+    }
 }
 
 pub fn pipe() -> (PipeReader, PipeWriter) {

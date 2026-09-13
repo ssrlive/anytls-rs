@@ -1,10 +1,10 @@
 use crate::core::{Command, Frame};
-use crate::proxy::pipe::{PipeReader, PipeWriter, pipe};
+use crate::proxy::pipe::{PipeReader, pipe};
 use crate::runtime::{DataWrite, FrameWrite, MAX_QUEUED_FRAME_BYTES, MAX_QUEUED_INBOUND_BYTES, StreamProtocolHooks};
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Weak};
-use tokio::sync::{Mutex, Semaphore, mpsc::Sender, watch};
+use tokio::sync::{Mutex, OwnedSemaphorePermit, Semaphore, mpsc, watch};
 
 #[derive(Clone)]
 pub(crate) enum HandshakeState {
@@ -13,12 +13,21 @@ pub(crate) enum HandshakeState {
     Failed(String),
 }
 
+/// A unit of work for a stream's inbound delivery pump. Delivery is decoupled
+/// from the session's single receive loop so that one slow or backpressured
+/// stream can never stall frame reading for the whole carrier (which would
+/// otherwise starve SYNACK and heartbeat frames of unrelated streams).
+enum InboundIntake {
+    Data { data: Vec<u8>, permit: OwnedSemaphorePermit },
+    Finish { error: Option<std::io::Error> },
+}
+
 pub struct Stream {
     id: u32,
     session_id: u64,
     pipe_reader: PipeReader,
-    pipe_writer: PipeWriter,
-    data_enqueue_tx: Sender<DataWrite>,
+    intake_tx: mpsc::UnboundedSender<InboundIntake>,
+    data_enqueue_tx: mpsc::Sender<DataWrite>,
     write_budget: Arc<Semaphore>,
     inbound_budget: Arc<Semaphore>,
     streams: Weak<Mutex<HashMap<u32, Arc<Stream>>>>,
@@ -36,7 +45,7 @@ impl Stream {
     pub(crate) fn new(
         id: u32,
         session_id: u64,
-        data_enqueue_tx: Sender<DataWrite>,
+        data_enqueue_tx: mpsc::Sender<DataWrite>,
         write_budget: Arc<Semaphore>,
         inbound_budget: Arc<Semaphore>,
         streams: Weak<Mutex<HashMap<u32, Arc<Stream>>>>,
@@ -45,11 +54,49 @@ impl Stream {
     ) -> Self {
         let (pipe_reader, pipe_writer) = pipe();
         let (handshake, _) = watch::channel(HandshakeState::Pending);
+        let aborted = tokio_util::sync::CancellationToken::new();
+        let (intake_tx, mut intake_rx) = mpsc::unbounded_channel::<InboundIntake>();
+        {
+            // Per-stream delivery pump: drains inbound frames into the pipe
+            // without ever blocking the session receive loop. Each queued item
+            // carries its shared inbound-budget permit, so total buffered memory
+            // stays bounded even though the intake channel itself is unbounded.
+            let aborted = aborted.clone();
+            tokio::spawn(async move {
+                loop {
+                    let item = tokio::select! {
+                        biased;
+                        _ = aborted.cancelled() => break,
+                        item = intake_rx.recv() => item,
+                    };
+                    let Some(item) = item else { break };
+                    match item {
+                        InboundIntake::Data { data, permit } => {
+                            let write = pipe_writer.write_with_permit(&data, permit);
+                            tokio::pin!(write);
+                            tokio::select! {
+                                biased;
+                                _ = aborted.cancelled() => break,
+                                result = &mut write => {
+                                    if result.is_err() {
+                                        break;
+                                    }
+                                }
+                            }
+                        }
+                        InboundIntake::Finish { error } => {
+                            pipe_writer.finish(error).await;
+                            break;
+                        }
+                    }
+                }
+            });
+        }
         Self {
             id,
             session_id,
             pipe_reader,
-            pipe_writer,
+            intake_tx,
             data_enqueue_tx,
             write_budget,
             inbound_budget,
@@ -60,7 +107,7 @@ impl Stream {
             write_closed: AtomicBool::new(false),
             terminated: AtomicBool::new(false),
             handshake,
-            aborted: tokio_util::sync::CancellationToken::new(),
+            aborted,
         }
     }
 
@@ -158,7 +205,15 @@ impl Stream {
                 .acquire_many_owned(permits)
                 .await
                 .map_err(|_| std::io::Error::new(std::io::ErrorKind::BrokenPipe, "Session inbound budget closed"))?;
-            self.pipe_writer.write_with_permit(buf, permit).await
+            // Hand off to the per-stream pump without blocking the receive loop
+            // on this stream's reader; the permit rides along to bound memory.
+            self.intake_tx
+                .send(InboundIntake::Data {
+                    data: buf.to_vec(),
+                    permit,
+                })
+                .map_err(|_| std::io::Error::new(std::io::ErrorKind::BrokenPipe, "Stream closed"))?;
+            Ok(buf.len())
         };
         tokio::select! {
             biased;
@@ -209,7 +264,13 @@ impl Stream {
                     false
                 }
             });
-            self.pipe_reader.finish_stream(error).await;
+            // Route the end-of-stream through the same intake queue so it is
+            // ordered strictly after any already-received PSH data, preserving
+            // graceful half-close semantics. Fall back to a direct finish if the
+            // pump has already stopped.
+            if let Err(mpsc::error::SendError(InboundIntake::Finish { error })) = self.intake_tx.send(InboundIntake::Finish { error }) {
+                self.pipe_reader.finish_stream(error).await;
+            }
         }
         self.maybe_finalize().await;
     }
@@ -315,5 +376,13 @@ impl Stream {
             .acquire_many_owned(permits)
             .await
             .map_err(|_| std::io::Error::new(std::io::ErrorKind::BrokenPipe, "Session write budget closed"))
+    }
+}
+
+impl Drop for Stream {
+    fn drop(&mut self) {
+        // Guarantee the per-stream delivery pump wakes and exits even if the
+        // stream is dropped without an explicit close while its pipe is full.
+        self.aborted.cancel();
     }
 }

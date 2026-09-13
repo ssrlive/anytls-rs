@@ -814,14 +814,16 @@ mod tests {
             let running = session.clone();
             let task = tokio::spawn(async move { running.run().await });
 
-            if local_close {
-                assert!(timeout(Duration::from_millis(1100), pending.wait_for_handshake()).await.is_err());
-                timeout(Duration::from_secs(1), slow.close()).await.unwrap().unwrap();
-            }
+            // A full or blocked sibling stream must never delay this stream's
+            // SYNACK: inbound delivery is decoupled from the receive loop, so the
+            // handshake resolves promptly without first closing the slow stream.
             timeout(Duration::from_secs(1), pending.wait_for_handshake())
                 .await
-                .expect("closing a full stream must not stall the next SYNACK")
+                .expect("a full sibling stream must not stall the next SYNACK")
                 .expect("other stream handshake must succeed");
+            if local_close {
+                timeout(Duration::from_secs(1), slow.close()).await.unwrap().unwrap();
+            }
             assert!(!session.is_terminated().await);
             timeout(Duration::from_secs(1), session.terminate())
                 .await
