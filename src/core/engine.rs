@@ -11,8 +11,8 @@ pub struct Engine;
 impl Engine {
     pub fn on_session_start(state: &Arc<State>, is_client: bool, client_name: &str) -> std::io::Result<Vec<ProtocolAction>> {
         log::debug!(
-            "Engine::on_session_start is_client={} client_name={} peer_version={}",
-            is_client,
+            "Engine::on_session_start {} side, client_name={} peer_version={}",
+            if is_client { "client" } else { "server" },
             client_name,
             state.peer_version()
         );
@@ -35,16 +35,14 @@ impl Engine {
     }
 
     pub fn on_frame(state: &Arc<State>, is_client: bool, frame: &Frame) -> std::io::Result<Vec<ProtocolAction>> {
+        use std::io::{Error, ErrorKind::InvalidData};
         let mut actions = Vec::new();
 
         log::debug!("Engine::on_frame is_client={} {}", is_client, frame);
 
         match frame.cmd {
             Command::Psh | Command::Syn | Command::Fin | Command::SynAck if frame.sid == 0 => {
-                return Err(std::io::Error::new(
-                    std::io::ErrorKind::InvalidData,
-                    format!("{} cannot use control sid 0", frame.cmd),
-                ));
+                return Err(Error::new(InvalidData, format!("{} cannot use control sid 0", frame.cmd)));
             }
             Command::Settings
             | Command::Alert
@@ -54,10 +52,7 @@ impl Engine {
             | Command::ServerSettings
                 if frame.sid != 0 =>
             {
-                return Err(std::io::Error::new(
-                    std::io::ErrorKind::InvalidData,
-                    format!("{} must use control sid 0", frame.cmd),
-                ));
+                return Err(Error::new(InvalidData, format!("{} must use control sid 0", frame.cmd)));
             }
             _ => {}
         }
@@ -67,20 +62,14 @@ impl Engine {
             Command::Syn | Command::Fin | Command::HeartRequest | Command::HeartResponse
         );
         if payload_forbidden && !frame.data.is_empty() {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::InvalidData,
-                format!("{} cannot carry a payload", frame.cmd),
-            ));
+            return Err(Error::new(InvalidData, format!("{} cannot carry a payload", frame.cmd)));
         }
         if matches!(
             frame.cmd,
             Command::Settings | Command::ServerSettings | Command::UpdatePaddingScheme
         ) && frame.data.is_empty()
         {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::InvalidData,
-                format!("{} requires a payload", frame.cmd),
-            ));
+            return Err(Error::new(InvalidData, format!("{} requires a payload", frame.cmd)));
         }
 
         match frame.cmd {
@@ -188,8 +177,6 @@ impl Engine {
 
         Ok(actions)
     }
-
-    // `on_open_stream` removed — stream opening is handled locally by Session.
 }
 
 #[cfg(test)]

@@ -105,12 +105,13 @@ impl Session {
     }
 
     pub async fn run(&self) -> std::io::Result<()> {
+        use std::io::{Error, ErrorKind};
         log::debug!("session={} client={} stage=session_run", self.id, self.is_client);
         let writer_failure = self.writer_state.failure_notified();
         let result = tokio::select! {
             biased;
-            _ = self.close_notify.cancelled() => Err(std::io::Error::new(std::io::ErrorKind::BrokenPipe, "Session closed")),
-            _ = writer_failure.cancelled() => Err(std::io::Error::new(std::io::ErrorKind::BrokenPipe, "Session writer failed")),
+            _ = self.close_notify.cancelled() => Err(Error::new(ErrorKind::BrokenPipe, "Session closed")),
+            _ = writer_failure.cancelled() => Err(Error::new(ErrorKind::BrokenPipe, "Session writer failed")),
             result = async {
                 self.ensure_started().await?;
                 self.recv_loop().await
@@ -121,24 +122,25 @@ impl Session {
     }
 
     pub async fn open_stream(&self, max_streams: usize) -> std::io::Result<Arc<Stream>> {
+        use std::io::{Error, ErrorKind};
         if self.is_terminated().await {
-            return Err(std::io::Error::new(std::io::ErrorKind::BrokenPipe, "Session closed"));
+            return Err(Error::new(ErrorKind::BrokenPipe, "Session closed"));
         }
 
         let (sid, stream) = {
             let mut streams = self.streams.lock().await;
             if self.closed.load(Ordering::Acquire) {
-                return Err(std::io::Error::new(std::io::ErrorKind::BrokenPipe, "Session closed"));
+                return Err(Error::new(ErrorKind::BrokenPipe, "Session closed"));
             }
             if streams.len() >= max_streams {
-                return Err(std::io::Error::new(std::io::ErrorKind::WouldBlock, "Session stream limit reached"));
+                return Err(Error::new(ErrorKind::WouldBlock, "Session stream limit reached"));
             }
 
             let sid = self
                 .next_stream_id
                 .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| current.checked_add(1))
                 .map(|sid| sid + 1)
-                .map_err(|_| std::io::Error::other("Stream identifier exhausted, please restart your client"))?;
+                .map_err(|_| Error::other("Stream identifier exhausted, please restart your client"))?;
 
             let stream = Arc::new(self.new_stream(sid));
             streams.insert(sid, stream.clone());
@@ -149,7 +151,7 @@ impl Session {
         log::debug!("session={} stream={sid} stage=syn_submit", self.id);
         if let Err(error) = self.write_frame_sync(Frame::new(Command::Syn, sid)).await {
             self.remove_stream(sid).await;
-            stream.close_from_session(Some(std::io::Error::other(error.to_string()))).await;
+            stream.close_from_session(Some(Error::other(error.to_string()))).await;
             return Err(error);
         }
 
@@ -158,6 +160,7 @@ impl Session {
     }
 
     pub async fn write_frame(&self, frame: Frame) -> std::io::Result<usize> {
+        use std::io::{Error, ErrorKind};
         let len = frame.data.len();
         let budget = if matches!(frame.cmd, Command::Psh) {
             self.acquire_write_budget(len).await?
@@ -172,17 +175,18 @@ impl Session {
                 })
                 .await
                 .map(|_| len)
-                .map_err(|_| std::io::Error::new(std::io::ErrorKind::BrokenPipe, "Session closed"))
+                .map_err(|_| Error::new(ErrorKind::BrokenPipe, "Session closed"))
         } else {
             self.control_tx
                 .send(FrameWrite::new(frame, None, Some(budget)))
                 .await
                 .map(|_| len)
-                .map_err(|_| std::io::Error::new(std::io::ErrorKind::BrokenPipe, "Session closed"))
+                .map_err(|_| Error::new(ErrorKind::BrokenPipe, "Session closed"))
         }
     }
 
     pub async fn write_frame_sync(&self, frame: Frame) -> std::io::Result<usize> {
+        use std::io::{Error, ErrorKind};
         let len = frame.data.len();
         let budget = if matches!(frame.cmd, Command::Psh) {
             self.acquire_write_budget(len).await?
@@ -197,16 +201,14 @@ impl Session {
                     frame: FrameWrite::new(frame, Some(ack_tx), Some(budget)),
                 })
                 .await
-                .map_err(|_| std::io::Error::new(std::io::ErrorKind::BrokenPipe, "Session closed"))
+                .map_err(|_| Error::new(ErrorKind::BrokenPipe, "Session closed"))
         } else {
             self.control_tx
                 .send(FrameWrite::new(frame, Some(ack_tx), Some(budget)))
                 .await
-                .map_err(|_| std::io::Error::new(std::io::ErrorKind::BrokenPipe, "Session closed"))
+                .map_err(|_| Error::new(ErrorKind::BrokenPipe, "Session closed"))
         }?;
-        ack_rx
-            .await
-            .map_err(|_| std::io::Error::new(std::io::ErrorKind::BrokenPipe, "Writer dropped"))??;
+        ack_rx.await.map_err(|_| Error::new(ErrorKind::BrokenPipe, "Writer dropped"))??;
         Ok(len)
     }
 
@@ -314,6 +316,7 @@ impl Session {
     }
 
     async fn recv_loop(&self) -> std::io::Result<()> {
+        use std::io::{Error, ErrorKind};
         let mut buffer = vec![0_u8; 4096];
         let mut pending = Vec::new();
         let writer_failure = self.writer_state.failure_notified();
@@ -322,14 +325,14 @@ impl Session {
 
         loop {
             if self.closed.load(Ordering::Acquire) {
-                return Err(std::io::Error::new(std::io::ErrorKind::BrokenPipe, "Session closed"));
+                return Err(Error::new(ErrorKind::BrokenPipe, "Session closed"));
             }
 
             let bytes_read = tokio::select! {
                 _ = heartbeat.tick() => {
                     let mut sent = self.heartbeat_sent.lock().await;
                     if sent.is_some_and(|time| time.elapsed() >= std::time::Duration::from_secs(90)) {
-                        return Err(std::io::Error::new(std::io::ErrorKind::TimedOut, "session heartbeat timed out"));
+                        return Err(Error::new(ErrorKind::TimedOut, "session heartbeat timed out"));
                     }
                     if sent.is_none() {
                         self.write_frame(Frame::new(Command::HeartRequest, 0)).await?;
@@ -338,17 +341,17 @@ impl Session {
                     continue;
                 }
                 _ = self.close_notify.cancelled() => {
-                    return Err(std::io::Error::new(std::io::ErrorKind::BrokenPipe, "Session closed"));
+                    return Err(Error::new(ErrorKind::BrokenPipe, "Session closed"));
                 }
                 _ = writer_failure.cancelled() => {
-                    return Err(std::io::Error::new(std::io::ErrorKind::BrokenPipe, "Session writer failed"));
+                    return Err(Error::new(ErrorKind::BrokenPipe, "Session writer failed"));
                 }
                 result = async {
                     self.reader.lock().await.read(&mut buffer).await
                 } => result?,
             };
             if bytes_read == 0 {
-                return Err(std::io::Error::new(std::io::ErrorKind::UnexpectedEof, "Connection closed"));
+                return Err(Error::new(ErrorKind::UnexpectedEof, "Connection closed"));
             }
             pending.extend_from_slice(&buffer[..bytes_read]);
 
@@ -407,6 +410,7 @@ impl Session {
     }
 
     async fn create_incoming_stream(&self, sid: u32) -> std::io::Result<Option<Arc<Stream>>> {
+        use std::io::{Error, ErrorKind};
         if sid == 0 || self.is_terminated().await {
             return Ok(None);
         }
@@ -414,16 +418,10 @@ impl Session {
         let stream = {
             let mut streams = self.streams.lock().await;
             if streams.contains_key(&sid) {
-                return Err(std::io::Error::new(
-                    std::io::ErrorKind::AlreadyExists,
-                    "duplicate incoming stream identifier",
-                ));
+                return Err(Error::new(ErrorKind::AlreadyExists, "duplicate incoming stream identifier"));
             }
             if streams.len() >= self.max_incoming_streams.load(Ordering::Acquire) {
-                return Err(std::io::Error::new(
-                    std::io::ErrorKind::WouldBlock,
-                    "session incoming stream limit reached",
-                ));
+                return Err(Error::new(ErrorKind::WouldBlock, "session incoming stream limit reached"));
             }
             let stream = Arc::new(self.new_stream(sid));
             streams.insert(sid, stream.clone());
@@ -494,28 +492,25 @@ impl ProtocolHost for Session {
         Ok(())
     }
 
-    async fn terminate_session(&self, sid: u32, message: Option<String>) -> std::io::Result<()> {
+    async fn terminate_session(&self, sid: u32, msg: Option<String>) -> std::io::Result<()> {
+        use std::io::Error;
         if let Some(stream) = self.remove_stream(sid).await {
-            stream
-                .close_from_peer(message.map(|message| std::io::Error::other(format!("remote: {message}"))))
-                .await;
+            stream.close_from_peer(msg.map(|msg| Error::other(format!("remote: {msg}")))).await;
         }
         Ok(())
     }
 
     async fn resolve_stream_handshake(&self, sid: u32, message: String) -> std::io::Result<()> {
+        use std::io::{Error, ErrorKind::InvalidData};
         if sid == 0 {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::InvalidData,
-                "SYNACK cannot use control sid 0",
-            ));
+            return Err(Error::new(InvalidData, "SYNACK cannot use control sid 0"));
         }
         let Some(stream) = self.stream_for_sid(sid).await else {
             if self.is_client && sid <= self.next_stream_id.load(Ordering::Relaxed) {
                 log::debug!("Ignoring late SYNACK for closed stream sid={sid}");
                 return Ok(());
             }
-            return Err(std::io::Error::new(std::io::ErrorKind::InvalidData, "SYNACK for unknown stream"));
+            return Err(Error::new(InvalidData, "SYNACK for unknown stream"));
         };
         if message.is_empty() {
             log::trace!("SYNACK succeeded for stream sid={sid}");
@@ -523,16 +518,14 @@ impl ProtocolHost for Session {
             // That loses unrelated multiplexed streams, so isolate the failure to
             // this stream and keep the Session available for the others.
             if !stream.resolve_handshake(None) {
-                return Err(std::io::Error::new(std::io::ErrorKind::InvalidData, "duplicate SYNACK"));
+                return Err(Error::new(InvalidData, "duplicate SYNACK"));
             }
         } else {
             if !stream.resolve_handshake(Some(format!("remote: {message}"))) {
-                return Err(std::io::Error::new(std::io::ErrorKind::InvalidData, "duplicate SYNACK"));
+                return Err(Error::new(InvalidData, "duplicate SYNACK"));
             }
             self.remove_stream(sid).await;
-            stream
-                .close_from_session(Some(std::io::Error::other(format!("remote: {message}"))))
-                .await;
+            stream.close_from_session(Some(Error::other(format!("remote: {message}")))).await;
         }
         Ok(())
     }

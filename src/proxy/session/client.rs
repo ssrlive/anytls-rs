@@ -4,7 +4,7 @@ use crate::proxy::session::{Session, Stream};
 use crate::runtime::new_client_session;
 use indexmap::IndexMap;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 use tokio::sync::{Mutex, RwLock};
 use tokio::time::interval;
@@ -24,7 +24,7 @@ impl IdleSessionPool {
         }
     }
 
-    async fn take_reusable(&self, idle_session_timeout: Duration, min_idle_sessions: usize) -> Option<(Arc<Session>, u64)> {
+    async fn take_reusable(&self, idle_session_timeout: Duration, min_idle_sessions: usize) -> Option<Arc<Session>> {
         loop {
             let candidate = {
                 let mut sessions = self.sessions.lock().await;
@@ -37,33 +37,33 @@ impl IdleSessionPool {
                 }
             };
 
-            let ((seq, (session, idle_since)), protected) = candidate?;
+            let ((session_id, (session, idle_since)), protected) = candidate?;
 
             if session.is_terminated().await {
                 continue;
             }
 
             if !protected && idle_since.elapsed() >= idle_session_timeout {
-                log::trace!("Dropping stale idle session {seq} before reuse");
+                log::trace!("Dropping stale idle session {session_id} before reuse");
                 let _ = session.terminate().await;
                 continue;
             }
 
             let ptr = Arc::as_ptr(&session) as usize;
-            log::trace!("Client: reusing idle session seq={} ptr=0x{:x}", seq, ptr);
-            return Some((session, seq));
+            log::trace!("Client: reusing idle session id={} ptr=0x{:x}", session_id, ptr);
+            return Some(session);
         }
     }
 
-    async fn return_session(&self, seq: u64, session: Arc<Session>) {
+    async fn return_session(&self, session_id: u64, session: Arc<Session>) {
         let mut sessions = self.sessions.lock().await;
-        if sessions.contains_key(&seq) {
+        if sessions.contains_key(&session_id) {
             return;
         }
 
         let ptr = Arc::as_ptr(&session) as usize;
-        log::trace!("Client: returning session to idle pool seq={} ptr=0x{:x}", seq, ptr);
-        sessions.insert(seq, (session, Instant::now()));
+        log::trace!("Client: returning session to idle pool id={} ptr=0x{:x}", session_id, ptr);
+        sessions.insert(session_id, (session, Instant::now()));
     }
 
     async fn cleanup_stale(&self, timeout: Duration, min_idle: usize) {
@@ -77,7 +77,7 @@ impl IdleSessionPool {
 
         let mut timed_out_indices: Vec<usize> = Vec::new();
         for index in 0..sessions.len() {
-            if let Some((_seq, (_session, idle_since))) = sessions.get_index(index)
+            if let Some((_session_id, (_session, idle_since))) = sessions.get_index(index)
                 && now.duration_since(*idle_since) >= timeout
             {
                 timed_out_indices.push(index);
@@ -92,7 +92,7 @@ impl IdleSessionPool {
         let remove_count = std::cmp::min(max_removable, timed_out_indices.len());
         let to_remove = &timed_out_indices[..remove_count];
         for &index in to_remove.iter().rev() {
-            if let Some((_seq, (session, _))) = sessions.swap_remove_index(index) {
+            if let Some((_session_id, (session, _))) = sessions.swap_remove_index(index) {
                 to_terminate.push(session);
             }
         }
@@ -121,7 +121,6 @@ pub struct Client {
     dial_out: DialOutFunc,
     active_sessions: Arc<Mutex<IndexMap<u64, Arc<Session>>>>,
     idle_session_pool: Arc<IdleSessionPool>,
-    session_seq_number: AtomicU64,
     closed_flag: Arc<AtomicBool>,
     cleanup_cancel: CancellationToken,
     cleanup_task: Mutex<Option<tokio::task::JoinHandle<()>>>,
@@ -162,7 +161,6 @@ impl Client {
             dial_out,
             active_sessions: Arc::new(Mutex::new(IndexMap::new())),
             idle_session_pool,
-            session_seq_number: AtomicU64::new(0),
             closed_flag: Arc::new(AtomicBool::new(false)),
             cleanup_cancel,
             cleanup_task: Mutex::new(Some(cleanup_task)),
@@ -184,10 +182,10 @@ impl Client {
                 return Err(std::io::Error::new(std::io::ErrorKind::BrokenPipe, "Client closed"));
             }
 
-            let (session, seq) = self.find_or_create_session().await?;
+            let session = self.find_or_create_session().await?;
             match session.open_stream(self.max_streams_per_session).await {
                 Ok(stream) => {
-                    self.spawn_idle_return_task(session.clone(), seq);
+                    self.spawn_idle_return_task(session.clone(), session.id);
                     return Ok(stream);
                 }
                 Err(error) => {
@@ -195,7 +193,7 @@ impl Client {
                         last_error = Some(error);
                         continue;
                     }
-                    log::warn!("Failed to open stream on session {seq}: {error}, retrying...");
+                    log::warn!("Failed to open stream on session {}: {error}, retrying...", session.id);
                     let _ = session.terminate().await;
                     last_error = Some(error);
                 }
@@ -204,22 +202,22 @@ impl Client {
         Err(last_error.unwrap_or_else(|| std::io::Error::other("Failed to create stream")))
     }
 
-    async fn find_or_create_session(&self) -> Result<(Arc<Session>, u64), std::io::Error> {
+    async fn find_or_create_session(&self) -> Result<Arc<Session>, std::io::Error> {
         if self.closed_flag.load(Ordering::SeqCst) {
             return Err(std::io::Error::new(std::io::ErrorKind::BrokenPipe, "Client closed"));
         }
 
-        if let Some((session, seq)) = self.take_reusable_session().await {
-            return Ok((session, seq));
+        if let Some(session) = self.take_reusable_session().await {
+            return Ok(session);
         }
 
         let active_sessions = {
             let sessions = self.active_sessions.lock().await;
-            sessions.iter().map(|(seq, session)| (*seq, session.clone())).collect::<Vec<_>>()
+            sessions.values().cloned().collect::<Vec<_>>()
         };
-        for (seq, session) in active_sessions {
+        for session in active_sessions {
             if !session.is_terminated().await && session.has_stream_capacity(self.max_streams_per_session).await {
-                return Ok((session, seq));
+                return Ok(session);
             }
         }
 
@@ -227,53 +225,53 @@ impl Client {
             return Err(std::io::Error::new(std::io::ErrorKind::BrokenPipe, "Client closed"));
         }
 
-        let (session, seq) = self.create_session().await?;
-        Ok((session, seq))
+        let session = self.create_session().await?;
+        Ok(session)
     }
 
-    fn spawn_idle_return_task(&self, session: Arc<Session>, seq: u64) {
+    fn spawn_idle_return_task(&self, session: Arc<Session>, session_id: u64) {
         let idle_session_pool = self.idle_session_pool.clone();
         tokio::spawn(async move {
             let ptr = Arc::as_ptr(&session) as usize;
             if session.is_terminated().await {
-                log::trace!("Client: idle waiter sees terminated session seq={} ptr=0x{:x}", seq, ptr);
+                log::trace!("Client: idle waiter sees terminated session id={} ptr=0x{:x}", session_id, ptr);
                 return;
             }
 
             if !session.is_stream_open().await {
-                idle_session_pool.return_session(seq, session.clone()).await;
+                idle_session_pool.return_session(session_id, session.clone()).await;
                 return;
             }
 
-            log::trace!("Client: idle waiter waiting for session seq={} ptr=0x{:x}", seq, ptr);
+            log::trace!("Client: idle waiter waiting for session id={} ptr=0x{:x}", session_id, ptr);
             session.wait_for_idle().await;
-            log::trace!("Client: idle waiter woke for session seq={} ptr=0x{:x}", seq, ptr);
+            log::trace!("Client: idle waiter woke for session id={} ptr=0x{:x}", session_id, ptr);
 
             if session.is_terminated().await {
-                log::trace!("Client: idle waiter woke to terminated session seq={} ptr=0x{:x}", seq, ptr);
+                log::trace!("Client: idle waiter woke to terminated session id={} ptr=0x{:x}", session_id, ptr);
                 return;
             }
 
             if session.is_stream_open().await {
-                log::trace!("Client: idle waiter woke but stream reopened seq={} ptr=0x{:x}", seq, ptr);
+                log::trace!("Client: idle waiter woke but stream reopened id={} ptr=0x{:x}", session_id, ptr);
                 return;
             }
 
-            idle_session_pool.return_session(seq, session).await;
+            idle_session_pool.return_session(session_id, session).await;
         });
     }
 
-    async fn take_reusable_session(&self) -> Option<(Arc<Session>, u64)> {
+    async fn take_reusable_session(&self) -> Option<Arc<Session>> {
         self.idle_session_pool
             .take_reusable(self.idle_session_timeout, self.min_idle_sessions)
             .await
     }
 
-    async fn create_session(&self) -> Result<(Arc<Session>, u64), std::io::Error> {
+    async fn create_session(&self) -> Result<Arc<Session>, std::io::Error> {
         log::debug!("Client: creating new session (dial out)");
         let conn = match (self.dial_out)().await {
             Ok(c) => {
-                log::debug!("Client: dial out succeeded");
+                log::trace!("Client: dial out succeeded");
                 c
             }
             Err(e) => {
@@ -289,24 +287,21 @@ impl Client {
             return Err(std::io::Error::new(std::io::ErrorKind::BrokenPipe, "Client closed"));
         }
 
-        // Use fetch_add to wrap to 0 after u64::MAX.
-        let seq = { self.session_seq_number.fetch_add(1, Ordering::SeqCst) };
+        let session_id = session.id;
 
-        self.active_sessions.lock().await.insert(seq, session.clone());
-        // Debug: record created session seq and pointer
-        let ptr = Arc::as_ptr(&session) as usize;
-        log::trace!("Client: created session seq={} ptr=0x{:x}", seq, ptr);
+        self.active_sessions.lock().await.insert(session_id, session.clone());
+        log::trace!("Client: created session id={session_id}");
 
         let session_clone = session.clone();
         let sessions = self.active_sessions.clone();
 
         tokio::spawn(async move {
             let result = session_clone.run().await;
-            log::debug!("Session {seq} ended: {result:?}");
-            sessions.lock().await.swap_remove(&seq);
+            log::debug!("Session {session_id} ended: {result:?}");
+            sessions.lock().await.swap_remove(&session_id);
         });
 
-        Ok((session, seq))
+        Ok(session)
     }
 
     pub async fn close(&self) -> Result<(), std::io::Error> {
@@ -374,9 +369,17 @@ mod tests {
         );
 
         let stream = client.create_stream().await.expect("stream should be created");
+        let first_session_id = client
+            .active_sessions
+            .lock()
+            .await
+            .values()
+            .next()
+            .expect("created session should be active")
+            .id;
         stream.close().await.expect("stream should close");
 
-        let (reused, reused_seq) = timeout(Duration::from_secs(1), async {
+        let reused = timeout(Duration::from_secs(1), async {
             loop {
                 if let Some(session) = client.take_reusable_session().await {
                     break session;
@@ -387,7 +390,7 @@ mod tests {
         .await
         .expect("session should become idle after its last stream closes");
 
-        assert_eq!(reused_seq, 0, "the first session should be returned to the idle pool");
+        assert_eq!(reused.id, first_session_id, "the first session should be returned to the idle pool");
         assert!(
             !reused.is_stream_open().await,
             "reused session should still be idle when removed from the idle pool"
@@ -419,15 +422,26 @@ mod tests {
         );
 
         let _first_stream = client.create_stream().await.expect("first stream should be created");
+        let first_session_id = client
+            .active_sessions
+            .lock()
+            .await
+            .values()
+            .next()
+            .expect("created session should be active")
+            .id;
         yield_now().await;
         assert!(client.idle_session_pool.is_empty().await, "first stream should still be active");
 
-        let (second_session, second_seq) = timeout(Duration::from_millis(50), client.find_or_create_session())
+        let second_session = timeout(Duration::from_millis(50), client.find_or_create_session())
             .await
             .expect("new session creation should not wait for idle pool reuse")
             .expect("new session should be created successfully");
 
-        assert_eq!(second_seq, 0, "a live session should be reused for another multiplexed stream");
+        assert_eq!(
+            second_session.id, first_session_id,
+            "a live session should be reused for another multiplexed stream"
+        );
         assert!(
             second_session.is_stream_open().await,
             "reused session should still contain the first active logical stream"
@@ -461,9 +475,17 @@ mod tests {
         );
 
         let stream = client.create_stream().await.expect("stream should be created");
+        let first_session_id = client
+            .active_sessions
+            .lock()
+            .await
+            .values()
+            .next()
+            .expect("created session should be active")
+            .id;
         stream.close().await.expect("stream should close");
 
-        let (reused, reused_seq) = timeout(Duration::from_secs(1), async {
+        let reused = timeout(Duration::from_secs(1), async {
             loop {
                 if let Some(session) = client.take_reusable_session().await {
                     break session;
@@ -474,7 +496,7 @@ mod tests {
         .await
         .expect("session should become idle after both halves close");
 
-        assert_eq!(reused_seq, 0, "the first session should be returned to the idle pool");
+        assert_eq!(reused.id, first_session_id, "the first session should be returned to the idle pool");
         assert!(
             !reused.is_stream_open().await,
             "reused session should still be idle when removed from the idle pool"
@@ -581,11 +603,11 @@ mod tests {
 
         tokio::time::sleep(Duration::from_millis(30)).await;
 
-        let (reused, reused_seq) = client
+        let reused = client
             .take_reusable_session()
             .await
             .expect("the protected idle session should remain reusable");
-        assert_eq!(reused_seq, 0);
+        assert!(reused.id > 0);
         assert!(!reused.is_terminated().await);
 
         client.close().await.expect("client should close cleanly");

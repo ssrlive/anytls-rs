@@ -3,10 +3,12 @@ use bytes::{Buf, BufMut, Bytes, BytesMut};
 pub const HEADER_OVERHEAD_SIZE: usize = 1 + 4 + 2;
 pub const MAX_FRAME_DATA_SIZE: usize = u16::MAX as usize;
 
+/// Represents the command type of a protocol frame.
 #[repr(u8)]
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum Command {
-    Waste,
+    #[default]
+    Waste = 0,
     Syn,
     Psh,
     Fin,
@@ -83,13 +85,14 @@ impl std::fmt::Display for Command {
     }
 }
 
-#[derive(Debug, Clone)]
+/// Represents a protocol frame, which consists of a command, a stream identifier, and an optional payload.
+#[derive(Debug, Clone, Default)]
 pub struct Frame {
     pub cmd: Command,
-    // `sid` indicates the logical stream identifier.
-    // Historical protocol design:
-    //  - sid == 0 : session-level control frames (settings, alerts, padding updates, etc.)
-    //  - sid >= 1  : per-logical-stream data frames (1 was the initial/default stream id)
+    /// `sid` indicates the logical stream identifier.
+    /// Historical protocol design:
+    ///  - sid == 0 : session-level control frames (settings, alerts, padding updates, etc.)
+    ///  - sid >= 1  : per-logical-stream data frames (1 was the initial/default stream id)
     pub sid: u32,
     pub data: Bytes,
 }
@@ -105,7 +108,7 @@ impl Frame {
         Self {
             cmd,
             sid,
-            data: Bytes::new(),
+            ..Frame::default()
         }
     }
 
@@ -114,11 +117,9 @@ impl Frame {
     }
 
     pub fn to_bytes(&self) -> std::io::Result<Bytes> {
+        use std::io::{Error, ErrorKind::InvalidInput};
         if self.data.len() > MAX_FRAME_DATA_SIZE {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::InvalidInput,
-                "frame payload exceeds protocol limit",
-            ));
+            return Err(Error::new(InvalidInput, "frame payload exceeds protocol limit"));
         }
         let mut buf = BytesMut::with_capacity(HEADER_OVERHEAD_SIZE + self.data.len());
         buf.put_u8(u8::from(self.cmd));
@@ -139,11 +140,7 @@ impl Frame {
 
         let frame_data = data[..length].to_vec();
 
-        Some(Self {
-            cmd: header.cmd,
-            sid: header.sid,
-            data: frame_data.into(),
-        })
+        Some(Self::with_data(header.cmd, header.sid, frame_data.into()))
     }
 }
 
