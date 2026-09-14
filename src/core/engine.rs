@@ -72,15 +72,69 @@ impl Engine {
             return Err(Error::new(InvalidData, format!("{} requires a payload", frame.cmd)));
         }
 
+        // client side handling of incoming frames
+        if is_client {
+            match frame.cmd {
+                Command::Waste | Command::HeartResponse => {}
+                Command::Psh => {
+                    if !frame.data.is_empty() {
+                        actions.push(ProtocolAction::PushStreamData {
+                            sid: frame.sid,
+                            data: frame.data.clone(),
+                        });
+                    }
+                }
+                Command::Fin => {
+                    actions.push(ProtocolAction::CloseLocalStream { sid: frame.sid });
+                }
+                Command::UpdatePaddingScheme => {
+                    if let Some(factory) = PaddingFactory::new(frame.data.as_ref()) {
+                        state.set_padding(factory);
+                    }
+                }
+                Command::ServerSettings => {
+                    let settings = StringMap::from_bytes(frame.data.as_ref());
+                    if let Some(version) = settings.get("v").and_then(|value| value.parse::<u8>().ok()) {
+                        state.set_peer_version(version);
+                    }
+                }
+                Command::HeartRequest => {
+                    actions.push(ProtocolAction::SendFrame(Frame::new(Command::HeartResponse, frame.sid)));
+                }
+                Command::SynAck => {
+                    // A SYNACK without data means success. A payload reports a
+                    // stream-scoped handshake failure to the client.
+                    if !frame.data.is_empty() {
+                        actions.push(ProtocolAction::CloseRemoteStream {
+                            sid: frame.sid,
+                            message: String::from_utf8_lossy(frame.data.as_ref()).to_string(),
+                        });
+                    }
+                }
+                Command::Alert => {
+                    // Alerts are handled by the session layer so their message
+                    // can be logged before the session is terminated.
+                }
+                Command::Syn | Command::Settings => {
+                    return Err(Error::new(InvalidData, format!("{} is not valid from the server", frame.cmd)));
+                }
+                Command::Unknown(_) => log::warn!("Received unexpected frame: {}", frame),
+            }
+            return Ok(actions);
+        }
+
+        // server side handling of incoming frames
         match frame.cmd {
             Command::Waste | Command::HeartResponse => {}
-            Command::Psh if !frame.data.is_empty() => {
-                actions.push(ProtocolAction::PushStreamData {
-                    sid: frame.sid,
-                    data: frame.data.clone(),
-                });
+            Command::Psh => {
+                if !frame.data.is_empty() {
+                    actions.push(ProtocolAction::PushStreamData {
+                        sid: frame.sid,
+                        data: frame.data.clone(),
+                    });
+                }
             }
-            Command::Syn if !is_client => {
+            Command::Syn => {
                 log::debug!(
                     "Server received SYN sid={} settings={} peer_version={}",
                     frame.sid,
@@ -98,7 +152,7 @@ impl Engine {
             Command::Fin => {
                 actions.push(ProtocolAction::CloseLocalStream { sid: frame.sid });
             }
-            Command::Settings if !is_client => {
+            Command::Settings => {
                 if state.received_settings_from_client() {
                     actions.push(ProtocolAction::AlertAndFail {
                         message: "duplicate client settings".to_string(),
@@ -147,32 +201,13 @@ impl Engine {
                     server_settings.to_bytes().into(),
                 )));
             }
-            Command::UpdatePaddingScheme if is_client => {
-                if let Some(factory) = PaddingFactory::new(frame.data.as_ref()) {
-                    state.set_padding(factory);
-                }
-            }
             Command::HeartRequest => {
                 actions.push(ProtocolAction::SendFrame(Frame::new(Command::HeartResponse, frame.sid)));
             }
-            Command::ServerSettings if is_client => {
-                let settings = StringMap::from_bytes(frame.data.as_ref());
-                if let Some(version) = settings.get("v").and_then(|value| value.parse::<u8>().ok()) {
-                    state.set_peer_version(version);
-                }
+            Command::Alert | Command::UpdatePaddingScheme | Command::ServerSettings | Command::SynAck => {
+                return Err(Error::new(InvalidData, format!("{} is not valid from the client", frame.cmd)));
             }
-            Command::SynAck => {
-                // SynAck received: nothing to cancel now that synack timeouts
-                // are no longer tracked via ProtocolAction. If SynAck carries
-                // data, close the remote stream with the message below.
-                if !frame.data.is_empty() {
-                    actions.push(ProtocolAction::CloseRemoteStream {
-                        sid: frame.sid,
-                        message: String::from_utf8_lossy(frame.data.as_ref()).to_string(),
-                    });
-                }
-            }
-            _ => log::warn!("Received unexpected frame: {}", frame),
+            Command::Unknown(_) => log::warn!("Received unexpected frame: {}", frame),
         }
 
         Ok(actions)
@@ -246,5 +281,27 @@ mod tests {
         let actions = Engine::on_frame(&state, false, &frame).expect("duplicate settings should produce an alert action");
 
         assert!(matches!(actions.first(), Some(crate::core::ProtocolAction::AlertAndFail { .. })));
+    }
+
+    #[test]
+    fn rejects_commands_from_wrong_direction() {
+        let state = State::new(PaddingFactory::default());
+        for frame in [
+            Frame::new(Command::Syn, 1),
+            Frame::with_data(Command::Settings, 0, bytes::Bytes::from_static(b"v=2")),
+        ] {
+            let error = Engine::on_frame(&state, true, &frame).expect_err("client must reject server-only commands");
+            assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
+        }
+
+        for frame in [
+            Frame::new(Command::SynAck, 1),
+            Frame::with_data(Command::ServerSettings, 0, bytes::Bytes::from_static(b"v=2")),
+            Frame::with_data(Command::UpdatePaddingScheme, 0, bytes::Bytes::from_static(b"stop=1")),
+            Frame::with_data(Command::Alert, 0, bytes::Bytes::from_static(b"unexpected")),
+        ] {
+            let error = Engine::on_frame(&state, false, &frame).expect_err("server must reject client-only commands");
+            assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
+        }
     }
 }
