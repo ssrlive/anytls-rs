@@ -10,6 +10,9 @@ A Rust implementation of the [AnyTLS](https://github.com/anytls/anytls-go) proxy
 AnyTLS-RS provides a proxy solution that disguises proxy traffic as regular TLS connections,
 making it harder to detect and block.
 
+Implementation and review conventions for multiplexed sessions are documented in
+[docs/coding_conventions.md](docs/coding_conventions.md).
+
 ## Features
 
 - **TLS Obfuscation**: Masks proxy traffic as standard TLS connections
