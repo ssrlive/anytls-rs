@@ -245,9 +245,6 @@ and `MIN_PROTOCOL_VERSION` (minimum accepted version for compatibility). See [do
 - Clients advertise `v=<n>` in `cmdSettings`; servers record and echo back a compatible version (>= `MIN_PROTOCOL_VERSION`).
 - Feature gates (such as `cmdSYNACK` and heartbeats) are enabled only when the negotiated version supports them.
 - Keep `MIN_PROTOCOL_VERSION` at a previous stable value when bumping `PROTOCOL_VERSION` to allow staged rollouts and interoperability.
-- Note: this release removes stream-level multiplexing — each `Session` exposes a single logical stream (`sid==1`).
-  Multiplexing was removed because it increased implementation complexity and fragility and made deadlocks more likely.
-  If you rely on multiplexing in other implementations, coordinate rollouts or maintain a compatibility gateway.
 
 ## Contributing
 

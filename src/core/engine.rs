@@ -44,6 +44,9 @@ impl Engine {
             Command::Psh | Command::Syn | Command::Fin | Command::SynAck if frame.sid == 0 => {
                 return Err(Error::new(InvalidData, format!("{} cannot use control sid 0", frame.cmd)));
             }
+            Command::Waste if frame.sid != 0 => {
+                return Err(Error::new(InvalidData, format!("{} must use control sid 0", frame.cmd)));
+            }
             Command::Settings
             | Command::Alert
             | Command::UpdatePaddingScheme
@@ -245,6 +248,13 @@ mod tests {
     fn rejects_payload_on_control_sid() {
         let state = State::new(PaddingFactory::default());
         let error = Engine::on_frame(&state, false, &Frame::new(Command::Psh, 0)).expect_err("control SID must be rejected");
+        assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
+    }
+
+    #[test]
+    fn rejects_waste_on_stream_sid() {
+        let state = State::new(PaddingFactory::default());
+        let error = Engine::on_frame(&state, false, &Frame::new(Command::Waste, 1)).expect_err("WASTE must use control SID");
         assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
     }
 

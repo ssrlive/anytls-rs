@@ -191,7 +191,7 @@ sequenceDiagram
 
 ---
 
-## 7. 多路复用 (Multiplexing) 原理 （版本 3 里 已经 删除）
+## 7. 多路复用 (Multiplexing) 原理
 
 AnyTLS 使用单条 TLS 连接承载多个逻辑流（Stream），极大地减少了握手延迟并提高了传输效率。
 

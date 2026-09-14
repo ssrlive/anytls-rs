@@ -9,12 +9,42 @@ use async_trait::async_trait;
 use bytes::Bytes;
 use std::collections::HashMap;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU8, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use tokio::io::AsyncReadExt;
 use tokio::sync::{Mutex, Semaphore, mpsc::Sender, watch};
 use tokio_util::sync::CancellationToken;
 
 static SESSION_ID_COUNTER: AtomicU64 = AtomicU64::new(1);
+
+#[repr(u8)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum SessionPhase {
+    Created = 0,
+    Running = 1,
+    Terminating = 2,
+    Terminated = 3,
+}
+
+impl From<SessionPhase> for u8 {
+    fn from(phase: SessionPhase) -> Self {
+        phase as u8
+    }
+}
+
+impl TryFrom<u8> for SessionPhase {
+    type Error = std::io::Error;
+
+    fn try_from(value: u8) -> Result<Self, Self::Error> {
+        use std::io::{Error, ErrorKind};
+        match value {
+            0 => Ok(SessionPhase::Created),
+            1 => Ok(SessionPhase::Running),
+            2 => Ok(SessionPhase::Terminating),
+            3 => Ok(SessionPhase::Terminated),
+            _ => Err(Error::new(ErrorKind::InvalidData, format!("invalid session phase {value}"))),
+        }
+    }
+}
 
 pub struct Session {
     pub id: u64,
@@ -22,7 +52,7 @@ pub struct Session {
     streams: Arc<Mutex<HashMap<u32, Arc<Stream>>>>,
     next_stream_id: AtomicU32,
     max_incoming_streams: AtomicUsize,
-    closed: AtomicBool,
+    phase: AtomicU8,
     started: Mutex<bool>,
     pub(crate) is_client: bool,
     pub(crate) protocol_state: Arc<State>,
@@ -67,7 +97,7 @@ impl Session {
             streams: Arc::new(Mutex::new(HashMap::new())),
             next_stream_id: AtomicU32::new(0),
             max_incoming_streams: AtomicUsize::new(1024),
-            closed: AtomicBool::new(false),
+            phase: AtomicU8::new(SessionPhase::Created.into()),
             started: Mutex::new(false),
             is_client,
             protocol_state,
@@ -97,9 +127,23 @@ impl Session {
             }
         };
 
-        if should_start && let Err(error) = self.protocol.on_session_start(self).await {
-            *self.started.lock().await = false;
-            return Err(error);
+        if should_start {
+            let c0 = SessionPhase::Created.into();
+            let new0 = SessionPhase::Running.into();
+            if self.phase.compare_exchange(c0, new0, Ordering::AcqRel, Ordering::Acquire).is_err() {
+                if self.phase()? == SessionPhase::Created {
+                    *self.started.lock().await = false;
+                }
+                return Err(std::io::Error::new(std::io::ErrorKind::BrokenPipe, "Session closed"));
+            }
+            if let Err(error) = self.protocol.on_session_start(self).await {
+                let c1 = SessionPhase::Running.into();
+                let new1 = SessionPhase::Created.into();
+                if self.phase.compare_exchange(c1, new1, Ordering::AcqRel, Ordering::Acquire).is_ok() {
+                    *self.started.lock().await = false;
+                }
+                return Err(error);
+            }
         }
         Ok(())
     }
@@ -123,13 +167,14 @@ impl Session {
 
     pub async fn open_stream(&self, max_streams: usize) -> std::io::Result<Arc<Stream>> {
         use std::io::{Error, ErrorKind};
+        self.ensure_started().await?;
         if self.is_terminated().await {
             return Err(Error::new(ErrorKind::BrokenPipe, "Session closed"));
         }
 
         let (sid, stream) = {
             let mut streams = self.streams.lock().await;
-            if self.closed.load(Ordering::Acquire) {
+            if self.phase()? != SessionPhase::Running {
                 return Err(Error::new(ErrorKind::BrokenPipe, "Session closed"));
             }
             if streams.len() >= max_streams {
@@ -161,6 +206,9 @@ impl Session {
 
     pub async fn write_frame(&self, frame: Frame) -> std::io::Result<usize> {
         use std::io::{Error, ErrorKind};
+        if matches!(self.phase()?, SessionPhase::Terminating | SessionPhase::Terminated) {
+            return Err(Error::new(ErrorKind::BrokenPipe, "Session closed"));
+        }
         let len = frame.data.len();
         let budget = if matches!(frame.cmd, Command::Psh) {
             self.acquire_write_budget(len).await?
@@ -187,6 +235,9 @@ impl Session {
 
     pub async fn write_frame_sync(&self, frame: Frame) -> std::io::Result<usize> {
         use std::io::{Error, ErrorKind};
+        if matches!(self.phase()?, SessionPhase::Terminating | SessionPhase::Terminated) {
+            return Err(Error::new(ErrorKind::BrokenPipe, "Session closed"));
+        }
         let len = frame.data.len();
         let budget = if matches!(frame.cmd, Command::Psh) {
             self.acquire_write_budget(len).await?
@@ -217,8 +268,19 @@ impl Session {
     }
 
     async fn terminate_with_error(&self, error: Option<&std::io::Error>) -> std::io::Result<()> {
-        if self.closed.swap(true, Ordering::AcqRel) {
-            return Ok(());
+        let mut current: SessionPhase = self.phase.load(Ordering::Acquire).try_into()?;
+        loop {
+            match current {
+                SessionPhase::Created | SessionPhase::Running => {
+                    let c = current.into();
+                    let new = SessionPhase::Terminating.into();
+                    match self.phase.compare_exchange(c, new, Ordering::AcqRel, Ordering::Acquire) {
+                        Ok(_) => break,
+                        Err(next) => current = next.try_into()?,
+                    }
+                }
+                SessionPhase::Terminating | SessionPhase::Terminated => return Ok(()),
+            }
         }
 
         self.close_notify.cancel();
@@ -234,25 +296,36 @@ impl Session {
             self.idle_state.send_replace(true);
             stream_list
         };
+        let id = self.id;
+        let c = if self.is_client { "client" } else { "server" };
+        let len = streams.len();
         if let Some(error) = error {
-            log::warn!(
-                "session={} client={} stage=session_failed active_streams={} reason={error}",
-                self.id,
-                self.is_client,
-                streams.len()
-            );
+            if error.kind() == std::io::ErrorKind::UnexpectedEof && streams.is_empty() {
+                log::debug!("session={id} {c} side, stage=session_closed active_streams=0 reason={error}");
+            } else {
+                log::warn!("session={id} {c} side, stage=session_failed active_streams={len} reason={error}");
+            }
         } else {
-            log::debug!("session={} stage=session_terminated active_streams={}", self.id, streams.len());
+            log::debug!("session={id} {c} side, stage=session_terminated active_streams={len}");
         }
         for stream in streams {
             let reason = error.map(|error| std::io::Error::new(error.kind(), format!("session {} ended: {error}", self.id)));
             stream.close_from_session(reason).await;
         }
+        self.phase.store(SessionPhase::Terminated.into(), Ordering::Release);
         Ok(())
     }
 
+    fn phase(&self) -> std::io::Result<SessionPhase> {
+        SessionPhase::try_from(self.phase.load(Ordering::Acquire))
+    }
+
     pub async fn is_terminated(&self) -> bool {
-        self.closed.load(Ordering::Acquire) || self.frame_tx.is_closed() || self.control_tx.is_closed() || self.writer_state.is_failed()
+        let p = self.phase().unwrap_or(SessionPhase::Terminated);
+        matches!(p, SessionPhase::Terminating | SessionPhase::Terminated)
+            || self.frame_tx.is_closed()
+            || self.control_tx.is_closed()
+            || self.writer_state.is_failed()
     }
 
     pub async fn peer_version(&self) -> u8 {
@@ -317,6 +390,7 @@ impl Session {
 
     async fn recv_loop(&self) -> std::io::Result<()> {
         use std::io::{Error, ErrorKind};
+        self.ensure_started().await?;
         let mut buffer = vec![0_u8; 4096];
         let mut pending = Vec::new();
         let writer_failure = self.writer_state.failure_notified();
@@ -324,7 +398,7 @@ impl Session {
         heartbeat.tick().await;
 
         loop {
-            if self.closed.load(Ordering::Acquire) {
+            if self.phase()? != SessionPhase::Running {
                 return Err(Error::new(ErrorKind::BrokenPipe, "Session closed"));
             }
 
@@ -541,7 +615,7 @@ impl ProtocolHost for Session {
 
 #[cfg(test)]
 mod tests {
-    use super::Session;
+    use super::{Session, SessionPhase};
     use crate::core::{Command, Frame};
     use crate::runtime::ProtocolHost;
     use bytes::Bytes;
@@ -560,6 +634,19 @@ mod tests {
             crate::core::State::new(crate::core::PaddingFactory::default()),
             crate::runtime::WriterRuntimeState::new(false),
         )
+    }
+
+    #[tokio::test]
+    async fn session_lifecycle_transitions_are_explicit() {
+        let session = test_session();
+        assert_eq!(session.phase().unwrap(), SessionPhase::Created);
+
+        session.ensure_started().await.expect("session should start");
+        assert_eq!(session.phase().unwrap(), SessionPhase::Running);
+
+        session.terminate().await.expect("session should terminate");
+        assert_eq!(session.phase().unwrap(), SessionPhase::Terminated);
+        assert!(session.open_stream(1).await.is_err());
     }
 
     #[tokio::test]
