@@ -852,7 +852,7 @@ async fn handle_tcp_stream(
     } else {
         destination.to_string()
     };
-    log::info!("Session #{sid} TCP relay established from {client} to {dest}");
+    log::debug!("Session #{sid} TCP relay established from {client} to {dest}");
 
     stream.handshake_success().await?;
     log::debug!("Starting relay to destination {destination}");

@@ -694,7 +694,7 @@ async fn handle_connection(incoming: IncomingConnection, client: Arc<Client>, ad
 }
 
 async fn s5_connect(conn_ready: connect::Connect<connect::Ready>, target_addr: Address, client: Arc<Client>) -> std::io::Result<()> {
-    log::info!("Connecting to target via proxy: {}", target_addr);
+    log::debug!("Connecting to target via proxy: {}", target_addr);
 
     // 创建到代理服务器的连接
     let proxy_stream = client.create_stream().await?;
