@@ -430,7 +430,7 @@ async fn handle_listener_stream(
     client: Arc<Client>,
     advertise_ip: Option<IpAddr>,
     credentials: UserKey,
-) -> Result<(), BoxError> {
+) -> std::io::Result<()> {
     let mut peek_buf = [0u8; 10];
     let n = stream.peek(&mut peek_buf).await?;
     if n == 0 {
@@ -686,7 +686,7 @@ impl rustls::client::danger::ServerCertVerifier for AllowAnyCertVerifier {
     }
 }
 
-async fn handle_connection(incoming: IncomingConnection, client: Arc<Client>, advertise_ip: Option<IpAddr>) -> Result<(), BoxError> {
+async fn handle_connection(incoming: IncomingConnection, client: Arc<Client>, advertise_ip: Option<IpAddr>) -> std::io::Result<()> {
     // perform handshake/authentication
     let authenticated = incoming.authenticate().await?;
     let client_conn = authenticated.wait_request().await?;
@@ -705,7 +705,7 @@ async fn handle_connection(incoming: IncomingConnection, client: Arc<Client>, ad
         }
         ClientConnection::Bind(_, _) => {
             log::warn!("Bind command is not supported");
-            return Err("Bind command is not supported".into());
+            return Err(std::io::Error::other("Bind command is not supported"));
         }
     };
     Ok(())
@@ -810,7 +810,7 @@ async fn handle_udp_associate(
     associate: UdpAssociate<associate::NeedReply>,
     client: Arc<Client>,
     advertise_ip: Option<IpAddr>,
-) -> Result<(), BoxError> {
+) -> std::io::Result<()> {
     use socks5_impl::protocol::Reply;
 
     let tcp_local_addr = associate.local_addr()?;
@@ -822,7 +822,7 @@ async fn handle_udp_associate(
         Err(err) => {
             let mut reply_listener = associate.reply(Reply::GeneralFailure, Address::unspecified()).await?;
             reply_listener.shutdown().await?;
-            return Err(err.into());
+            return Err(err);
         }
     };
 
@@ -831,7 +831,7 @@ async fn handle_udp_associate(
         Err(err) => {
             let mut reply_listener = associate.reply(Reply::GeneralFailure, Address::unspecified()).await?;
             reply_listener.shutdown().await?;
-            return Err(err.into());
+            return Err(err);
         }
     };
 
@@ -843,7 +843,7 @@ async fn handle_udp_associate(
         let request_bytes: Vec<u8> = UotRequest::new(UotMode::Datagram, Address::unspecified()).into();
         proxy_stream.write(&request_bytes).await?;
 
-        Ok::<(), BoxError>(())
+        Ok::<(), std::io::Error>(())
     }
     .await
     {
@@ -864,12 +864,12 @@ async fn handle_udp_associate(
     let proxy_writer = proxy_stream.clone();
     let mut proxy_reader = StreamReader::new(proxy_stream.clone());
 
-    let result: Result<(), BoxError> = loop {
+    let result: std::io::Result<()> = loop {
         tokio::select! {
             res = listen_udp.recv_from() => {
                 let (pkt, frag, destination, src_addr) = res?;
                 if frag != 0 {
-                    break Err(std::io::Error::new(std::io::ErrorKind::InvalidData, "UDP fragmentation is not supported").into());
+                    break Err(std::io::Error::new(std::io::ErrorKind::InvalidData, "UDP fragmentation is not supported"));
                 }
 
                 *incoming_addr.lock().await = src_addr;
@@ -884,7 +884,7 @@ async fn handle_udp_associate(
                 }
 
                 let Some(source) = source else {
-                    break Err(std::io::Error::new(std::io::ErrorKind::InvalidData, "UOT datagram response missing source address").into());
+                    break Err(std::io::Error::new(std::io::ErrorKind::InvalidData, "UOT datagram response missing source address"));
                 };
                 listen_udp.send_to(&payload, 0, source, incoming).await?;
             }
