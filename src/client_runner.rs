@@ -251,11 +251,16 @@ struct StreamReader {
     inner: Arc<Stream>,
     #[allow(clippy::type_complexity)]
     read_fut: Option<std::pin::Pin<Box<dyn std::future::Future<Output = std::io::Result<(Vec<u8>, usize)>> + Send>>>,
+    pending: Vec<u8>,
 }
 
 impl StreamReader {
     fn new(inner: Arc<Stream>) -> Self {
-        Self { inner, read_fut: None }
+        Self {
+            inner,
+            read_fut: None,
+            pending: Vec::new(),
+        }
     }
 }
 
@@ -266,12 +271,25 @@ impl AsyncRead for StreamReader {
         buf: &mut tokio::io::ReadBuf<'_>,
     ) -> std::task::Poll<std::io::Result<()>> {
         loop {
+            if !self.pending.is_empty() {
+                let len = self.pending.len().min(buf.remaining());
+                buf.put_slice(&self.pending[..len]);
+                self.pending.drain(..len);
+                return std::task::Poll::Ready(Ok(()));
+            }
+
             if let Some(fut) = self.read_fut.as_mut() {
                 match fut.as_mut().poll(cx) {
                     std::task::Poll::Ready(Ok((v, n))) => {
                         self.read_fut = None;
-                        buf.put_slice(&v[..n]);
-                        return std::task::Poll::Ready(Ok(()));
+                        if n > v.len() {
+                            return std::task::Poll::Ready(Err(std::io::Error::new(
+                                std::io::ErrorKind::InvalidData,
+                                "stream reader returned more data than requested",
+                            )));
+                        }
+                        self.pending.extend_from_slice(&v[..n]);
+                        continue;
                     }
                     std::task::Poll::Ready(Err(e)) => {
                         self.read_fut = None;
