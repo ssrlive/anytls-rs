@@ -79,7 +79,7 @@ echo "Server PID=$SERVER_PID, log=$SERVER_LOG"
 
 # Start client
 echo "Starting client..." | tee -a "$LOGDIR/run.log"
-RUST_LOG=debug anytls-client -l 127.0.0.1:2080 -s 127.0.0.1:443 -p password --root-cert "$REPO_DIR/debug/root.crt" --sni example.com >"$CLIENT_LOG" 2>&1 &
+RUST_LOG=debug anytls-client -l socks5://127.0.0.1:2080 -s 127.0.0.1:443 -p password --root-cert "$REPO_DIR/debug/root.crt" --sni example.com >"$CLIENT_LOG" 2>&1 &
 CLIENT_PID=$!
 sleep 1
 

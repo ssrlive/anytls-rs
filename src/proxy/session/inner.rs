@@ -406,11 +406,19 @@ impl Session {
                 _ = heartbeat.tick() => {
                     let mut sent = self.heartbeat_sent.lock().await;
                     if sent.is_some_and(|time| time.elapsed() >= std::time::Duration::from_secs(90)) {
+                        log::warn!(
+                            "session={} client={} stage=heartbeat_timeout elapsed_ms={}",
+                            self.id,
+                            self.is_client,
+                            sent.expect("heartbeat timestamp was checked").elapsed().as_millis()
+                        );
                         return Err(Error::new(ErrorKind::TimedOut, "session heartbeat timed out"));
                     }
                     if sent.is_none() {
+                        log::debug!("session={} client={} stage=heartbeat_request_submit", self.id, self.is_client);
                         self.write_frame(Frame::new(Command::HeartRequest, 0)).await?;
                         *sent = Some(tokio::time::Instant::now());
+                        log::debug!("session={} client={} stage=heartbeat_request_queued", self.id, self.is_client);
                     }
                     continue;
                 }
@@ -609,7 +617,13 @@ impl ProtocolHost for Session {
     }
 
     async fn heartbeat_response(&self) {
-        *self.heartbeat_sent.lock().await = None;
+        let elapsed = self.heartbeat_sent.lock().await.take().map(|sent| sent.elapsed().as_millis());
+        log::debug!(
+            "session={} client={} stage=heartbeat_response_received elapsed_ms={:?}",
+            self.id,
+            self.is_client,
+            elapsed
+        );
     }
 }
 
