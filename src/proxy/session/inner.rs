@@ -374,6 +374,26 @@ impl Session {
         self.acquire_budget(&self.control_budget, len, MAX_QUEUED_CONTROL_BYTES).await
     }
 
+    fn try_queue_control_frame(&self, frame: Frame) -> std::io::Result<bool> {
+        use std::io::{Error, ErrorKind};
+        if matches!(self.phase()?, SessionPhase::Terminating | SessionPhase::Terminated) {
+            return Err(Error::new(ErrorKind::BrokenPipe, "Session closed"));
+        }
+        let permits = frame.data.len().clamp(1, MAX_QUEUED_CONTROL_BYTES) as u32;
+        let budget = match self.control_budget.clone().try_acquire_many_owned(permits) {
+            Ok(budget) => budget,
+            Err(tokio::sync::TryAcquireError::NoPermits) => return Ok(false),
+            Err(tokio::sync::TryAcquireError::Closed) => {
+                return Err(Error::new(ErrorKind::BrokenPipe, "Session closed"));
+            }
+        };
+        match self.control_tx.try_send(FrameWrite::new(frame, None, Some(budget))) {
+            Ok(()) => Ok(true),
+            Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => Ok(false),
+            Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => Err(Error::new(ErrorKind::BrokenPipe, "Session closed")),
+        }
+    }
+
     async fn acquire_budget(
         &self,
         budget: &Arc<Semaphore>,
@@ -404,21 +424,32 @@ impl Session {
 
             let bytes_read = tokio::select! {
                 _ = heartbeat.tick() => {
-                    let mut sent = self.heartbeat_sent.lock().await;
-                    if sent.is_some_and(|time| time.elapsed() >= std::time::Duration::from_secs(90)) {
-                        log::warn!(
-                            "session={} client={} stage=heartbeat_timeout elapsed_ms={}",
-                            self.id,
-                            self.is_client,
-                            sent.expect("heartbeat timestamp was checked").elapsed().as_millis()
-                        );
-                        return Err(Error::new(ErrorKind::TimedOut, "session heartbeat timed out"));
-                    }
-                    if sent.is_none() {
+                    let send_heartbeat = {
+                        let mut sent = self.heartbeat_sent.lock().await;
+                        if sent.is_some_and(|time| time.elapsed() >= std::time::Duration::from_secs(90)) {
+                            log::warn!(
+                                "session={} client={} stage=heartbeat_timeout elapsed_ms={}",
+                                self.id,
+                                self.is_client,
+                                sent.expect("heartbeat timestamp was checked").elapsed().as_millis()
+                            );
+                            return Err(Error::new(ErrorKind::TimedOut, "session heartbeat timed out"));
+                        }
+                        if sent.is_none() {
+                            *sent = Some(tokio::time::Instant::now());
+                            true
+                        } else {
+                            false
+                        }
+                    };
+                    if send_heartbeat {
                         log::debug!("session={} client={} stage=heartbeat_request_submit", self.id, self.is_client);
-                        self.write_frame(Frame::new(Command::HeartRequest, 0)).await?;
-                        *sent = Some(tokio::time::Instant::now());
-                        log::debug!("session={} client={} stage=heartbeat_request_queued", self.id, self.is_client);
+                        if self.try_queue_control_frame(Frame::new(Command::HeartRequest, 0))? {
+                            log::debug!("session={} client={} stage=heartbeat_request_queued", self.id, self.is_client);
+                        } else {
+                            self.heartbeat_sent.lock().await.take();
+                            log::debug!("session={} client={} stage=heartbeat_request_deferred", self.id, self.is_client);
+                        }
                     }
                     continue;
                 }
