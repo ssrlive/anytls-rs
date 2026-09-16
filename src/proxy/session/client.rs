@@ -178,12 +178,6 @@ impl Client {
             return Err(std::io::Error::new(std::io::ErrorKind::BrokenPipe, "Client closed"));
         }
 
-        let _dial_guard = if self.max_streams_per_session > 1 {
-            Some(self.dial_lock.lock().await)
-        } else {
-            None
-        };
-
         let mut last_error = None;
         for _ in 0..3 {
             if self.closed_flag.load(Ordering::SeqCst) {
@@ -215,6 +209,12 @@ impl Client {
             return Err(std::io::Error::new(std::io::ErrorKind::BrokenPipe, "Client closed"));
         }
 
+        let _dial_guard = if self.max_streams_per_session > 1 {
+            Some(self.dial_lock.lock().await)
+        } else {
+            None
+        };
+
         if let Some(session) = self.take_reusable_session().await {
             return Ok(session);
         }
@@ -233,8 +233,7 @@ impl Client {
             return Err(std::io::Error::new(std::io::ErrorKind::BrokenPipe, "Client closed"));
         }
 
-        let session = self.create_session().await?;
-        Ok(session)
+        self.create_session().await
     }
 
     fn spawn_idle_return_task(&self, session: Arc<Session>, session_id: u64) {
