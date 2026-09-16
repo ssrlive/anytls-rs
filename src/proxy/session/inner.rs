@@ -417,6 +417,7 @@ impl Session {
         let mut pending = Vec::new();
         let writer_failure = self.writer_state.failure_notified();
         let mut heartbeat = tokio::time::interval(std::time::Duration::from_secs(30));
+        let mut last_inbound_activity = tokio::time::Instant::now();
         heartbeat.tick().await;
 
         loop {
@@ -426,6 +427,9 @@ impl Session {
 
             let bytes_read = tokio::select! {
                 _ = heartbeat.tick() => {
+                    if last_inbound_activity.elapsed() < std::time::Duration::from_secs(30) {
+                        continue;
+                    }
                     let send_heartbeat = {
                         let mut sent = self.heartbeat_sent.lock().await;
                         if sent.is_some_and(|time| time.elapsed() >= std::time::Duration::from_secs(90)) {
@@ -481,6 +485,10 @@ impl Session {
                     self.id,
                     frame.data.len()
                 );
+                last_inbound_activity = tokio::time::Instant::now();
+                if frame.cmd != Command::HeartResponse {
+                    self.heartbeat_sent.lock().await.take();
+                }
                 let handling = self.protocol.handle_frame(self, frame);
                 tokio::pin!(handling);
                 match tokio::time::timeout(std::time::Duration::from_secs(1), &mut handling).await {
