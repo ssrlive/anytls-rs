@@ -128,6 +128,7 @@ pub struct Client {
     idle_session_timeout: Duration,
     min_idle_sessions: usize,
     max_streams_per_session: usize,
+    dial_lock: Arc<Mutex<()>>,
 }
 
 impl Client {
@@ -168,6 +169,7 @@ impl Client {
             idle_session_timeout,
             min_idle_sessions,
             max_streams_per_session: max_streams_per_session.max(1),
+            dial_lock: Arc::new(Mutex::new(())),
         }
     }
 
@@ -175,6 +177,12 @@ impl Client {
         if self.closed_flag.load(Ordering::SeqCst) {
             return Err(std::io::Error::new(std::io::ErrorKind::BrokenPipe, "Client closed"));
         }
+
+        let _dial_guard = if self.max_streams_per_session > 1 {
+            Some(self.dial_lock.lock().await)
+        } else {
+            None
+        };
 
         let mut last_error = None;
         for _ in 0..3 {

@@ -696,9 +696,47 @@ async fn handle_connection(incoming: IncomingConnection, client: Arc<Client>, ad
 
     match client_conn {
         ClientConnection::Connect(conn_need_reply, addr) => {
-            // Reply to client with success and upgrade to Ready
-            let conn_ready = conn_need_reply.reply(Reply::Succeeded, addr.clone()).await?;
-            s5_connect(conn_ready, addr, client).await?;
+            let proxy_stream = match client.create_stream().await {
+                Ok(stream) => stream,
+                Err(err) => {
+                    log::debug!("Failed to create proxy stream for {addr}: {err}");
+                    let mut reply = conn_need_reply.reply(Reply::GeneralFailure, addr).await?;
+                    let _ = reply.shutdown().await;
+                    return Ok(());
+                }
+            };
+            let sid = proxy_stream.id();
+            let addr_data: Vec<u8> = addr.clone().into();
+            if let Err(err) = proxy_stream.write(&addr_data).await {
+                log::debug!("Session #{sid}: failed to write target addr for {addr}: {err}");
+                let _ = proxy_stream.terminate().await;
+                let mut reply = conn_need_reply.reply(Reply::GeneralFailure, addr).await?;
+                let _ = reply.shutdown().await;
+                return Ok(());
+            }
+
+            let handshake_stream = proxy_stream.clone();
+            let handshake_res = tokio::time::timeout(std::time::Duration::from_secs(10), handshake_stream.wait_for_handshake())
+                .await
+                .map_err(|_| std::io::Error::new(std::io::ErrorKind::TimedOut, "stream handshake timed out"))
+                .and_then(|res| res);
+
+            if let Err(err) = handshake_res {
+                log::debug!("Session #{sid}: proxy stream handshake failed for {addr}: {err}");
+                let _ = proxy_stream.terminate().await;
+                let mut reply = conn_need_reply.reply(Reply::HostUnreachable, addr).await?;
+                let _ = reply.shutdown().await;
+                return Ok(());
+            }
+
+            let conn_ready = match conn_need_reply.reply(Reply::Succeeded, addr.clone()).await {
+                Ok(ready) => ready,
+                Err(err) => {
+                    let _ = proxy_stream.terminate().await;
+                    return Err(err);
+                }
+            };
+            s5_connect(conn_ready, proxy_stream).await?;
         }
         ClientConnection::UdpAssociate(associate, _) => {
             handle_udp_associate(associate, client, advertise_ip).await?;
@@ -711,58 +749,45 @@ async fn handle_connection(incoming: IncomingConnection, client: Arc<Client>, ad
     Ok(())
 }
 
-async fn s5_connect(conn_ready: connect::Connect<connect::Ready>, target_addr: Address, client: Arc<Client>) -> std::io::Result<()> {
-    log::debug!("Connecting to target via proxy: {}", target_addr);
-
-    // 创建到代理服务器的连接
-    let proxy_stream = client.create_stream().await?;
+async fn s5_connect(conn_ready: connect::Connect<connect::Ready>, proxy_stream: Arc<Stream>) -> std::io::Result<()> {
     let sid = proxy_stream.id();
-    {
-        // Debug: check is_terminated first, then take pointer (as integer) and log in a short scope
-        let is_terminated = proxy_stream.is_terminated().await;
-        let session_ptr_val = Arc::as_ptr(&proxy_stream) as usize;
-        log::debug!("Session #{sid}: acquired proxy session ptr=0x{session_ptr_val:x} is_terminated={is_terminated}",);
-    }
-
-    // 发送目标地址给代理服务器
-    let addr_data: Vec<u8> = target_addr.into();
-    let written = proxy_stream.write(&addr_data).await?;
-    log::debug!(
-        "Session #{sid}: wrote target addr {} bytes to proxy (expected {})",
-        written,
-        addr_data.len()
-    );
-
     // 开始数据转发
     let (mut client_read, mut client_write) = conn_ready.into_split();
     let proxy_stream_read = proxy_stream.clone();
     let proxy_stream_write = proxy_stream.clone();
+    let cancel = tokio_util::sync::CancellationToken::new();
 
     // Client -> Proxy
+    let cancel_c2p = cancel.clone();
     let c2p = tokio::spawn(async move {
         let mut buf = vec![0u8; 4096];
         let mut err = None;
         let mut local_eof = false;
         loop {
-            match client_read.read(&mut buf).await {
-                Ok(0) => {
-                    local_eof = true;
-                    break;
-                }
-                Ok(n) => {
-                    log::trace!("s5_connect: client->proxy forwarding {} bytes", n);
-                    if let Err(e) = proxy_stream_write.write(&buf[..n]).await {
+            tokio::select! {
+                biased;
+                _ = cancel_c2p.cancelled() => break,
+                res = client_read.read(&mut buf) => match res {
+                    Ok(0) => {
+                        local_eof = true;
+                        break;
+                    }
+                    Ok(n) => {
+                        log::trace!("s5_connect: client->proxy forwarding {} bytes", n);
+                        if let Err(e) = proxy_stream_write.write(&buf[..n]).await {
+                            err = Some(e);
+                            break;
+                        }
+                    }
+                    Err(e) => {
                         err = Some(e);
                         break;
                     }
                 }
-                Err(e) => {
-                    err = Some(e);
-                    break;
-                }
             }
         }
         if let Some(e) = err {
+            cancel_c2p.cancel();
             let _ = proxy_stream_write.terminate().await;
             log::debug!("Session #{sid}: client to proxy error: {e}");
         } else if local_eof {
@@ -772,29 +797,35 @@ async fn s5_connect(conn_ready: connect::Connect<connect::Ready>, target_addr: A
     });
 
     // Proxy -> Client
+    let cancel_p2c = cancel.clone();
     let p2c = tokio::spawn(async move {
         let mut buf = vec![0u8; 4096];
         let mut err = None;
         loop {
-            match proxy_stream_read.read(&mut buf).await {
-                Ok(0) => break,
-                Ok(n) => {
-                    log::trace!("s5_connect: proxy->client forwarding {} bytes", n);
-                    match client_write.write_all(&buf[..n]).await {
-                        Ok(()) => log::trace!("s5_connect: proxy->client wrote {} bytes", n),
-                        Err(e) => {
-                            log::debug!("Session #{sid}: proxy to client write failed after {} bytes: {e}", n);
-                            err = Some(e);
-                            break;
+            tokio::select! {
+                biased;
+                _ = cancel_p2c.cancelled() => break,
+                res = proxy_stream_read.read(&mut buf) => match res {
+                    Ok(0) => break,
+                    Ok(n) => {
+                        log::trace!("s5_connect: proxy->client forwarding {} bytes", n);
+                        match client_write.write_all(&buf[..n]).await {
+                            Ok(()) => log::trace!("s5_connect: proxy->client wrote {} bytes", n),
+                            Err(e) => {
+                                log::debug!("Session #{sid}: proxy to client write failed after {} bytes: {e}", n);
+                                err = Some(e);
+                                break;
+                            }
                         }
                     }
-                }
-                Err(e) => {
-                    err = Some(e);
-                    break;
+                    Err(e) => {
+                        err = Some(e);
+                        break;
+                    }
                 }
             }
         }
+        cancel_p2c.cancel();
         let _ = client_write.shutdown().await;
         if let Some(e) = err {
             log::debug!("Session #{sid}: proxy to client error: {e}");
