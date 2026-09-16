@@ -11,6 +11,8 @@ pub trait ProtocolHost: Send + Sync {
 
     async fn send_frame(&self, frame: Frame) -> std::io::Result<usize>;
 
+    fn try_send_heartbeat(&self, frame: Frame) -> std::io::Result<bool>;
+
     async fn send_frame_sync(&self, frame: Frame) -> std::io::Result<usize>;
 
     async fn push_stream_data(&self, sid: u32, data: Bytes) -> std::io::Result<()>;

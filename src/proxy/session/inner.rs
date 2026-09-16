@@ -62,6 +62,7 @@ pub struct Session {
     #[allow(clippy::type_complexity)]
     on_new_stream: Option<Arc<Box<dyn Fn(Arc<Stream>) + Send + Sync>>>,
     protocol: Arc<dyn Protocol>,
+    heartbeat_tx: Sender<FrameWrite>,
     control_tx: Sender<FrameWrite>,
     pub(crate) frame_tx: Sender<FrameWrite>,
     data_enqueue_tx: Sender<DataWrite>,
@@ -81,6 +82,7 @@ impl Session {
         writer_state: Arc<WriterRuntimeState>,
     ) -> Self {
         let (reader, writer) = tokio::io::split(conn);
+        let (heartbeat_tx, heartbeat_rx) = tokio::sync::mpsc::channel::<FrameWrite>(4);
         let (control_tx, control_rx) = tokio::sync::mpsc::channel::<FrameWrite>(32);
         let (frame_tx, data_rx) = tokio::sync::mpsc::channel::<FrameWrite>(100);
         let (data_enqueue_tx, data_enqueue_rx) = tokio::sync::mpsc::channel::<DataWrite>(100);
@@ -89,7 +91,14 @@ impl Session {
         let control_budget = Arc::new(Semaphore::new(MAX_QUEUED_CONTROL_BYTES));
         let inbound_budget = Arc::new(Semaphore::new(MAX_QUEUED_INBOUND_BYTES));
         let (idle_state, _) = watch::channel(true);
-        protocol.spawn_writer_task(writer, control_rx, data_rx, protocol_state.clone(), writer_state.clone());
+        protocol.spawn_writer_task(
+            writer,
+            heartbeat_rx,
+            control_rx,
+            data_rx,
+            protocol_state.clone(),
+            writer_state.clone(),
+        );
 
         Self {
             id: SESSION_ID_COUNTER.fetch_add(1, Ordering::Relaxed),
@@ -106,6 +115,7 @@ impl Session {
             close_notify: CancellationToken::new(),
             on_new_stream: on_new_stream.map(Arc::new),
             protocol,
+            heartbeat_tx,
             control_tx,
             frame_tx,
             data_enqueue_tx,
@@ -374,20 +384,12 @@ impl Session {
         self.acquire_budget(&self.control_budget, len, MAX_QUEUED_CONTROL_BYTES).await
     }
 
-    fn try_queue_control_frame(&self, frame: Frame) -> std::io::Result<bool> {
+    fn try_queue_heartbeat(&self, frame: Frame) -> std::io::Result<bool> {
         use std::io::{Error, ErrorKind};
         if matches!(self.phase()?, SessionPhase::Terminating | SessionPhase::Terminated) {
             return Err(Error::new(ErrorKind::BrokenPipe, "Session closed"));
         }
-        let permits = frame.data.len().clamp(1, MAX_QUEUED_CONTROL_BYTES) as u32;
-        let budget = match self.control_budget.clone().try_acquire_many_owned(permits) {
-            Ok(budget) => budget,
-            Err(tokio::sync::TryAcquireError::NoPermits) => return Ok(false),
-            Err(tokio::sync::TryAcquireError::Closed) => {
-                return Err(Error::new(ErrorKind::BrokenPipe, "Session closed"));
-            }
-        };
-        match self.control_tx.try_send(FrameWrite::new(frame, None, Some(budget))) {
+        match self.heartbeat_tx.try_send(FrameWrite::new(frame, None, None)) {
             Ok(()) => Ok(true),
             Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => Ok(false),
             Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => Err(Error::new(ErrorKind::BrokenPipe, "Session closed")),
@@ -444,7 +446,7 @@ impl Session {
                     };
                     if send_heartbeat {
                         log::debug!("session={} client={} stage=heartbeat_request_submit", self.id, self.is_client);
-                        if self.try_queue_control_frame(Frame::new(Command::HeartRequest, 0))? {
+                        if self.try_queue_heartbeat(Frame::new(Command::HeartRequest, 0))? {
                             log::debug!("session={} client={} stage=heartbeat_request_queued", self.id, self.is_client);
                         } else {
                             self.heartbeat_sent.lock().await.take();
@@ -565,6 +567,10 @@ impl ProtocolHost for Session {
 
     async fn send_frame(&self, frame: Frame) -> std::io::Result<usize> {
         self.write_frame(frame).await
+    }
+
+    fn try_send_heartbeat(&self, frame: Frame) -> std::io::Result<bool> {
+        self.try_queue_heartbeat(frame)
     }
 
     async fn send_frame_sync(&self, frame: Frame) -> std::io::Result<usize> {

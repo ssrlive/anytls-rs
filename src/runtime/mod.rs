@@ -243,6 +243,7 @@ pub(crate) trait Protocol: Send + Sync {
     fn spawn_writer_task(
         &self,
         writer: tokio::io::WriteHalf<Box<dyn AsyncReadWrite>>,
+        heartbeat_rx: Receiver<FrameWrite>,
         control_rx: Receiver<FrameWrite>,
         data_rx: Receiver<FrameWrite>,
         state: Arc<State>,
@@ -373,7 +374,13 @@ impl AnyTlsProtocol {
             match action {
                 ProtocolAction::SendFrame(frame) => {
                     log::debug!("apply_actions: SendFrame {}", frame);
-                    host.send_frame(frame).await?;
+                    if matches!(frame.cmd, Command::HeartRequest | Command::HeartResponse) {
+                        if !host.try_send_heartbeat(frame)? {
+                            log::debug!("heartbeat queue is full; response will be superseded by the next heartbeat cycle");
+                        }
+                    } else {
+                        host.send_frame(frame).await?;
+                    }
                 }
                 ProtocolAction::SendFrameSync(frame) => {
                     log::debug!("apply_actions: SendFrameSync {}", frame);
@@ -426,6 +433,7 @@ impl Protocol for AnyTlsProtocol {
     fn spawn_writer_task(
         &self,
         mut writer: tokio::io::WriteHalf<Box<dyn AsyncReadWrite>>,
+        mut heartbeat_rx: Receiver<FrameWrite>,
         mut control_rx: Receiver<FrameWrite>,
         mut data_rx: Receiver<FrameWrite>,
         state: Arc<State>,
@@ -436,9 +444,24 @@ impl Protocol for AnyTlsProtocol {
             let writing = async {
                 let mut control_open = true;
                 let mut data_open = true;
+                let mut heartbeat_open = true;
                 let mut control_burst = 0usize;
-                while control_open || data_open {
-                    let next = if control_burst >= 32 && data_open {
+                while heartbeat_open || control_open || data_open {
+                    let next = if heartbeat_open {
+                        match heartbeat_rx.try_recv() {
+                            Ok(frame) => Some(frame),
+                            Err(tokio::sync::mpsc::error::TryRecvError::Empty) => None,
+                            Err(tokio::sync::mpsc::error::TryRecvError::Disconnected) => {
+                                heartbeat_open = false;
+                                None
+                            }
+                        }
+                    } else {
+                        None
+                    };
+                    let next = if next.is_some() {
+                        next
+                    } else if control_burst >= 32 && data_open {
                         control_burst = 0;
                         match data_rx.try_recv() {
                             Ok(frame) => Some(frame),
@@ -451,6 +474,10 @@ impl Protocol for AnyTlsProtocol {
                     } else {
                         tokio::select! {
                             biased;
+                            frame = heartbeat_rx.recv(), if heartbeat_open => {
+                                if frame.is_none() { heartbeat_open = false; }
+                                frame
+                            }
                             frame = control_rx.recv(), if control_open => {
                                 if frame.is_none() { control_open = false; }
                                 if frame.is_some() { control_burst = control_burst.saturating_add(1); }
@@ -569,10 +596,12 @@ mod tests {
     async fn writer_sends_control_frames_past_burst_limit_without_data() {
         let (io, mut peer) = tokio::io::duplex(4096);
         let (_, writer) = tokio::io::split(Box::new(io) as Box<dyn AsyncReadWrite>);
+        let (_heartbeat_tx, heartbeat_rx) = mpsc::channel(4);
         let (control_tx, control_rx) = mpsc::channel(32);
         let (data_tx, data_rx) = mpsc::channel(32);
         AnyTlsProtocol.spawn_writer_task(
             writer,
+            heartbeat_rx,
             control_rx,
             data_rx,
             State::new(PaddingFactory::default()),
@@ -609,6 +638,7 @@ mod tests {
     async fn writer_bounds_control_bursts_and_drains_closed_queues_in_order() {
         let (io, mut peer) = tokio::io::duplex(4096);
         let (_, writer) = tokio::io::split(Box::new(io) as Box<dyn AsyncReadWrite>);
+        let (heartbeat_tx, heartbeat_rx) = mpsc::channel(4);
         let (control_tx, control_rx) = mpsc::channel(96);
         let (data_tx, data_rx) = mpsc::channel(2);
         let control = Frame::new(Command::HeartResponse, 0);
@@ -621,8 +651,10 @@ mod tests {
         data_tx.send(FrameWrite::new(fin.clone(), None, None)).await.unwrap();
         drop(control_tx);
         drop(data_tx);
+        drop(heartbeat_tx);
         AnyTlsProtocol.spawn_writer_task(
             writer,
+            heartbeat_rx,
             control_rx,
             data_rx,
             State::new(PaddingFactory::default()),
