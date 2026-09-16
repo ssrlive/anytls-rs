@@ -51,8 +51,6 @@ pub(crate) const MAX_QUEUED_FRAME_BYTES: usize = 4 * 1024 * 1024;
 pub(crate) const MAX_QUEUED_INBOUND_BYTES: usize = 4 * 1024 * 1024;
 #[cfg(any(feature = "client", feature = "server"))]
 pub(crate) const MAX_QUEUED_CONTROL_BYTES: usize = 256 * 1024;
-#[cfg(any(feature = "client", feature = "server"))]
-const WRITE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
 
 #[cfg(any(feature = "client", feature = "server"))]
 pub(crate) struct FrameWrite {
@@ -305,13 +303,6 @@ impl AnyTlsProtocol {
         state: &Arc<State>,
         writer_state: &Arc<WriterRuntimeState>,
     ) -> std::io::Result<usize> {
-        async fn write_with_timeout(writer: &mut tokio::io::WriteHalf<Box<dyn AsyncReadWrite>>, bytes: &[u8]) -> std::io::Result<()> {
-            tokio::time::timeout(WRITE_TIMEOUT, writer.write_all(bytes))
-                .await
-                .map_err(|_| std::io::Error::new(std::io::ErrorKind::TimedOut, "Session write timed out"))??;
-            Ok(())
-        }
-
         if writer_state.is_buffering().await {
             writer_state.append_buffered_bytes(&bytes).await;
             return Ok(bytes.len());
@@ -346,7 +337,7 @@ impl AnyTlsProtocol {
 
                     let frame_len = spec.max(0) as usize;
                     if remain_payload_len > frame_len {
-                        write_with_timeout(writer, &bytes[..frame_len]).await?;
+                        writer.write_all(&bytes[..frame_len]).await?;
                         bytes.drain(0..frame_len);
                     } else if remain_payload_len > 0 {
                         let padding_len = frame_len.saturating_sub(remain_payload_len).saturating_sub(HEADER_OVERHEAD_SIZE);
@@ -356,13 +347,13 @@ impl AnyTlsProtocol {
                             padding_frame[5..7].copy_from_slice(&(padding_len as u16).to_be_bytes());
                             bytes.extend_from_slice(&padding_frame);
                         }
-                        write_with_timeout(writer, &bytes).await?;
+                        writer.write_all(&bytes).await?;
                         bytes.clear();
                     } else {
                         let mut padding_frame = vec![0u8; HEADER_OVERHEAD_SIZE + frame_len];
                         padding_frame[0] = Command::Waste.into();
                         padding_frame[5..7].copy_from_slice(&(frame_len as u16).to_be_bytes());
-                        write_with_timeout(writer, &padding_frame).await?;
+                        writer.write_all(&padding_frame).await?;
                     }
                 }
 
@@ -374,7 +365,7 @@ impl AnyTlsProtocol {
             }
         }
 
-        write_with_timeout(writer, &bytes).await?;
+        writer.write_all(&bytes).await?;
         Ok(payload_len)
     }
 
