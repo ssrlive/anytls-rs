@@ -802,6 +802,7 @@ async fn s5_connect(conn_ready: connect::Connect<connect::Ready>, target_addr: A
     });
 
     let _ = tokio::join!(c2p, p2c);
+    let _ = proxy_stream.terminate().await;
 
     Ok(())
 }

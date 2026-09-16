@@ -970,9 +970,7 @@ async fn handle_tcp_stream(
                 log::warn!("Error relaying from outbound {}: {e}", destination);
             }
         }
-        if res.is_err() {
-            relay_cancel.cancel();
-        }
+        relay_cancel.cancel();
         log::debug!("o2s finished (outbound->client)");
         Ok::<(), std::io::Error>(())
     };
@@ -981,6 +979,8 @@ async fn handle_tcp_stream(
         (Ok(_), Ok(_)) => log::debug!("Relay finished"),
         (Err(e), _) | (_, Err(e)) => log::warn!("Relay error: {e}"),
     }
+
+    let _ = stream.terminate().await;
 
     Ok(())
 }
