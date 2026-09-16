@@ -433,6 +433,13 @@ impl Session {
                     let send_heartbeat = {
                         let mut sent = self.heartbeat_sent.lock().await;
                         if sent.is_some_and(|time| time.elapsed() >= std::time::Duration::from_secs(90)) {
+                            if self.is_stream_open().await {
+                                let id = self.id;
+                                let c = if self.is_client { "client" } else { "server" };
+                                log::warn!("session={id}, {c} side, stage=heartbeat_timeout_deferred active_streams=true");
+                                *sent = None;
+                                continue;
+                            }
                             log::warn!(
                                 "session={} client={} stage=heartbeat_timeout elapsed_ms={}",
                                 self.id,
