@@ -929,6 +929,50 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn blocked_stream_data_does_not_stall_control_frames() {
+        let (io, mut peer) = duplex(4096);
+        let session = Arc::new(Session::new_with_protocol(
+            Box::new(io),
+            true,
+            None,
+            Arc::new(crate::runtime::AnyTlsProtocol),
+            crate::core::State::new(crate::core::PaddingFactory::default()),
+            crate::runtime::WriterRuntimeState::new(false),
+        ));
+        let slow = session.open_stream(2).await.unwrap();
+        let pending = session.open_stream(2).await.unwrap();
+        let held = session
+            .inbound_budget
+            .clone()
+            .acquire_many_owned(crate::runtime::MAX_QUEUED_INBOUND_BYTES as u32)
+            .await
+            .unwrap();
+
+        peer.write_all(
+            &Frame::with_data(Command::Psh, slow.id(), Bytes::from_static(b"blocked"))
+                .to_bytes()
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+        peer.write_all(&Frame::new(Command::SynAck, pending.id()).to_bytes().unwrap())
+            .await
+            .unwrap();
+        let running = session.clone();
+        let task = tokio::spawn(async move { running.run().await });
+
+        timeout(Duration::from_secs(1), pending.wait_for_handshake())
+            .await
+            .expect("control frame must not wait for slow stream data")
+            .expect("other stream handshake must succeed");
+        assert!(!session.is_terminated().await);
+
+        drop(held);
+        session.terminate().await.unwrap();
+        timeout(Duration::from_secs(1), task).await.unwrap().unwrap().unwrap_err();
+    }
+
+    #[tokio::test]
     async fn session_failure_reason_reaches_pending_handshake() {
         for invalid_frame in [false, true] {
             let (io, mut peer) = duplex(4096);

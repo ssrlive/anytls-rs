@@ -4,7 +4,7 @@ use crate::runtime::{DataWrite, FrameWrite, MAX_QUEUED_FRAME_BYTES, MAX_QUEUED_I
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Weak};
-use tokio::sync::{Mutex, OwnedSemaphorePermit, Semaphore, mpsc, watch};
+use tokio::sync::{Mutex, Semaphore, mpsc, watch};
 
 #[derive(Clone)]
 pub(crate) enum HandshakeState {
@@ -18,7 +18,7 @@ pub(crate) enum HandshakeState {
 /// stream can never stall frame reading for the whole carrier (which would
 /// otherwise starve SYNACK and heartbeat frames of unrelated streams).
 enum InboundIntake {
-    Data { data: Vec<u8>, permit: OwnedSemaphorePermit },
+    Data { data: Vec<u8> },
     Finish { error: Option<std::io::Error> },
 }
 
@@ -29,7 +29,6 @@ pub struct Stream {
     intake_tx: mpsc::UnboundedSender<InboundIntake>,
     data_enqueue_tx: mpsc::Sender<DataWrite>,
     write_budget: Arc<Semaphore>,
-    inbound_budget: Arc<Semaphore>,
     streams: Weak<Mutex<HashMap<u32, Arc<Stream>>>>,
     idle_state: Weak<watch::Sender<bool>>,
     protocol_hooks: Arc<dyn StreamProtocolHooks>,
@@ -62,6 +61,7 @@ impl Stream {
             // carries its shared inbound-budget permit, so total buffered memory
             // stays bounded even though the intake channel itself is unbounded.
             let aborted = aborted.clone();
+            let inbound_budget = inbound_budget.clone();
             tokio::spawn(async move {
                 loop {
                     let item = tokio::select! {
@@ -71,7 +71,18 @@ impl Stream {
                     };
                     let Some(item) = item else { break };
                     match item {
-                        InboundIntake::Data { data, permit } => {
+                        InboundIntake::Data { data } => {
+                            let permits = data.len().clamp(1, MAX_QUEUED_INBOUND_BYTES) as u32;
+                            let permit = tokio::select! {
+                                biased;
+                                _ = aborted.cancelled() => break,
+                                result = inbound_budget.clone().acquire_many_owned(permits) => {
+                                    match result {
+                                        Ok(permit) => permit,
+                                        Err(_) => break,
+                                    }
+                                }
+                            };
                             let write = pipe_writer.write_with_permit(&data, permit);
                             tokio::pin!(write);
                             tokio::select! {
@@ -99,7 +110,6 @@ impl Stream {
             intake_tx,
             data_enqueue_tx,
             write_budget,
-            inbound_budget,
             streams,
             idle_state,
             protocol_hooks,
@@ -198,20 +208,11 @@ impl Stream {
             return Err(std::io::Error::new(std::io::ErrorKind::BrokenPipe, "Stream closed"));
         }
         let delivering = async {
-            let permits = buf.len().clamp(1, MAX_QUEUED_INBOUND_BYTES) as u32;
-            let permit = self
-                .inbound_budget
-                .clone()
-                .acquire_many_owned(permits)
-                .await
-                .map_err(|_| std::io::Error::new(std::io::ErrorKind::BrokenPipe, "Session inbound budget closed"))?;
             // Hand off to the per-stream pump without blocking the receive loop
-            // on this stream's reader; the permit rides along to bound memory.
+            // on this stream's reader; the pump applies the shared budget before
+            // writing to the pipe, preserving frame order without dropping data.
             self.intake_tx
-                .send(InboundIntake::Data {
-                    data: buf.to_vec(),
-                    permit,
-                })
+                .send(InboundIntake::Data { data: buf.to_vec() })
                 .map_err(|_| std::io::Error::new(std::io::ErrorKind::BrokenPipe, "Stream closed"))?;
             Ok(buf.len())
         };
