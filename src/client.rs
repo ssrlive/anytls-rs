@@ -24,20 +24,13 @@ pub struct Client {
     dialer: Dialer,
     padding: Arc<RwLock<PaddingFactory>>,
     idle: Mutex<Vec<IdleSession>>,
-    sessions: Mutex<Vec<Arc<Session>>>,
+    sessions: Mutex<Vec<std::sync::Weak<Session>>>,
     next_sequence: std::sync::atomic::AtomicUsize,
     max_streams_per_session: usize,
-    disabled: bool,
 }
 
 impl Client {
-    pub fn new(
-        dialer: Dialer,
-        padding: Arc<RwLock<PaddingFactory>>,
-        idle_timeout: Duration,
-        max_streams_per_session: usize,
-        disable_reuse: bool,
-    ) -> Arc<Self> {
+    pub fn new(dialer: Dialer, padding: Arc<RwLock<PaddingFactory>>, idle_timeout: Duration, max_streams_per_session: usize) -> Arc<Self> {
         let client = Arc::new(Self {
             dialer,
             padding,
@@ -45,32 +38,28 @@ impl Client {
             sessions: Mutex::new(Vec::new()),
             next_sequence: std::sync::atomic::AtomicUsize::new(0),
             max_streams_per_session: max_streams_per_session.max(1),
-            disabled: disable_reuse,
         });
-        if !disable_reuse {
-            let cleanup_client = Arc::clone(&client);
-            tokio::spawn(async move {
-                let interval = if idle_timeout <= Duration::from_secs(5) {
-                    Duration::from_secs(30)
-                } else {
-                    idle_timeout
+        let cleanup_client = Arc::downgrade(&client);
+        tokio::spawn(async move {
+            let interval = if idle_timeout <= Duration::from_secs(5) {
+                Duration::from_secs(30)
+            } else {
+                idle_timeout
+            };
+            let mut ticker = tokio::time::interval(interval);
+            loop {
+                ticker.tick().await;
+                let Some(client) = cleanup_client.upgrade() else {
+                    break;
                 };
-                let mut ticker = tokio::time::interval(interval);
-                loop {
-                    ticker.tick().await;
-                    cleanup_client.cleanup(idle_timeout).await;
-                }
-            });
-        }
+                client.cleanup(idle_timeout).await;
+            }
+        });
         client
     }
 
     pub async fn create_stream(self: &Arc<Self>) -> std::io::Result<Stream> {
-        let session = if self.disabled {
-            None
-        } else {
-            self.take_idle().await.or(self.take_session_with_capacity().await)
-        };
+        let session = self.take_idle().await.or(self.take_session_with_capacity().await);
         let session = match session {
             Some(session) => session,
             None => self.create_session().await?,
@@ -88,13 +77,16 @@ impl Client {
         let transport = (self.dialer)().await?;
         let sequence = self.next_sequence.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let session = Session::new_client(sequence, transport, Arc::clone(&self.padding), self.max_streams_per_session);
-        self.sessions.lock().await.push(Arc::clone(&session));
+        self.sessions.lock().await.push(Arc::downgrade(&session));
         let (sender, mut receiver) = mpsc::unbounded_channel();
         session.set_idle_sender(sender).await;
-        let client = Arc::clone(self);
+        let client = Arc::downgrade(self);
         tokio::spawn(async move {
             while let Some(session) = receiver.recv().await {
-                if !session.is_closed() && !client.disabled {
+                let Some(client) = client.upgrade() else {
+                    break;
+                };
+                if !session.is_closed() {
                     let mut idle = client.idle.lock().await;
                     if !idle.iter().any(|item| Arc::ptr_eq(&item.session, &session)) {
                         idle.push(IdleSession {
@@ -122,7 +114,11 @@ impl Client {
     }
 
     async fn take_session_with_capacity(&self) -> Option<Arc<Session>> {
-        let sessions = self.sessions.lock().await.clone();
+        let sessions = {
+            let mut registered = self.sessions.lock().await;
+            registered.retain(|session| session.strong_count() > 0);
+            registered.iter().filter_map(std::sync::Weak::upgrade).collect::<Vec<_>>()
+        };
         let mut candidates = Vec::new();
         for session in sessions {
             if !session.is_closed() && session.has_stream_capacity().await {
@@ -133,6 +129,7 @@ impl Client {
     }
 
     async fn cleanup(&self, timeout: Duration) {
+        self.sessions.lock().await.retain(|session| session.strong_count() > 0);
         let expiration = Instant::now().checked_sub(timeout).unwrap_or_else(Instant::now);
         let mut idle = self.idle.lock().await;
         let mut retained = Vec::with_capacity(idle.len());
@@ -182,7 +179,6 @@ mod tests {
             Arc::new(RwLock::new(PaddingFactory::new(DEFAULT_SCHEME).unwrap())),
             Duration::from_secs(60),
             2,
-            false,
         );
 
         let mut first = client.create_stream().await.unwrap();

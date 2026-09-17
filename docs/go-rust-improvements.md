@@ -44,6 +44,8 @@ When the limit is reached:
 - If no existing Session has capacity, the Client creates a new Session.
 - A server receiving an extra `SYN` sends `SYNACK` with `session stream limit reached`.
 
+`max_streams_per_session = 1` prevents multiple concurrent logical streams from sharing one Session, but it does not disable reuse of an idle Session. After its only stream closes, that Session can still return to the idle pool and serve a later stream.
+
 This is a deliberate improvement over the current Go implementation, which has no explicit per-Session stream limit and can keep allocating `uint32` SIDs until resource exhaustion or SID wraparound.
 
 ## Session Selection
@@ -56,6 +58,16 @@ The Rust Client chooses a Session in this order:
 
 The Session ID is used as the ordering key for this selection.
 
+## Session Reuse Policy
+
+The Rust Client intentionally has no separate `disable_reuse` option. The Go option combines two unrelated policies: it prevents idle Session reuse and also closes the entire Session when the logical stream closes. Rust keeps these responsibilities separate:
+
+- `max_streams_per_session` controls only the number of concurrent logical streams carried by one Session.
+- The idle pool controls whether an otherwise healthy Session can be reused after its streams close.
+- A value of `max_streams_per_session = 1` prevents concurrent stream sharing, but does not disable reuse of an idle Session.
+
+This is an intentional Rust design difference, not a missing compatibility feature. It avoids forcing a new transport connection merely to limit per-Session concurrency and keeps resource policy independent from stream capacity.
+
 ## Idle Session Pool
 
 A Session enters the idle pool only after its active logical stream count becomes zero.
@@ -63,6 +75,7 @@ A Session enters the idle pool only after its active logical stream count become
 Both closure paths perform the capacity check:
 
 - Local `Stream::close` sends `FIN`, removes the stream, and checks whether the Session has no remaining streams.
+- Dropping a `Stream` schedules the same cleanup on the Tokio runtime, removes the stream without waiting for the peer FIN, and then best-effort sends `FIN`.
 - Remote `FIN` or remote `SYNACK` failure closes the local stream endpoint, removes the stream, and performs the same check.
 
 A Session with one remaining active stream is not placed in the idle pool when another stream closes.
@@ -83,6 +96,8 @@ The active closer waits for the FIN reply for at most 3 seconds. If the peer doe
 This means a Session is returned to the idle pool only after the final logical stream has completed the FIN exchange and the active stream count is zero.
 
 The current Go implementation is different: its documented behavior says that a normally received `cmdFIN` closes the local Stream without sending a `cmdFIN` reply, while a locally closed Stream sends `cmdFIN` immediately. The Rust FIN reply handshake is an intentional improvement for orderly bidirectional stream closure and is not a wire-format change.
+
+Because Rust `Drop` cannot await, automatic cleanup requires an active Tokio runtime. Explicit `Stream::close().await` remains the deterministic close operation and waits for the FIN reply or the 3-second timeout.
 
 ## Preserved Go Behavior
 

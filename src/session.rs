@@ -1,4 +1,7 @@
-use std::{collections::HashMap, sync::Arc};
+use std::{
+    collections::HashMap,
+    sync::{Arc, Weak},
+};
 
 use tokio::time::{Duration, timeout};
 
@@ -46,6 +49,7 @@ pub struct Session {
     received_settings: std::sync::atomic::AtomicBool,
     padding: Arc<RwLock<PaddingFactory>>,
     reader: Mutex<tokio::io::ReadHalf<BoxTransport>>,
+    close_notify: Notify,
     incoming: Mutex<Option<mpsc::Receiver<Stream>>>,
     incoming_sender: Option<mpsc::Sender<Stream>>,
     idle_sender: Mutex<Option<mpsc::UnboundedSender<Arc<Session>>>>,
@@ -96,6 +100,7 @@ impl Session {
             received_settings: std::sync::atomic::AtomicBool::new(false),
             padding,
             reader: Mutex::new(reader),
+            close_notify: Notify::new(),
             incoming: Mutex::new(incoming.map(|(_, receiver)| receiver)),
             incoming_sender,
             idle_sender: Mutex::new(None),
@@ -176,7 +181,7 @@ impl Session {
             return Err(error);
         }
         self.writer.lock().await.buffering = false;
-        Ok(Stream::new(id, Arc::clone(self), local))
+        Ok(Stream::new(id, Arc::downgrade(self), local))
     }
 
     pub(crate) async fn write_data(&self, id: u32, data: &[u8]) -> std::io::Result<usize> {
@@ -215,6 +220,7 @@ impl Session {
         if self.closed.swap(true, std::sync::atomic::Ordering::AcqRel) {
             return Ok(());
         }
+        self.close_notify.notify_one();
         let streams = self.streams.lock().await.drain().map(|(_, entry)| entry).collect::<Vec<_>>();
         for entry in streams {
             entry.closed.notify_one();
@@ -235,7 +241,12 @@ impl Session {
 
     async fn receive_loop(self: Arc<Self>) -> std::io::Result<()> {
         loop {
-            let frame = Frame::read_from(&mut *self.reader.lock().await).await?;
+            let frame = tokio::select! {
+                result = async {
+                    Frame::read_from(&mut *self.reader.lock().await).await
+                } => result?,
+                _ = self.close_notify.notified() => return Ok(()),
+            };
             if !valid_stream_id(frame.command, frame.stream_id) {
                 return Err(std::io::Error::new(
                     std::io::ErrorKind::InvalidData,
@@ -305,14 +316,45 @@ impl Session {
     }
 
     async fn close_remote_stream(self: &Arc<Self>, id: u32) -> std::io::Result<()> {
-        self.write_control(Frame::new(Command::Fin, id)).await?;
+        let should_reply = {
+            let mut streams = self.streams.lock().await;
+            match streams.get_mut(&id) {
+                Some(stream) if !stream.local_fin => {
+                    stream.local_fin = true;
+                    true
+                }
+                Some(_) | None => false,
+            }
+        };
+        let result = if should_reply {
+            self.write_control(Frame::new(Command::Fin, id)).await
+        } else {
+            Ok(())
+        };
         self.finish_stream(id).await;
-        Ok(())
+        result
+    }
+
+    async fn drop_stream(self: &Arc<Self>, id: u32) {
+        let should_send_fin = {
+            let mut streams = self.streams.lock().await;
+            match streams.get_mut(&id) {
+                Some(stream) if !stream.local_fin => {
+                    stream.local_fin = true;
+                    true
+                }
+                Some(_) | None => false,
+            }
+        };
+        self.finish_stream(id).await;
+        if should_send_fin {
+            let _ = self.write_control(Frame::new(Command::Fin, id)).await;
+        }
     }
 
     async fn finish_stream(self: &Arc<Self>, id: u32) {
-        if let Some(mut entry) = self.streams.lock().await.remove(&id) {
-            let _ = entry.writer.shutdown().await;
+        if let Some(entry) = self.streams.lock().await.remove(&id) {
+            drop(entry.writer);
             entry.closed.notify_waiters();
         }
         if self.active_streams().await == 0
@@ -350,7 +392,7 @@ impl Session {
                 },
             );
         }
-        let stream = Stream::new(id, Arc::clone(self), local);
+        let stream = Stream::new(id, Arc::downgrade(self), local);
         self.incoming_sender
             .as_ref()
             .unwrap()
@@ -425,14 +467,14 @@ impl Writer {
 
 pub struct Stream {
     id: u32,
-    session: Arc<Session>,
+    session: Weak<Session>,
     io: tokio::io::DuplexStream,
     closed: bool,
     handshake_reported: std::sync::atomic::AtomicBool,
 }
 
 impl Stream {
-    fn new(id: u32, session: Arc<Session>, io: tokio::io::DuplexStream) -> Self {
+    fn new(id: u32, session: Weak<Session>, io: tokio::io::DuplexStream) -> Self {
         Self {
             id,
             session,
@@ -448,7 +490,7 @@ impl Stream {
 
     #[cfg(test)]
     pub(crate) fn session(&self) -> Arc<Session> {
-        Arc::clone(&self.session)
+        self.session.upgrade().expect("session should still be alive")
     }
 
     pub async fn read(&mut self, data: &mut [u8]) -> std::io::Result<usize> {
@@ -459,11 +501,19 @@ impl Stream {
         if self.closed {
             return Err(std::io::Error::new(std::io::ErrorKind::BrokenPipe, "stream closed"));
         }
-        self.session.write_data(self.id, data).await
+        let session = self
+            .session
+            .upgrade()
+            .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::BrokenPipe, "session closed"))?;
+        session.write_data(self.id, data).await
     }
 
     pub async fn handshake_success(&self) -> std::io::Result<()> {
-        if self.session.peer_version.load(std::sync::atomic::Ordering::Acquire) >= 2
+        let session = self
+            .session
+            .upgrade()
+            .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::BrokenPipe, "session closed"))?;
+        if session.peer_version.load(std::sync::atomic::Ordering::Acquire) >= 2
             && self
                 .handshake_reported
                 .compare_exchange(
@@ -474,13 +524,17 @@ impl Stream {
                 )
                 .is_ok()
         {
-            self.session.write_control(Frame::new(Command::SynAck, self.id)).await?;
+            session.write_control(Frame::new(Command::SynAck, self.id)).await?;
         }
         Ok(())
     }
 
     pub async fn handshake_failure(&self, error: &str) -> std::io::Result<()> {
-        if self.session.peer_version.load(std::sync::atomic::Ordering::Acquire) >= 2
+        let session = self
+            .session
+            .upgrade()
+            .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::BrokenPipe, "session closed"))?;
+        if session.peer_version.load(std::sync::atomic::Ordering::Acquire) >= 2
             && self
                 .handshake_reported
                 .compare_exchange(
@@ -493,7 +547,7 @@ impl Stream {
         {
             let mut frame = Frame::new(Command::SynAck, self.id);
             frame.data = error.as_bytes().to_vec();
-            self.session.write_control(frame).await?;
+            session.write_control(frame).await?;
         }
         Ok(())
     }
@@ -503,7 +557,11 @@ impl Stream {
             return Ok(());
         }
         self.closed = true;
-        self.session.close_stream(self.id).await?;
+        let session = self
+            .session
+            .upgrade()
+            .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::BrokenPipe, "session closed"))?;
+        session.close_stream(self.id).await?;
         self.io.shutdown().await
     }
 }
@@ -512,6 +570,15 @@ impl Drop for Stream {
     fn drop(&mut self) {
         if !self.closed {
             self.closed = true;
+            let Some(session) = self.session.upgrade() else {
+                return;
+            };
+            let id = self.id;
+            if let Ok(handle) = tokio::runtime::Handle::try_current() {
+                handle.spawn(async move {
+                    session.drop_stream(id).await;
+                });
+            }
         }
     }
 }
@@ -551,6 +618,31 @@ mod tests {
         assert_eq!(&response, b"world");
 
         client_stream.close().await.unwrap();
+        let _ = server.close().await;
+        let _ = client.close().await;
+    }
+
+    #[tokio::test]
+    async fn dropping_stream_releases_session_stream() {
+        let (client_io, server_io) = tokio::io::duplex(128 * 1024);
+        let client = Session::new_client(1, Box::new(client_io), padding(), 1);
+        let server = Session::new_server(1, Box::new(server_io), padding(), 1);
+        client.run().await.unwrap();
+        server.run().await.unwrap();
+
+        let client_stream = client.open_stream().await.unwrap();
+        client_stream.write(b"x").await.unwrap();
+        let _server_stream = server.accept_stream().await.unwrap();
+        drop(client_stream);
+
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while client.active_streams().await != 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("dropped stream should be released");
+
         let _ = server.close().await;
         let _ = client.close().await;
     }
