@@ -1,0 +1,19 @@
+[package]
+name = "anytls"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+md-5 = "0.11.0"
+rand = "0.10.2"
+rustls = "0.23.45"
+sha2 = "0.11.0"
+tokio = { version = "1.53.1", features = [
+    "io-util",
+    "macros",
+    "net",
+    "rt-multi-thread",
+    "sync",
+    "time",
+] }
+tokio-rustls = "0.26.5"

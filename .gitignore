@@ -1,0 +1,9 @@
+/Cargo.lock
+/target
+/.VSCodeCounter
+/dist
+/cmd/client/client
+/cmd/server/server
+*.exe
+*.zip
+.vscode
