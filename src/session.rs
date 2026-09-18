@@ -41,7 +41,7 @@ struct Writer {
 
 /// Represents an status of a logical stream within a session.
 pub(crate) struct StreamEntry {
-    pub(crate) writer: tokio::io::DuplexStream,
+    pub(crate) writer: Arc<Mutex<tokio::io::DuplexStream>>,
     /// Indicates whether the local side has sent a FIN for this stream.
     /// The stream is considered fully closed when both local and remote sides have sent FIN.
     pub(crate) local_fin: bool,
@@ -52,7 +52,7 @@ pub(crate) struct StreamEntry {
 impl StreamEntry {
     pub(crate) fn new(writer: tokio::io::DuplexStream) -> Self {
         Self {
-            writer,
+            writer: Arc::new(Mutex::new(writer)),
             local_fin: false,
             close_notify: Arc::new(Notify::new()),
         }
@@ -228,7 +228,8 @@ impl Session {
             Arc::clone(&stream.close_notify)
         };
         if let Err(e) = self.write_control(Frame::new(Command::Fin, id)).await {
-            log::warn!("Failed to send FIN for stream {id}: {e}");
+            self.finish_stream(id).await;
+            return Err(e);
         }
         if timeout(FIN_ACK_TIMEOUT, close_notify.notified()).await.is_err() {
             self.finish_stream(id).await;
@@ -261,6 +262,7 @@ impl Session {
     }
 
     async fn receive_loop(self: Arc<Self>) -> std::io::Result<()> {
+        use std::io::{Error, ErrorKind::InvalidData};
         loop {
             let frame = tokio::select! {
                 result = async {
@@ -270,13 +272,16 @@ impl Session {
             };
             let stream_id = frame.stream_id;
             if !frame.command.valid_stream_id(stream_id) {
-                use std::io::{Error, ErrorKind::InvalidData};
                 break Err(Error::new(InvalidData, "invalid stream id for command"));
+            }
+            if !frame.command.allows_data() && !frame.data.is_empty() {
+                break Err(Error::new(InvalidData, "command must not contain data"));
             }
             match frame.command {
                 Command::Push => {
-                    if let Some(entry) = self.streams.lock().await.get_mut(&stream_id) {
-                        entry.writer.write_all(&frame.data).await?;
+                    let writer = self.streams.lock().await.get(&stream_id).map(|entry| Arc::clone(&entry.writer));
+                    if let Some(writer) = writer {
+                        writer.lock().await.write_all(&frame.data).await?;
                     }
                 }
                 Command::Waste => {}
@@ -308,7 +313,10 @@ impl Session {
                         *self.padding.write().await = factory;
                     }
                 }
-                Command::Alert => break Ok(()),
+                Command::Alert => {
+                    log::warn!("Received session alert: {}", String::from_utf8_lossy(&frame.data));
+                    break Ok(());
+                }
             }
         }
     }
@@ -395,23 +403,30 @@ impl Session {
             return Err(Error::new(InvalidData, "settings required before SYN"));
         }
         let (local, remote) = tokio::io::duplex(64 * 1024);
+        let mut reject = false;
         {
             let mut streams = self.streams.lock().await;
-            if streams.len() >= self.max_streams {
-                let mut rejection = Frame::new(Command::SynAck, id);
-                rejection.data = b"session stream limit reached".to_vec();
-                self.write_control(rejection).await?;
+            if streams.contains_key(&id) {
                 return Ok(());
             }
-            streams.insert(id, StreamEntry::new(remote));
+            if streams.len() >= self.max_streams {
+                reject = true;
+            } else {
+                streams.insert(id, StreamEntry::new(remote));
+            }
+        }
+        if reject {
+            let mut rejection = Frame::new(Command::SynAck, id);
+            rejection.data = b"session stream limit reached".to_vec();
+            self.write_control(rejection).await?;
+            return Ok(());
         }
         let stream = Stream::new(id, Arc::downgrade(self), local);
-        self.incoming_sender
-            .as_ref()
-            .unwrap()
-            .send(stream)
-            .await
-            .map_err(|e| Error::new(BrokenPipe, format!("stream receiver closed: {e}")))
+        if let Err(e) = self.incoming_sender.as_ref().unwrap().send(stream).await {
+            self.finish_stream(id).await;
+            return Err(Error::new(BrokenPipe, format!("stream receiver closed: {e}")));
+        }
+        Ok(())
     }
 }
 
