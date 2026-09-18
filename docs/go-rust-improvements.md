@@ -39,7 +39,7 @@ active_streams < max_streams_per_session
 
 When the limit is reached:
 
-- A client-side `open_stream` returns `WouldBlock`.
+- A direct `Session::open_stream` returns `WouldBlock`; `Client::create_stream` treats this as a capacity race and retries Session selection instead of closing the selected Session.
 - The Client selects another Session with available capacity, if one exists.
 - If no existing Session has capacity, the Client creates a new Session.
 - A server receiving an extra `SYN` sends `SYNACK` with `session stream limit reached`.
@@ -52,11 +52,13 @@ This is a deliberate improvement over the current Go implementation, which has n
 
 The Rust Client chooses a Session in this order:
 
-1. Reuse the newest fully idle Session.
-2. Reuse the newest existing Session with available stream capacity.
+1. Reuse the oldest fully idle Session.
+2. Reuse the oldest existing Session with available stream capacity.
 3. Create a new Session.
 
-The Session ID is used as the ordering key for this selection.
+The Session ID is used as the ordering key for this selection; the smallest Session ID is selected first.
+
+The Rust Client also applies a configurable maximum Session age through `Client::new`. An expired Session is excluded from new-stream selection. Existing logical streams are not interrupted; the Session is allowed to drain, and an idle expired Session is closed by the cleanup path.
 
 ## Session Reuse Policy
 
@@ -82,9 +84,11 @@ A Session with one remaining active stream is not placed in the idle pool when a
 
 The pool deduplicates Session references, so closing multiple streams cannot enqueue the same Session more than once.
 
-## FIN Close Handshake
+## Intentional Rust FIN Difference
 
-The Rust implementation uses an explicit FIN exchange for every logical stream:
+The Rust implementation intentionally differs from the Go implementation and the
+protocol's one-way FIN behavior by using an explicit FIN reply handshake for every
+logical stream:
 
 1. An active closer sends `FIN` and keeps the stream in the Session stream table.
 2. It waits for the peer's `FIN` before completing local stream shutdown.
@@ -95,7 +99,11 @@ The active closer waits for the FIN reply for at most 3 seconds. If the peer doe
 
 This means a Session is returned to the idle pool only after the final logical stream has completed the FIN exchange and the active stream count is zero.
 
-The current Go implementation is different: its documented behavior says that a normally received `cmdFIN` closes the local Stream without sending a `cmdFIN` reply, while a locally closed Stream sends `cmdFIN` immediately. The Rust FIN reply handshake is an intentional improvement for orderly bidirectional stream closure and is not a wire-format change.
+The Go implementation is intentionally not mirrored here: a normally received
+`cmdFIN` closes the local Stream without sending a `cmdFIN` reply, while a locally
+closed Stream sends `cmdFIN` immediately. Rust sends the reply as part of its own
+close-handshake design. This is an intentional behavioral difference, not an
+accidental compatibility gap; the command value and frame format remain unchanged.
 
 Because Rust `Drop` cannot await, automatic cleanup requires an active Tokio runtime. Explicit `Stream::close().await` remains the deterministic close operation and waits for the FIN reply or the 3-second timeout.
 
@@ -106,7 +114,7 @@ The Rust translation preserves these important Go behaviors:
 - Settings are sent before opening data streams.
 - Client Settings and the first `SYN` remain buffered until the first data write flushes them with the first `PSH`.
 - The first data stream starts at SID `1`.
-- `FIN` closes one logical stream through a FIN reply handshake without closing the whole Session.
+- `FIN` closes one logical stream without closing the whole Session; Rust additionally uses a FIN reply handshake by design.
 - `SYNACK` is sent at most once per stream handshake.
 - Padding packet counting is tied to transport writes.
 - The Session remains reusable while it is alive and has capacity.

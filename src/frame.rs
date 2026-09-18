@@ -40,6 +40,23 @@ impl TryFrom<u8> for Command {
     }
 }
 
+impl Command {
+    pub fn valid_stream_id(self, stream_id: u32) -> bool {
+        match self {
+            Command::Syn | Command::Push | Command::Fin | Command::SynAck => stream_id > 0,
+            Command::Waste | Command::Settings | Command::Alert | Command::UpdatePaddingScheme | Command::ServerSettings => stream_id == 0,
+            Command::HeartRequest | Command::HeartResponse => stream_id == 0,
+        }
+    }
+
+    pub fn allows_data(self) -> bool {
+        matches!(
+            self,
+            Self::Waste | Self::Push | Self::Settings | Self::Alert | Self::UpdatePaddingScheme | Self::SynAck | Self::ServerSettings
+        )
+    }
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct Frame {
     pub command: Command,
@@ -74,8 +91,16 @@ impl Frame {
         let mut header = [0u8; HEADER_OVERHEAD_SIZE];
         reader.read_exact(&mut header).await?;
         let command = Command::try_from(header[0]).map_err(|value| Error::new(InvalidData, format!("unknown command {value}")))?;
-        let stream_id = u32::from_be_bytes(header[1..5].try_into().expect("header width"));
-        let data_len = u16::from_be_bytes(header[5..7].try_into().expect("header width")) as usize;
+        let stream_id = u32::from_be_bytes(
+            header[1..5]
+                .try_into()
+                .map_err(|e| Error::new(InvalidData, format!("invalid header width: {e}")))?,
+        );
+        let data_len = u16::from_be_bytes(
+            header[5..7]
+                .try_into()
+                .map_err(|e| Error::new(InvalidData, format!("invalid header width: {e}")))?,
+        ) as usize;
         let mut data = vec![0u8; data_len];
         reader.read_exact(&mut data).await?;
         Ok(Self { command, stream_id, data })
