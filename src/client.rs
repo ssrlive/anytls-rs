@@ -85,7 +85,7 @@ impl Client {
                 Ok(stream) => return Ok(stream),
                 Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => continue,
                 Err(error) => {
-                    let _ = session.close().await;
+                    let _ = session.shutdown().await;
                     return Err(error);
                 }
             }
@@ -124,7 +124,7 @@ impl Client {
             if !item.session.is_closed() && !item.session.is_expired(self.max_session_age) {
                 return Some(item.session);
             }
-            tokio::spawn(async move { item.session.close().await });
+            tokio::spawn(async move { item.session.shutdown().await });
         }
         None
     }
@@ -152,7 +152,7 @@ impl Client {
         for item in idle.drain(..) {
             if item.since < expiration || item.session.is_expired(self.max_session_age) {
                 let session = item.session;
-                tokio::spawn(async move { session.close().await });
+                tokio::spawn(async move { session.shutdown().await });
             } else {
                 retained.push(item);
             }
@@ -215,7 +215,7 @@ mod tests {
 
         assert_eq!(client.idle_pool.lock().await.len(), 2);
         for server in server_sessions.lock().await.drain(..) {
-            let _ = server.close().await;
+            let _ = server.shutdown().await;
         }
     }
 
@@ -261,7 +261,7 @@ mod tests {
 
         drop(second);
         for server in server_sessions.lock().await.drain(..) {
-            let _ = server.close().await;
+            let _ = server.shutdown().await;
         }
     }
 }

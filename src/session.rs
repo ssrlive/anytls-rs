@@ -4,9 +4,10 @@ use std::{
 };
 use tokio::{
     io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt},
-    sync::{Mutex, Notify, RwLock, mpsc},
+    sync::{Mutex, RwLock, mpsc},
     time::{Duration, timeout},
 };
+use tokio_util::sync::CancellationToken;
 
 use crate::{
     frame::{Command, Frame},
@@ -46,7 +47,7 @@ pub(crate) struct StreamEntry {
     /// The stream is considered fully closed when both local and remote sides have sent FIN.
     pub(crate) local_fin: bool,
     /// Used to notify an active-close task that is waiting for a FIN response.
-    pub(crate) close_notify: Arc<Notify>,
+    pub(crate) close_token: CancellationToken,
 }
 
 impl StreamEntry {
@@ -54,7 +55,7 @@ impl StreamEntry {
         Self {
             writer: Arc::new(Mutex::new(writer)),
             local_fin: false,
-            close_notify: Arc::new(Notify::new()),
+            close_token: CancellationToken::new(),
         }
     }
 }
@@ -73,7 +74,7 @@ pub struct Session {
     received_settings: std::sync::atomic::AtomicBool,
     padding: Arc<RwLock<PaddingFactory>>,
     reader: Mutex<tokio::io::ReadHalf<BoxTransport>>,
-    close_notify: Notify,
+    close_token: CancellationToken,
     incoming: Mutex<Option<mpsc::Receiver<Stream>>>,
     incoming_sender: Option<mpsc::Sender<Stream>>,
     idle_sender: Mutex<Option<mpsc::UnboundedSender<Arc<Session>>>>,
@@ -125,7 +126,7 @@ impl Session {
             received_settings: std::sync::atomic::AtomicBool::new(false),
             padding,
             reader: Mutex::new(reader),
-            close_notify: Notify::new(),
+            close_token: CancellationToken::new(),
             incoming: Mutex::new(incoming.map(|(_, receiver)| receiver)),
             incoming_sender,
             idle_sender: Mutex::new(None),
@@ -140,12 +141,9 @@ impl Session {
         !max_age.is_zero() && self.created_at.elapsed() >= max_age
     }
 
-    pub async fn active_stream_count(&self) -> usize {
-        self.streams.lock().await.len()
-    }
-
+    #[inline]
     pub async fn has_stream_capacity(&self) -> bool {
-        self.active_stream_count().await < self.max_streams
+        self.streams.lock().await.len() < self.max_streams
     }
 
     pub async fn set_idle_sender(&self, sender: mpsc::UnboundedSender<Arc<Session>>) {
@@ -169,7 +167,7 @@ impl Session {
         let session = Arc::clone(self);
         tokio::spawn(async move {
             let _ = Arc::clone(&session).receive_loop().await;
-            let _ = session.close().await;
+            let _ = session.shutdown().await;
         });
         Ok(())
     }
@@ -180,7 +178,14 @@ impl Session {
         let receiver = incoming
             .as_mut()
             .ok_or_else(|| Error::new(Unsupported, "client sessions do not accept streams"))?;
-        receiver.recv().await.ok_or_else(|| Error::new(BrokenPipe, "session closed"))
+        let stream = tokio::select! {
+            stream = receiver.recv() => stream.ok_or_else(|| Error::new(BrokenPipe, "session closed because of remote closure"))?,
+            _ = self.close_token.cancelled() => return Err(Error::new(BrokenPipe, "session closed because of cancellation")),
+        };
+        if stream.is_closed() {
+            return Err(std::io::Error::new(std::io::ErrorKind::BrokenPipe, "stream closed"));
+        }
+        Ok(stream)
     }
 
     pub async fn open_stream(self: &Arc<Self>) -> std::io::Result<Stream> {
@@ -189,63 +194,77 @@ impl Session {
         }
         let id = self.next_stream_id.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
         let (local, remote) = tokio::io::duplex(64 * 1024);
+
         {
             let mut streams = self.streams.lock().await;
             if streams.len() >= self.max_streams {
                 return Err(std::io::Error::new(std::io::ErrorKind::WouldBlock, "session stream limit reached"));
             }
+            self.write_control(Frame::new(Command::Syn, id)).await?;
             streams.insert(id, StreamEntry::new(remote));
+
+            self.writer.lock().await.buffering = false;
         }
-        if let Err(error) = self.write_control(Frame::new(Command::Syn, id)).await {
-            self.streams.lock().await.remove(&id);
-            return Err(error);
-        }
-        self.writer.lock().await.buffering = false;
+
         Ok(Stream::new(id, Arc::downgrade(self), local))
     }
 
-    pub(crate) async fn write_data(&self, id: u32, data: &[u8]) -> std::io::Result<usize> {
-        let mut frame = Frame::new(Command::Push, id);
+    pub(crate) async fn write_data(&self, stream_id: u32, data: &[u8]) -> std::io::Result<usize> {
+        use std::io::{Error, ErrorKind::BrokenPipe};
+        let mut frame = Frame::new(Command::Push, stream_id);
         frame.data.extend_from_slice(data);
         let bytes = frame.encode()?;
+
+        let streams = self.streams.lock().await;
+        if !streams.contains_key(&stream_id) {
+            return Err(Error::new(BrokenPipe, format!("stream {stream_id} closed")));
+        }
+
         let mut writer = self.writer.lock().await;
-        writer.write_conn(bytes, &self.padding).await?;
+        let result = writer.write_conn(bytes, &self.padding).await;
+        drop(writer);
+
+        drop(streams);
+
+        result?;
         Ok(data.len())
     }
 
-    pub(crate) async fn close_stream(self: &Arc<Self>, id: u32) -> std::io::Result<()> {
+    pub(crate) async fn close_stream_by_id(self: &Arc<Self>, stream_id: u32) -> std::io::Result<()> {
         use std::io::{Error, ErrorKind::BrokenPipe, ErrorKind::TimedOut};
         if self.is_closed() {
             return Ok(());
         }
         let close_notify = {
             let mut streams = self.streams.lock().await;
-            let stream = streams.get_mut(&id).ok_or_else(|| Error::new(BrokenPipe, "stream closed"))?;
+            let stream = streams.get_mut(&stream_id).ok_or_else(|| Error::new(BrokenPipe, "stream closed"))?;
             if stream.local_fin {
                 return Ok(());
             }
             stream.local_fin = true;
-            Arc::clone(&stream.close_notify)
+            stream.close_token.clone()
         };
-        if let Err(e) = self.write_control(Frame::new(Command::Fin, id)).await {
-            self.finish_stream(id).await;
+        // Send a FIN frame to remote to indicate that we have known closed the local side of the stream.
+        // It's different from the Go implementation, so if the FIN frame fails to send, we should still think the session is fine.
+        if let Err(e) = self.write_control(Frame::new(Command::Fin, stream_id)).await {
+            self.finish_stream_by_id(stream_id).await;
             return Err(e);
         }
-        if timeout(FIN_ACK_TIMEOUT, close_notify.notified()).await.is_err() {
-            self.finish_stream(id).await;
+        if timeout(FIN_ACK_TIMEOUT, close_notify.cancelled()).await.is_err() {
+            self.finish_stream_by_id(stream_id).await;
             return Err(Error::new(TimedOut, "timed out waiting for FIN reply"));
         }
         Ok(())
     }
 
-    pub async fn close(&self) -> std::io::Result<()> {
+    pub async fn shutdown(&self) -> std::io::Result<()> {
         if self.closed.swap(true, std::sync::atomic::Ordering::AcqRel) {
             return Ok(());
         }
-        self.close_notify.notify_one();
+        self.close_token.cancel();
         let streams = self.streams.lock().await.drain().map(|(_, entry)| entry).collect::<Vec<_>>();
         for entry in streams {
-            entry.close_notify.notify_one();
+            entry.close_token.cancel();
         }
         let mut writer = self.writer.lock().await;
         writer.transport.shutdown().await
@@ -268,7 +287,7 @@ impl Session {
                 result = async {
                     Frame::read_from(&mut *self.reader.lock().await).await
                 } => result?,
-                _ = self.close_notify.notified() => break Ok(()),
+                _ = self.close_token.cancelled() => break Ok(()),
             };
             let stream_id = frame.stream_id;
             if !frame.command.valid_stream_id(stream_id) {
@@ -290,7 +309,7 @@ impl Session {
                 Command::Settings => self.receive_settings(&frame.data).await?,
                 Command::SynAck => {
                     if !frame.data.is_empty() {
-                        self.finish_stream(stream_id).await;
+                        self.finish_stream_by_id(stream_id).await;
                         let info = String::from_utf8_lossy(&frame.data);
                         log::warn!("Received SynAck with unexpected data for stream {stream_id}, error: {info}");
                     }
@@ -327,10 +346,13 @@ impl Session {
         }
         self.received_settings.store(true, std::sync::atomic::Ordering::Release);
         let map = string_map::from_bytes(data);
-        let padding = self.padding.read().await;
-        if map.get("padding-md5") != Some(&padding.md5) {
+        let update_scheme = {
+            let padding = self.padding.read().await;
+            (map.get("padding-md5") != Some(&padding.md5)).then(|| padding.raw_scheme().to_vec())
+        };
+        if let Some(scheme) = update_scheme {
             let mut update = Frame::new(Command::UpdatePaddingScheme, 0);
-            update.data = padding.raw_scheme().to_vec();
+            update.data = scheme;
             self.write_control(update).await?;
         }
         if map.get("v").and_then(|value| value.parse::<u8>().ok()).unwrap_or(0) >= 2 {
@@ -342,10 +364,10 @@ impl Session {
         Ok(())
     }
 
-    async fn on_receive_fin_cmd(self: &Arc<Self>, id: u32) -> std::io::Result<()> {
+    async fn on_receive_fin_cmd(self: &Arc<Self>, stream_id: u32) -> std::io::Result<()> {
         let should_reply = {
             let mut streams = self.streams.lock().await;
-            match streams.get_mut(&id) {
+            match streams.get_mut(&stream_id) {
                 Some(stream) if !stream.local_fin => {
                     stream.local_fin = true;
                     true
@@ -354,44 +376,54 @@ impl Session {
             }
         };
         let result = if should_reply {
-            self.write_control(Frame::new(Command::Fin, id)).await
+            self.write_control(Frame::new(Command::Fin, stream_id)).await
         } else {
             Ok(())
         };
-        self.finish_stream(id).await;
+        self.finish_stream_by_id(stream_id).await;
         result
     }
 
-    async fn drop_stream(self: &Arc<Self>, id: u32) {
-        let should_send_fin = {
-            let mut streams = self.streams.lock().await;
-            match streams.get_mut(&id) {
-                Some(stream) if !stream.local_fin => {
-                    stream.local_fin = true;
-                    true
-                }
-                Some(_) | None => false,
-            }
-        };
-        if should_send_fin && let Err(e) = self.write_control(Frame::new(Command::Fin, id)).await {
-            log::warn!("Failed to send FIN for stream {id}: {e}");
-        }
-        self.finish_stream(id).await;
-    }
-
-    async fn finish_stream(self: &Arc<Self>, id: u32) {
-        if let Some(entry) = self.streams.lock().await.remove(&id) {
-            drop(entry.writer);
-            entry.close_notify.notify_waiters();
-        }
-        if self.active_stream_count().await == 0
-            && let Some(sender) = self.idle_sender.lock().await.as_ref()
+    async fn drop_stream_by_id(self: &Arc<Self>, stream_id: u32) {
         {
-            let _ = sender.send(Arc::clone(self));
+            let mut streams = self.streams.lock().await;
+            let should_send_fin = {
+                match streams.get_mut(&stream_id) {
+                    Some(stream) if !stream.local_fin => {
+                        stream.local_fin = true;
+                        true
+                    }
+                    Some(_) | None => false,
+                }
+            };
+            if should_send_fin && let Err(e) = self.write_control(Frame::new(Command::Fin, stream_id)).await {
+                log::warn!("Failed to send FIN for stream {stream_id}: {e}");
+            }
+        }
+        self.finish_stream_by_id(stream_id).await;
+    }
+
+    async fn finish_stream_by_id(self: &Arc<Self>, stream_id: u32) {
+        let became_idle = {
+            let mut streams = self.streams.lock().await;
+            if let Some(entry) = streams.remove(&stream_id) {
+                drop(entry.writer);
+                entry.close_token.cancel();
+            }
+            streams.is_empty()
+        };
+
+        if became_idle {
+            let sender = self.idle_sender.lock().await.clone();
+            if let Some(sender) = sender
+                && let Err(e) = sender.send(Arc::clone(self))
+            {
+                log::warn!("Failed to send idle session: {e}");
+            }
         }
     }
 
-    async fn on_receive_syn_cmd(self: &Arc<Self>, id: u32) -> std::io::Result<()> {
+    async fn on_receive_syn_cmd(self: &Arc<Self>, stream_id: u32) -> std::io::Result<()> {
         use std::io::{Error, ErrorKind::BrokenPipe, ErrorKind::InvalidData};
         if self.is_client || self.incoming_sender.is_none() {
             return Ok(());
@@ -406,25 +438,35 @@ impl Session {
         let mut reject = false;
         {
             let mut streams = self.streams.lock().await;
-            if streams.contains_key(&id) {
+            if streams.contains_key(&stream_id) {
                 return Ok(());
             }
             if streams.len() >= self.max_streams {
                 reject = true;
             } else {
-                streams.insert(id, StreamEntry::new(remote));
+                streams.insert(stream_id, StreamEntry::new(remote));
             }
         }
         if reject {
-            let mut rejection = Frame::new(Command::SynAck, id);
+            let mut rejection = Frame::new(Command::SynAck, stream_id);
             rejection.data = b"session stream limit reached".to_vec();
             self.write_control(rejection).await?;
             return Ok(());
         }
-        let stream = Stream::new(id, Arc::downgrade(self), local);
-        if let Err(e) = self.incoming_sender.as_ref().unwrap().send(stream).await {
-            self.finish_stream(id).await;
-            return Err(Error::new(BrokenPipe, format!("stream receiver closed: {e}")));
+        let stream = Stream::new(stream_id, Arc::downgrade(self), local);
+        let sender = self.incoming_sender.as_ref().unwrap().clone();
+        match sender.try_send(stream) {
+            Ok(()) => {}
+            Err(mpsc::error::TrySendError::Full(_)) => {
+                let mut rejection = Frame::new(Command::SynAck, stream_id);
+                rejection.data = b"incoming stream queue is full".to_vec();
+                self.write_control(rejection).await?;
+                self.finish_stream_by_id(stream_id).await;
+            }
+            Err(mpsc::error::TrySendError::Closed(_)) => {
+                self.finish_stream_by_id(stream_id).await;
+                return Err(Error::new(BrokenPipe, "stream receiver closed"));
+            }
         }
         Ok(())
     }
@@ -508,6 +550,10 @@ impl Stream {
         self.id
     }
 
+    pub fn is_closed(&self) -> bool {
+        self.closed
+    }
+
     #[cfg(test)]
     pub(crate) fn session(&self) -> Arc<Session> {
         self.session.upgrade().expect("session should still be alive")
@@ -554,11 +600,12 @@ impl Stream {
             return Ok(());
         }
         self.closed = true;
-        let session = self.session.upgrade().ok_or_else(|| Error::new(BrokenPipe, "session closed"))?;
-        if let Err(e) = session.close_stream(self.id).await {
-            log::warn!("Failed to close stream {}: {}", self.id, e);
-        }
-        self.io.shutdown().await
+        let close_result = match self.session.upgrade() {
+            Some(session) => session.close_stream_by_id(self.id).await,
+            None => Err(Error::new(BrokenPipe, "session closed")),
+        };
+        let shutdown_result = self.io.shutdown().await;
+        close_result.and(shutdown_result)
     }
 }
 
@@ -575,7 +622,7 @@ impl Drop for Stream {
         let id = self.id;
         if let Ok(handle) = tokio::runtime::Handle::try_current() {
             handle.spawn(async move {
-                session.drop_stream(id).await;
+                session.drop_stream_by_id(id).await;
             });
         }
     }
@@ -616,8 +663,8 @@ mod tests {
         assert_eq!(&response, b"world");
 
         client_stream.close().await.unwrap();
-        let _ = server.close().await;
-        let _ = client.close().await;
+        let _ = server.shutdown().await;
+        let _ = client.shutdown().await;
     }
 
     #[tokio::test]
@@ -634,14 +681,14 @@ mod tests {
         drop(client_stream);
 
         tokio::time::timeout(Duration::from_secs(1), async {
-            while client.active_stream_count().await != 0 {
+            while !client.streams.lock().await.is_empty() {
                 tokio::task::yield_now().await;
             }
         })
         .await
         .expect("dropped stream should be released");
 
-        let _ = server.close().await;
-        let _ = client.close().await;
+        let _ = server.shutdown().await;
+        let _ = client.shutdown().await;
     }
 }
