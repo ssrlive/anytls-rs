@@ -93,7 +93,7 @@ logical stream:
 1. An active closer sends `FIN` and keeps the stream in the Session stream table.
 2. It waits for the peer's `FIN` before completing local stream shutdown.
 3. A peer that receives `FIN` sends `FIN` back first.
-4. Only after the FIN reply is written successfully does the receiver remove the stream, close its local stream endpoint, and run the idle-pool capacity check.
+4. The receiver queues the FIN reply, then removes the stream, closes its local stream endpoint, and runs the idle-pool capacity check. A failed writer task closes the Session.
 
 The active closer waits for the FIN reply for at most 3 seconds. If the peer does not reply within that deadline, Rust force-closes the logical stream, removes it from the Session, performs the idle-pool capacity check, and returns a timeout error instead of waiting forever.
 
