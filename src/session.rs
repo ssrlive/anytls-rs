@@ -18,6 +18,7 @@ use crate::{
 pub type BoxTransport = Box<dyn AsyncReadWrite>;
 
 const FIN_ACK_TIMEOUT: Duration = Duration::from_secs(3);
+const PUSH_QUEUE_CAPACITY: usize = 16;
 
 pub trait AsyncReadWrite: AsyncRead + AsyncWrite + Unpin + Send {}
 impl<T: AsyncRead + AsyncWrite + Unpin + Send> AsyncReadWrite for T {}
@@ -49,6 +50,7 @@ struct WriteRequest {
 /// Represents an status of a logical stream within a session.
 pub(crate) struct StreamEntry {
     pub(crate) writer: Arc<Mutex<tokio::io::DuplexStream>>,
+    pub(crate) push_sender: mpsc::Sender<Vec<u8>>,
     /// Indicates whether the local side has sent a FIN for this stream.
     /// The stream is considered fully closed when both local and remote sides have sent FIN.
     pub(crate) local_fin: bool,
@@ -58,10 +60,27 @@ pub(crate) struct StreamEntry {
 
 impl StreamEntry {
     pub(crate) fn new(writer: tokio::io::DuplexStream) -> Self {
+        let (push_sender, mut push_receiver) = mpsc::channel::<Vec<u8>>(PUSH_QUEUE_CAPACITY);
+        let writer = Arc::new(Mutex::new(writer));
+        let task_writer = Arc::clone(&writer);
+        let close_token = CancellationToken::new();
+        let task_close_token = close_token.clone();
+        tokio::spawn(async move {
+            while let Some(data) = push_receiver.recv().await {
+                let result = tokio::select! {
+                    result = async { task_writer.lock().await.write_all(&data).await } => result,
+                    _ = task_close_token.cancelled() => break,
+                };
+                if result.is_err() {
+                    break;
+                }
+            }
+        });
         Self {
-            writer: Arc::new(Mutex::new(writer)),
+            writer,
+            push_sender,
             local_fin: false,
-            close_token: CancellationToken::new(),
+            close_token,
         }
     }
 }
@@ -74,7 +93,7 @@ pub struct Session {
     streams: Mutex<HashMap<u32, StreamEntry>>,
     next_stream_id: std::sync::atomic::AtomicU32,
     /// Indicates whether the session has been closed.
-    closed: std::sync::atomic::AtomicBool,
+    closed: Arc<std::sync::atomic::AtomicBool>,
     is_client: bool,
     peer_version: std::sync::atomic::AtomicU8,
     received_settings: std::sync::atomic::AtomicBool,
@@ -119,6 +138,8 @@ impl Session {
         let writer_packet_counter = Arc::clone(&packet_counter);
         let (write_sender, mut write_receiver) = mpsc::channel::<WriteRequest>(64);
         let writer_padding = Arc::clone(&padding);
+        let closed = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let writer_closed = Arc::clone(&closed);
         tokio::spawn(async move {
             let mut writer = Writer {
                 transport: writer,
@@ -136,15 +157,20 @@ impl Session {
                     let _ = writer.transport.shutdown().await;
                     break;
                 };
-                let result = writer.write_conn(request.bytes, &writer_padding).await.map(|_| ());
+                let mut result = writer.write_conn(request.bytes, &writer_padding).await.map(|_| ());
+                if result.is_ok() && request.disable_buffering_after {
+                    writer.buffering = false;
+                    if !writer.buffered.is_empty() {
+                        result = writer.write_conn(Vec::new(), &writer_padding).await.map(|_| ());
+                    }
+                }
                 let failed = result.is_err();
                 if let Some(result_sender) = request.result {
                     let _ = result_sender.send(result);
                 }
                 if failed {
+                    writer_closed.store(true, std::sync::atomic::Ordering::Release);
                     writer_close_token.cancel();
-                } else if request.disable_buffering_after {
-                    writer.buffering = false;
                 }
             }
         });
@@ -155,7 +181,7 @@ impl Session {
             write_sender,
             streams: Mutex::new(HashMap::new()),
             next_stream_id: std::sync::atomic::AtomicU32::new(0),
-            closed: std::sync::atomic::AtomicBool::new(false),
+            closed,
             is_client,
             peer_version: std::sync::atomic::AtomicU8::new(0),
             received_settings: std::sync::atomic::AtomicBool::new(false),
@@ -357,9 +383,11 @@ impl Session {
             }
             match frame.command {
                 Command::Push => {
-                    let writer = self.streams.lock().await.get(&stream_id).map(|entry| Arc::clone(&entry.writer));
-                    if let Some(writer) = writer {
-                        writer.lock().await.write_all(&frame.data).await?;
+                    let push_sender = self.streams.lock().await.get(&stream_id).map(|entry| entry.push_sender.clone());
+                    if let Some(push_sender) = push_sender
+                        && push_sender.try_send(frame.data).is_err()
+                    {
+                        self.finish_stream_by_id(stream_id).await;
                     }
                 }
                 Command::Waste => {}
@@ -444,20 +472,18 @@ impl Session {
     }
 
     async fn drop_stream_by_id(self: &Arc<Self>, stream_id: u32) {
-        {
+        let should_send_fin = {
             let mut streams = self.streams.lock().await;
-            let should_send_fin = {
-                match streams.get_mut(&stream_id) {
-                    Some(stream) if !stream.local_fin => {
-                        stream.local_fin = true;
-                        true
-                    }
-                    Some(_) | None => false,
+            match streams.get_mut(&stream_id) {
+                Some(stream) if !stream.local_fin => {
+                    stream.local_fin = true;
+                    true
                 }
-            };
-            if should_send_fin && let Err(e) = self.write_control(Frame::new(Command::Fin, stream_id)).await {
-                log::warn!("Failed to send FIN for stream {stream_id}: {e}");
+                Some(_) | None => false,
             }
+        };
+        if should_send_fin && let Err(e) = self.write_control(Frame::new(Command::Fin, stream_id)).await {
+            log::warn!("Failed to send FIN for stream {stream_id}: {e}");
         }
         self.finish_stream_by_id(stream_id).await;
     }
@@ -720,6 +746,24 @@ mod tests {
         assert_eq!(&response, b"world");
 
         client_stream.close().await.unwrap();
+        let _ = server.shutdown().await;
+        let _ = client.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn flushes_syn_without_waiting_for_stream_data() {
+        let (client_io, server_io) = tokio::io::duplex(128 * 1024);
+        let client = Session::new_client(1, Box::new(client_io), padding(), 1);
+        let server = Session::new_server(1, Box::new(server_io), padding(), 1);
+        client.run().await.unwrap();
+        server.run().await.unwrap();
+
+        let _client_stream = client.open_stream().await.unwrap();
+        tokio::time::timeout(Duration::from_secs(1), server.accept_stream())
+            .await
+            .unwrap()
+            .unwrap();
+
         let _ = server.shutdown().await;
         let _ = client.shutdown().await;
     }

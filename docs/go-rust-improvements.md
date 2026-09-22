@@ -112,9 +112,9 @@ Because Rust `Drop` cannot await, automatic cleanup requires an active Tokio run
 The Rust translation preserves these important Go behaviors:
 
 - Settings are sent before opening data streams.
-- Client Settings and the first `SYN` remain buffered until the first data write flushes them with the first `PSH`.
+- Client Settings and the first `SYN` are buffered briefly, then flushed immediately after `SYN` is queued; they do not require a first data write.
 - The first data stream starts at SID `1`.
-- `FIN` closes one logical stream without closing the whole Session; Rust additionally uses a FIN reply handshake by design.
+- `FIN` closes one logical stream without closing the whole Session; Rust uses a FIN reply handshake by design.
 - `SYNACK` is sent at most once per stream handshake.
 - Padding packet counting is tied to transport writes.
 - The Session remains reusable while it is alive and has capacity.
