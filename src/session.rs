@@ -49,23 +49,29 @@ struct WriteRequest {
 /// Represents an status of a logical stream within a session.
 pub(crate) struct StreamEntry {
     pub(crate) writer: Arc<Mutex<tokio::io::DuplexStream>>,
-    pub(crate) push_sender: mpsc::UnboundedSender<Vec<u8>>,
+    pub(crate) push_sender: mpsc::UnboundedSender<Option<Vec<u8>>>,
     /// Indicates whether the local side has sent a FIN for this stream.
     /// The stream is considered fully closed when both local and remote sides have sent FIN.
     pub(crate) local_fin: bool,
     /// Used to notify an active-close task that is waiting for a FIN response.
     pub(crate) close_token: CancellationToken,
+    /// Notifies an active-close task that the peer FIN has arrived.
+    pub(crate) fin_token: CancellationToken,
 }
 
 impl StreamEntry {
     pub(crate) fn new(writer: tokio::io::DuplexStream) -> Self {
-        let (push_sender, mut push_receiver) = mpsc::unbounded_channel::<Vec<u8>>();
+        let (push_sender, mut push_receiver) = mpsc::unbounded_channel::<Option<Vec<u8>>>();
         let writer = Arc::new(Mutex::new(writer));
         let task_writer = Arc::clone(&writer);
         let close_token = CancellationToken::new();
         let task_close_token = close_token.clone();
         tokio::spawn(async move {
             while let Some(data) = push_receiver.recv().await {
+                let Some(data) = data else {
+                    let _ = task_writer.lock().await.shutdown().await;
+                    break;
+                };
                 let result = tokio::select! {
                     result = async { task_writer.lock().await.write_all(&data).await } => result,
                     _ = task_close_token.cancelled() => break,
@@ -80,6 +86,7 @@ impl StreamEntry {
             push_sender,
             local_fin: false,
             close_token,
+            fin_token: CancellationToken::new(),
         }
     }
 }
@@ -304,7 +311,7 @@ impl Session {
                 return Ok(());
             }
             stream.local_fin = true;
-            stream.close_token.clone()
+            stream.fin_token.clone()
         };
         if let Err(e) = self.enqueue_frame(Frame::new(Command::Fin, stream_id), false).await {
             self.finish_stream_by_id(stream_id).await;
@@ -314,6 +321,7 @@ impl Session {
             self.finish_stream_by_id(stream_id).await;
             return Err(Error::new(TimedOut, "timed out waiting for FIN reply"));
         }
+        self.finish_stream_by_id(stream_id).await;
         Ok(())
     }
 
@@ -380,7 +388,7 @@ impl Session {
                 Command::Push => {
                     let push_sender = self.streams.lock().await.get(&stream_id).map(|entry| entry.push_sender.clone());
                     if let Some(push_sender) = push_sender {
-                        if push_sender.send(frame.data).is_err() {
+                        if push_sender.send(Some(frame.data)).is_err() {
                             log::debug!("Push worker closed for stream {stream_id}; closing stream");
                             if !self.is_closed() {
                                 self.send_fin_before_finish(stream_id).await;
@@ -459,14 +467,15 @@ impl Session {
     }
 
     async fn on_receive_fin_cmd(self: &Arc<Self>, stream_id: u32) -> std::io::Result<()> {
-        let should_reply = {
+        let (should_reply, push_sender, fin_token) = {
             let mut streams = self.streams.lock().await;
             match streams.get_mut(&stream_id) {
                 Some(stream) if !stream.local_fin => {
                     stream.local_fin = true;
-                    true
+                    (true, Some(stream.push_sender.clone()), Some(stream.fin_token.clone()))
                 }
-                Some(_) | None => false,
+                Some(stream) => (false, Some(stream.push_sender.clone()), Some(stream.fin_token.clone())),
+                None => (false, None, None),
             }
         };
         let result = if should_reply {
@@ -474,7 +483,15 @@ impl Session {
         } else {
             Ok(())
         };
-        self.finish_stream_by_id(stream_id).await;
+        if result.is_ok() {
+            if let Some(push_sender) = push_sender {
+                if push_sender.send(None).is_err() {
+                    self.finish_stream_by_id(stream_id).await;
+                } else if let Some(fin_token) = fin_token {
+                    fin_token.cancel();
+                }
+            }
+        }
         result
     }
 
