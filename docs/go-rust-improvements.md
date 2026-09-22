@@ -78,34 +78,20 @@ Both closure paths perform the capacity check:
 
 - Local `Stream::close` sends `FIN`, removes the stream, and checks whether the Session has no remaining streams.
 - Dropping a `Stream` schedules the same cleanup on the Tokio runtime, removes the stream without waiting for the peer FIN, and then best-effort sends `FIN`.
-- Remote `FIN` or remote `SYNACK` failure closes the local stream endpoint, removes the stream, and performs the same check.
+- Remote `FIN` closes the local read half after queued data drains. The stream remains available for reverse-direction writes until the local side also sends `FIN`; then it is removed and the idle-pool capacity check runs.
+- Remote `SYNACK` failure closes the local stream endpoint, removes the stream, and performs the same check.
 
 A Session with one remaining active stream is not placed in the idle pool when another stream closes.
 
 The pool deduplicates Session references, so closing multiple streams cannot enqueue the same Session more than once.
 
-## Intentional Rust FIN Difference
+## FIN Half-Close
 
-The Rust implementation intentionally differs from the Go implementation and the
-protocol's one-way FIN behavior by using an explicit FIN reply handshake for every
-logical stream:
+`FIN` is a one-way EOF marker, matching the protocol and Go implementation. Receiving `FIN` queues EOF behind all previously received `PUSH` data and shuts down only the local read half after that data drains. It does not reply with another `FIN`, and it does not prevent the local application from sending a response in the opposite direction.
 
-1. An active closer sends `FIN` and keeps the stream in the Session stream table.
-2. It waits for the peer's `FIN` before completing local stream shutdown.
-3. A peer that receives `FIN` sends `FIN` back first.
-4. The receiver queues the FIN reply, then removes the stream, closes its local stream endpoint, and runs the idle-pool capacity check. A failed writer task closes the Session.
+Each side sends its own `FIN` when its write half closes. The stream is removed only after both local and remote FINs have been observed and queued inbound data has drained. `StreamIo::poll_shutdown` sends the local FIN while preserving reads, which lets bidirectional relays propagate TCP half-closes correctly.
 
-The active closer waits for the FIN reply for at most 3 seconds. If the peer does not reply within that deadline, Rust force-closes the logical stream, removes it from the Session, performs the idle-pool capacity check, and returns a timeout error instead of waiting forever.
-
-This means a Session is returned to the idle pool only after the final logical stream has completed the FIN exchange and the active stream count is zero.
-
-The Go implementation is intentionally not mirrored here: a normally received
-`cmdFIN` closes the local Stream without sending a `cmdFIN` reply, while a locally
-closed Stream sends `cmdFIN` immediately. Rust sends the reply as part of its own
-close-handshake design. This is an intentional behavioral difference, not an
-accidental compatibility gap; the command value and frame format remain unchanged.
-
-Because Rust `Drop` cannot await, automatic cleanup requires an active Tokio runtime. Explicit `Stream::close().await` remains the deterministic close operation and waits for the FIN reply or the 3-second timeout.
+Because Rust `Drop` cannot await, automatic cleanup requires an active Tokio runtime. Explicit `Stream::close().await` sends FIN and performs deterministic local cleanup.
 
 ## Preserved Go Behavior
 
@@ -114,7 +100,7 @@ The Rust translation preserves these important Go behaviors:
 - Settings are sent before opening data streams.
 - Client Settings and the first `SYN` are buffered briefly, then flushed immediately after `SYN` is queued; they do not require a first data write.
 - The first data stream starts at SID `1`.
-- `FIN` closes one logical stream without closing the whole Session; Rust uses a FIN reply handshake by design.
+- `FIN` closes one logical stream direction without closing the whole Session; the stream is released after both FIN directions complete.
 - `SYNACK` is sent at most once per stream handshake.
 - Padding packet counting is tied to transport writes.
 - The Session remains reusable while it is alive and has capacity.
