@@ -26,8 +26,8 @@ impl<T: AsyncRead + AsyncWrite + Unpin + Send> AsyncReadWrite for T {}
 struct Writer {
     transport: tokio::io::WriteHalf<BoxTransport>,
 
-    /// It's `true` in client, Indicates whether cached the Settings and SYN frames instead of being sent immediately;
-    /// they are flushed together only when the first piece of actual data arrives: `Settings + SYN + PSH`
+    /// Client Settings and SYN are buffered until the initial SYN write request
+    /// disables buffering, then flushed before subsequent data frames.
     buffering: bool,
 
     /// Buffer frames that have not yet been truly written to the underlying connection.
@@ -311,9 +311,7 @@ impl Session {
     }
 
     pub async fn shutdown(&self) -> std::io::Result<()> {
-        if self.closed.swap(true, std::sync::atomic::Ordering::AcqRel) {
-            return Ok(());
-        }
+        self.closed.store(true, std::sync::atomic::Ordering::Release);
         self.close_token.cancel();
         let streams = self.streams.lock().await.drain().map(|(_, entry)| entry).collect::<Vec<_>>();
         for entry in streams {
@@ -384,10 +382,20 @@ impl Session {
             match frame.command {
                 Command::Push => {
                     let push_sender = self.streams.lock().await.get(&stream_id).map(|entry| entry.push_sender.clone());
-                    if let Some(push_sender) = push_sender
-                        && push_sender.try_send(frame.data).is_err()
-                    {
-                        self.finish_stream_by_id(stream_id).await;
+                    if let Some(push_sender) = push_sender {
+                        match push_sender.try_send(frame.data) {
+                            Ok(()) => {}
+                            Err(mpsc::error::TrySendError::Full(_data)) => {
+                                log::warn!("Push queue full for stream {stream_id}; closing stream");
+                                self.send_fin_before_finish(stream_id);
+                                self.finish_stream_by_id(stream_id).await;
+                            }
+                            Err(mpsc::error::TrySendError::Closed(_data)) => {
+                                log::warn!("Push worker closed for stream {stream_id}; closing stream");
+                                self.send_fin_before_finish(stream_id);
+                                self.finish_stream_by_id(stream_id).await;
+                            }
+                        }
                     }
                 }
                 Command::Waste => {}
@@ -402,7 +410,11 @@ impl Session {
                     }
                     // TODO: Handle additional SynAck logic if necessary
                 }
-                Command::HeartRequest => self.enqueue_frame_nowait(Frame::new(Command::HeartResponse, stream_id))?,
+                Command::HeartRequest => {
+                    if let Err(error) = self.enqueue_frame_nowait(Frame::new(Command::HeartResponse, stream_id)) {
+                        log::warn!("Failed to queue heart response: {error}");
+                    }
+                }
                 Command::HeartResponse => {}
                 Command::ServerSettings => {
                     let map = string_map::from_bytes(&frame.data);
@@ -486,6 +498,12 @@ impl Session {
             log::warn!("Failed to send FIN for stream {stream_id}: {e}");
         }
         self.finish_stream_by_id(stream_id).await;
+    }
+
+    fn send_fin_before_finish(&self, stream_id: u32) {
+        if let Err(error) = self.enqueue_frame_nowait(Frame::new(Command::Fin, stream_id)) {
+            log::warn!("Failed to queue FIN for stream {stream_id}: {error}");
+        }
     }
 
     async fn finish_stream_by_id(self: &Arc<Self>, stream_id: u32) {
@@ -766,6 +784,32 @@ mod tests {
 
         let _ = server.shutdown().await;
         let _ = client.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn shutdown_drains_streams_after_writer_failure() {
+        let (client_io, server_io) = tokio::io::duplex(128 * 1024);
+        let client = Session::new_client(1, Box::new(client_io), padding(), 1);
+        let server = Session::new_server(1, Box::new(server_io), padding(), 1);
+        client.run().await.unwrap();
+        server.run().await.unwrap();
+
+        let mut client_stream = client.open_stream().await.unwrap();
+        let _server_stream = server.accept_stream().await.unwrap();
+        client.closed.store(true, std::sync::atomic::Ordering::Release);
+        client.shutdown().await.unwrap();
+
+        assert!(client.streams.lock().await.is_empty());
+        let mut data = [0u8; 1];
+        assert_eq!(
+            tokio::time::timeout(Duration::from_secs(1), client_stream.read(&mut data))
+                .await
+                .unwrap()
+                .unwrap(),
+            0
+        );
+
+        let _ = server.shutdown().await;
     }
 
     #[tokio::test]
