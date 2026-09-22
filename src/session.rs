@@ -18,7 +18,6 @@ use crate::{
 pub type BoxTransport = Box<dyn AsyncReadWrite>;
 
 const FIN_ACK_TIMEOUT: Duration = Duration::from_secs(3);
-const PUSH_QUEUE_CAPACITY: usize = 16;
 
 pub trait AsyncReadWrite: AsyncRead + AsyncWrite + Unpin + Send {}
 impl<T: AsyncRead + AsyncWrite + Unpin + Send> AsyncReadWrite for T {}
@@ -50,7 +49,7 @@ struct WriteRequest {
 /// Represents an status of a logical stream within a session.
 pub(crate) struct StreamEntry {
     pub(crate) writer: Arc<Mutex<tokio::io::DuplexStream>>,
-    pub(crate) push_sender: mpsc::Sender<Vec<u8>>,
+    pub(crate) push_sender: mpsc::UnboundedSender<Vec<u8>>,
     /// Indicates whether the local side has sent a FIN for this stream.
     /// The stream is considered fully closed when both local and remote sides have sent FIN.
     pub(crate) local_fin: bool,
@@ -60,7 +59,7 @@ pub(crate) struct StreamEntry {
 
 impl StreamEntry {
     pub(crate) fn new(writer: tokio::io::DuplexStream) -> Self {
-        let (push_sender, mut push_receiver) = mpsc::channel::<Vec<u8>>(PUSH_QUEUE_CAPACITY);
+        let (push_sender, mut push_receiver) = mpsc::unbounded_channel::<Vec<u8>>();
         let writer = Arc::new(Mutex::new(writer));
         let task_writer = Arc::clone(&writer);
         let close_token = CancellationToken::new();
@@ -381,11 +380,7 @@ impl Session {
                 Command::Push => {
                     let push_sender = self.streams.lock().await.get(&stream_id).map(|entry| entry.push_sender.clone());
                     if let Some(push_sender) = push_sender {
-                        let send_result = tokio::select! {
-                            result = push_sender.send(frame.data) => result,
-                            _ = self.close_token.cancelled() => break Ok(()),
-                        };
-                        if send_result.is_err() {
+                        if push_sender.send(frame.data).is_err() {
                             log::debug!("Push worker closed for stream {stream_id}; closing stream");
                             if !self.is_closed() {
                                 self.send_fin_before_finish(stream_id).await;
