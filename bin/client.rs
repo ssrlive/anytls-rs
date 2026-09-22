@@ -16,6 +16,7 @@ use socks5_impl::{
     server::{ClientConnection, Server, auth::NoAuth},
 };
 use std::{net::SocketAddr, sync::Arc};
+use tokio::io::AsyncWriteExt;
 use tokio::net::TcpStream;
 use tokio_rustls::TlsConnector;
 
@@ -104,7 +105,8 @@ async fn handle_socks5(incoming: socks5_impl::server::IncomingConnection, client
     target.write_to_async_stream(&mut remote).await?;
     let mut ready = connect.reply(Reply::Succeeded, Address::unspecified()).await?;
     tokio::io::copy_bidirectional(&mut ready, &mut remote).await?;
-    ready.shutdown().await
+    ready.shutdown().await?;
+    remote.shutdown().await
 }
 
 fn tls_config() -> Arc<ClientConfig> {

@@ -14,7 +14,9 @@ use std::{
     net::{SocketAddr, ToSocketAddrs},
     sync::Arc,
 };
+use tokio::io::AsyncWriteExt;
 use tokio::net::{TcpListener, TcpStream};
+use tokio::time::Duration;
 use tokio_rustls::TlsAcceptor;
 
 #[derive(Parser, Debug)]
@@ -38,7 +40,14 @@ async fn main() -> std::io::Result<()> {
     let password = Arc::new(args.password);
     let mut session_id = 0usize;
     loop {
-        let (tcp, peer) = listener.accept().await?;
+        let (tcp, peer) = match listener.accept().await {
+            Ok(connection) => connection,
+            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock || error.raw_os_error() == Some(24) => {
+                tokio::time::sleep(Duration::from_millis(100)).await;
+                continue;
+            }
+            Err(error) => return Err(error),
+        };
         session_id = session_id.wrapping_add(1);
         let acceptor = acceptor.clone();
         let padding = padding.clone();
@@ -93,6 +102,8 @@ async fn relay_stream(stream: Stream) -> std::io::Result<()> {
     stream_io.handshake_success().await?;
     let mut outbound = outbound;
     tokio::io::copy_bidirectional(&mut stream_io, &mut outbound).await?;
+    stream_io.shutdown().await?;
+    outbound.shutdown().await?;
     Ok(())
 }
 
