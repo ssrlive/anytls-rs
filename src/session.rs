@@ -233,8 +233,13 @@ impl Session {
 
         let session = Arc::clone(self);
         tokio::spawn(async move {
-            let _ = Arc::clone(&session).receive_loop().await;
+            let result = Arc::clone(&session).receive_loop().await;
+            match result {
+                Ok(()) => log::info!("session {} receive loop stopped", session.session_id),
+                Err(error) => log::warn!("session {} receive loop failed: {error}", session.session_id),
+            }
             let _ = session.shutdown().await;
+            log::info!("session {} shut down", session.session_id);
         });
         Ok(())
     }

@@ -36,8 +36,10 @@ struct Args {
 
 #[tokio::main]
 async fn main() -> std::io::Result<()> {
+    env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
     let args = Args::parse();
     let listener = Server::bind(args.listen, Arc::new(NoAuth)).await?;
+    log::info!("SOCKS5 listener started on {}; AnyTLS server {}", args.listen, args.server);
     let padding = Arc::new(tokio::sync::RwLock::new(
         PaddingFactory::new(DEFAULT_SCHEME).expect("default padding"),
     ));
@@ -65,7 +67,7 @@ async fn main() -> std::io::Result<()> {
         let client = client.clone();
         tokio::spawn(async move {
             if let Err(error) = handle_socks5(stream, client).await {
-                log::debug!("SOCKS5 connection failed: {error}");
+                log::warn!("SOCKS5 connection failed: {error}");
             }
         });
     }
@@ -78,11 +80,14 @@ async fn dial(
     padding: Arc<tokio::sync::RwLock<PaddingFactory>>,
 ) -> std::io::Result<BoxTransport> {
     let tcp = TcpStream::connect(server).await?;
+    log::info!("connecting to AnyTLS server {server}");
     let name = ServerName::try_from(sni.to_owned()).map_err(std::io::Error::other)?;
     let connector = TlsConnector::from(tls_config());
     let mut tls = connector.connect(name, tcp).await?;
+    log::info!("TLS connection to AnyTLS server {server} established");
     let padding = padding.read().await;
     write_auth(&mut tls, password, &padding).await?;
+    log::info!("AnyTLS authentication to {server} completed");
     Ok(Box::new(tls))
 }
 
@@ -100,13 +105,20 @@ async fn handle_socks5(incoming: socks5_impl::server::IncomingConnection, client
             return Err(std::io::Error::other("SOCKS5 UDP ASSOCIATE is unsupported"));
         }
     };
+    let started = std::time::Instant::now();
+    log::info!("opening SOCKS5 CONNECT to {target:?}");
     let stream = client.create_stream().await?;
     let mut remote = StreamIo::new(stream);
     target.write_to_async_stream(&mut remote).await?;
     let mut ready = connect.reply(Reply::Succeeded, Address::unspecified()).await?;
-    tokio::io::copy_bidirectional(&mut ready, &mut remote).await?;
+    let (client_to_proxy, proxy_to_client) = tokio::io::copy_bidirectional(&mut ready, &mut remote).await?;
     ready.shutdown().await?;
-    remote.shutdown().await
+    remote.shutdown().await?;
+    log::info!(
+        "SOCKS5 relay to {target:?} closed: client_to_proxy={client_to_proxy} bytes, proxy_to_client={proxy_to_client} bytes, elapsed={:?}",
+        started.elapsed()
+    );
+    Ok(())
 }
 
 fn tls_config() -> Arc<ClientConfig> {

@@ -31,18 +31,25 @@ struct Args {
 
 #[tokio::main]
 async fn main() -> std::io::Result<()> {
+    env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
     let args = Args::parse();
     let listener = TcpListener::bind(args.listen).await?;
+    log::info!("AnyTLS server listening on {}", args.listen);
     let acceptor = TlsAcceptor::from(Arc::new(tls_config()?));
     let padding = Arc::new(tokio::sync::RwLock::new(
         PaddingFactory::new(DEFAULT_SCHEME).expect("default padding"),
     ));
     let password = Arc::new(args.password);
     let mut session_id = 0usize;
+    let mut last_emfile_warning = tokio::time::Instant::now() - Duration::from_secs(5);
     loop {
         let (tcp, peer) = match listener.accept().await {
             Ok(connection) => connection,
             Err(error) if error.kind() == std::io::ErrorKind::WouldBlock || error.raw_os_error() == Some(24) => {
+                if last_emfile_warning.elapsed() >= Duration::from_secs(5) {
+                    log::warn!("accept temporarily failed due to exhausted descriptors: {error}");
+                    last_emfile_warning = tokio::time::Instant::now();
+                }
                 tokio::time::sleep(Duration::from_millis(100)).await;
                 continue;
             }
@@ -54,8 +61,11 @@ async fn main() -> std::io::Result<()> {
         let password = password.clone();
         let max_streams = args.max_streams_per_session;
         tokio::spawn(async move {
+            log::info!("accepted TLS connection {session_id} from {peer}");
             if let Err(error) = handle_connection(tcp, acceptor, padding, password, session_id, max_streams).await {
-                log::debug!("connection {peer} failed: {error}");
+                log::warn!("connection {session_id} from {peer} failed: {error}");
+            } else {
+                log::info!("connection {session_id} from {peer} closed");
             }
         });
     }
@@ -71,26 +81,35 @@ async fn handle_connection(
 ) -> std::io::Result<()> {
     let mut tls = acceptor.accept(tcp).await?;
     read_auth(&mut tls, &password).await?;
+    log::info!("connection {session_id}: TLS and AnyTLS authentication completed");
 
     let session = Session::new_server(session_id, Box::new(tls) as BoxTransport, padding, max_streams);
     session.run().await?;
     loop {
         let stream = match session.accept_stream().await {
             Ok(stream) => stream,
-            Err(error) if error.kind() == std::io::ErrorKind::BrokenPipe => return Ok(()),
+            Err(error) if error.kind() == std::io::ErrorKind::BrokenPipe => {
+                log::info!("connection {session_id}: session closed by peer");
+                return Ok(());
+            }
             Err(error) => return Err(error),
         };
+        let session_id = session_id;
         tokio::spawn(async move {
+            let stream_id = stream.id();
             if let Err(error) = relay_stream(stream).await {
-                log::debug!("stream relay failed: {error}");
+                log::warn!("session {session_id} stream {stream_id} relay failed: {error}");
             }
         });
     }
 }
 
 async fn relay_stream(stream: Stream) -> std::io::Result<()> {
+    let stream_id = stream.id();
+    let started = std::time::Instant::now();
     let mut stream_io = StreamIo::new(stream);
     let destination = read_target(&mut stream_io).await?;
+    log::info!("stream {stream_id}: connecting to {destination:?}");
     let addresses: Vec<SocketAddr> = destination.to_socket_addrs()?.collect();
     let outbound = match TcpStream::connect(&addresses[..]).await {
         Ok(outbound) => outbound,
@@ -101,9 +120,13 @@ async fn relay_stream(stream: Stream) -> std::io::Result<()> {
     };
     stream_io.handshake_success().await?;
     let mut outbound = outbound;
-    tokio::io::copy_bidirectional(&mut stream_io, &mut outbound).await?;
+    let (stream_to_target, target_to_stream) = tokio::io::copy_bidirectional(&mut stream_io, &mut outbound).await?;
     stream_io.shutdown().await?;
     outbound.shutdown().await?;
+    log::info!(
+        "stream {stream_id}: relay to {destination:?} closed: stream_to_target={stream_to_target} bytes, target_to_stream={target_to_stream} bytes, elapsed={:?}",
+        started.elapsed()
+    );
     Ok(())
 }
 
