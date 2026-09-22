@@ -381,15 +381,13 @@ impl Session {
                 Command::Push => {
                     let push_sender = self.streams.lock().await.get(&stream_id).map(|entry| entry.push_sender.clone());
                     if let Some(push_sender) = push_sender {
-                        match push_sender.try_send(frame.data) {
-                            Ok(()) => {}
-                            Err(mpsc::error::TrySendError::Full(_data)) => {
-                                log::warn!("Push queue full for stream {stream_id}; closing stream");
-                                self.send_fin_before_finish(stream_id).await;
-                                self.finish_stream_by_id(stream_id).await;
-                            }
-                            Err(mpsc::error::TrySendError::Closed(_data)) => {
-                                log::warn!("Push worker closed for stream {stream_id}; closing stream");
+                        let send_result = tokio::select! {
+                            result = push_sender.send(frame.data) => result,
+                            _ = self.close_token.cancelled() => break Ok(()),
+                        };
+                        if send_result.is_err() {
+                            log::debug!("Push worker closed for stream {stream_id}; closing stream");
+                            if !self.is_closed() {
                                 self.send_fin_before_finish(stream_id).await;
                                 self.finish_stream_by_id(stream_id).await;
                             }
