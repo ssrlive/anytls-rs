@@ -3,12 +3,23 @@ name = "anytls"
 version = "0.1.0"
 edition = "2024"
 
+[[bin]]
+name = "anytls-server"
+path = "bin/server.rs"
+
+[[bin]]
+name = "anytls-client"
+path = "bin/client.rs"
+
 [dependencies]
+clap = { version = "4.6.7", features = ["derive"] }
 log = "0.4.34"
 md-5 = "0.11.0"
-rand = "0.10.2"
+rand = "0.10.3"
+rcgen = "0.14.10"
 rustls = "0.23.45"
 sha2 = "0.11.0"
+socks5-impl = { version = "0.9.6", features = ["server", "serde"] }
 tokio = { version = "1.53.1", features = [
     "io-util",
     "macros",
@@ -18,4 +29,4 @@ tokio = { version = "1.53.1", features = [
     "time",
 ] }
 tokio-rustls = "0.26.5"
-tokio-util = { version = "0.7", features = ["rt"] }
+tokio-util = { version = "0.7.19", features = ["rt"] }

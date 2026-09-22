@@ -635,17 +635,20 @@ impl Writer {
 pub struct Stream {
     id: u32,
     session: Weak<Session>,
-    io: tokio::io::DuplexStream,
+    reader: Arc<Mutex<tokio::io::ReadHalf<tokio::io::DuplexStream>>>,
+    writer: Arc<Mutex<tokio::io::WriteHalf<tokio::io::DuplexStream>>>,
     closed: bool,
     handshake_reported: std::sync::atomic::AtomicBool,
 }
 
 impl Stream {
     fn new(id: u32, session: Weak<Session>, io: tokio::io::DuplexStream) -> Self {
+        let (reader, writer) = tokio::io::split(io);
         Self {
             id,
             session,
-            io,
+            reader: Arc::new(Mutex::new(reader)),
+            writer: Arc::new(Mutex::new(writer)),
             closed: false,
             handshake_reported: std::sync::atomic::AtomicBool::new(false),
         }
@@ -664,8 +667,8 @@ impl Stream {
         self.session.upgrade().expect("session should still be alive")
     }
 
-    pub async fn read(&mut self, data: &mut [u8]) -> std::io::Result<usize> {
-        self.io.read(data).await
+    pub async fn read(&self, data: &mut [u8]) -> std::io::Result<usize> {
+        self.reader.lock().await.read(data).await
     }
 
     pub async fn write(&self, data: &[u8]) -> std::io::Result<usize> {
@@ -709,7 +712,7 @@ impl Stream {
             Some(session) => session.close_stream_by_id(self.id).await,
             None => Err(Error::new(BrokenPipe, "session closed")),
         };
-        let shutdown_result = self.io.shutdown().await;
+        let shutdown_result = self.writer.lock().await.shutdown().await;
         close_result.and(shutdown_result)
     }
 }
@@ -754,7 +757,7 @@ mod tests {
         assert_eq!(client_stream.id(), 1);
 
         client_stream.write(b"hello").await.unwrap();
-        let mut server_stream = server.accept_stream().await.unwrap();
+        let server_stream = server.accept_stream().await.unwrap();
         let mut received = [0u8; 5];
         server_stream.read(&mut received).await.unwrap();
         assert_eq!(&received, b"hello");
@@ -796,7 +799,7 @@ mod tests {
         client.run().await.unwrap();
         server.run().await.unwrap();
 
-        let mut client_stream = client.open_stream().await.unwrap();
+        let client_stream = client.open_stream().await.unwrap();
         let _server_stream = server.accept_stream().await.unwrap();
         client.closed.store(true, std::sync::atomic::Ordering::Release);
         client.shutdown().await.unwrap();
