@@ -30,7 +30,7 @@ struct Args {
     password: String,
     #[arg(long, default_value = "localhost")]
     sni: String,
-    #[arg(long, default_value_t = 16)]
+    #[arg(long, default_value_t = 128)]
     max_streams_per_session: usize,
 }
 
