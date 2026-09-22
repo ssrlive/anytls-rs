@@ -259,6 +259,10 @@ impl Session {
 
         {
             let mut streams = self.streams.lock().await;
+            // Re-check under the streams lock so we cannot insert after shutdown drained.
+            if self.is_closed() {
+                return Err(Error::new(BrokenPipe, "session closed"));
+            }
             if streams.len() >= self.max_streams {
                 return Err(Error::new(std::io::ErrorKind::WouldBlock, "session stream limit reached"));
             }
@@ -267,6 +271,10 @@ impl Session {
         if let Err(error) = self.enqueue_frame(Frame::new(Command::Syn, id), true).await {
             self.finish_stream_by_id(id).await;
             return Err(error);
+        }
+        if self.is_closed() {
+            self.finish_stream_by_id(id).await;
+            return Err(Error::new(BrokenPipe, "session closed"));
         }
 
         Ok(Stream::new(id, Arc::downgrade(self), local))
@@ -332,16 +340,6 @@ impl Session {
         self.enqueue_encoded_with_mode(frame.encode()?, disable_buffering_after).await
     }
 
-    fn enqueue_frame_nowait(&self, frame: Frame) -> std::io::Result<()> {
-        self.write_sender
-            .try_send(WriteRequest {
-                bytes: frame.encode()?,
-                disable_buffering_after: false,
-                result: None,
-            })
-            .map_err(|error| std::io::Error::new(std::io::ErrorKind::WouldBlock, format!("writer queue unavailable: {error}")))
-    }
-
     async fn enqueue_encoded(&self, bytes: Vec<u8>, disable_buffering_after: bool) -> std::io::Result<()> {
         self.enqueue_encoded_with_mode(bytes, disable_buffering_after).await
     }
@@ -387,12 +385,12 @@ impl Session {
                             Ok(()) => {}
                             Err(mpsc::error::TrySendError::Full(_data)) => {
                                 log::warn!("Push queue full for stream {stream_id}; closing stream");
-                                self.send_fin_before_finish(stream_id);
+                                self.send_fin_before_finish(stream_id).await;
                                 self.finish_stream_by_id(stream_id).await;
                             }
                             Err(mpsc::error::TrySendError::Closed(_data)) => {
                                 log::warn!("Push worker closed for stream {stream_id}; closing stream");
-                                self.send_fin_before_finish(stream_id);
+                                self.send_fin_before_finish(stream_id).await;
                                 self.finish_stream_by_id(stream_id).await;
                             }
                         }
@@ -411,7 +409,7 @@ impl Session {
                     // TODO: Handle additional SynAck logic if necessary
                 }
                 Command::HeartRequest => {
-                    if let Err(error) = self.enqueue_frame_nowait(Frame::new(Command::HeartResponse, stream_id)) {
+                    if let Err(error) = self.enqueue_frame(Frame::new(Command::HeartResponse, stream_id), false).await {
                         log::warn!("Failed to queue heart response: {error}");
                     }
                 }
@@ -452,13 +450,17 @@ impl Session {
         if let Some(scheme) = update_scheme {
             let mut update = Frame::new(Command::UpdatePaddingScheme, 0);
             update.data = scheme;
-            self.enqueue_frame_nowait(update)?;
+            if let Err(error) = self.enqueue_frame(update, false).await {
+                log::warn!("Failed to queue padding scheme update: {error}");
+            }
         }
         if map.get("v").and_then(|value| value.parse::<u8>().ok()).unwrap_or(0) >= 2 {
             self.peer_version.store(2, std::sync::atomic::Ordering::Release);
             let mut settings = Frame::new(Command::ServerSettings, 0);
             settings.data = b"v=2".to_vec();
-            self.enqueue_frame_nowait(settings)?;
+            if let Err(error) = self.enqueue_frame(settings, false).await {
+                log::warn!("Failed to queue server settings: {error}");
+            }
         }
         Ok(())
     }
@@ -475,7 +477,7 @@ impl Session {
             }
         };
         let result = if should_reply {
-            self.enqueue_frame_nowait(Frame::new(Command::Fin, stream_id))
+            self.enqueue_frame(Frame::new(Command::Fin, stream_id), false).await
         } else {
             Ok(())
         };
@@ -500,8 +502,8 @@ impl Session {
         self.finish_stream_by_id(stream_id).await;
     }
 
-    fn send_fin_before_finish(&self, stream_id: u32) {
-        if let Err(error) = self.enqueue_frame_nowait(Frame::new(Command::Fin, stream_id)) {
+    async fn send_fin_before_finish(&self, stream_id: u32) {
+        if let Err(error) = self.enqueue_frame(Frame::new(Command::Fin, stream_id), false).await {
             log::warn!("Failed to queue FIN for stream {stream_id}: {error}");
         }
     }
@@ -534,7 +536,7 @@ impl Session {
         if !self.received_settings.load(std::sync::atomic::Ordering::Acquire) {
             let mut alert = Frame::new(Command::Alert, 0);
             alert.data = b"client did not send its settings".to_vec();
-            self.enqueue_frame_nowait(alert)?;
+            self.enqueue_frame(alert, false).await?;
             return Err(Error::new(InvalidData, "settings required before SYN"));
         }
         let (local, remote) = tokio::io::duplex(64 * 1024);
@@ -553,7 +555,7 @@ impl Session {
         if reject {
             let mut rejection = Frame::new(Command::SynAck, stream_id);
             rejection.data = b"session stream limit reached".to_vec();
-            self.enqueue_frame_nowait(rejection)?;
+            self.enqueue_frame(rejection, false).await?;
             return Ok(());
         }
         let stream = Stream::new(stream_id, Arc::downgrade(self), local);
@@ -563,7 +565,7 @@ impl Session {
             Err(mpsc::error::TrySendError::Full(_)) => {
                 let mut rejection = Frame::new(Command::SynAck, stream_id);
                 rejection.data = b"incoming stream queue is full".to_vec();
-                self.enqueue_frame_nowait(rejection)?;
+                self.enqueue_frame(rejection, false).await?;
                 self.finish_stream_by_id(stream_id).await;
             }
             Err(mpsc::error::TrySendError::Closed(_)) => {
@@ -787,7 +789,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn shutdown_drains_streams_after_writer_failure() {
+    async fn shutdown_drains_streams_after_session_closed() {
         let (client_io, server_io) = tokio::io::duplex(128 * 1024);
         let client = Session::new_client(1, Box::new(client_io), padding(), 1);
         let server = Session::new_server(1, Box::new(server_io), padding(), 1);
@@ -835,5 +837,24 @@ mod tests {
 
         let _ = server.shutdown().await;
         let _ = client.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn open_stream_fails_after_shutdown() {
+        let (client_io, server_io) = tokio::io::duplex(128 * 1024);
+        let client = Session::new_client(1, Box::new(client_io), padding(), 1);
+        let server = Session::new_server(1, Box::new(server_io), padding(), 1);
+        client.run().await.unwrap();
+        server.run().await.unwrap();
+
+        client.shutdown().await.unwrap();
+        let err = client.open_stream().await;
+        assert!(err.is_err());
+        if let Err(err) = &err {
+            assert_eq!(err.kind(), std::io::ErrorKind::BrokenPipe);
+        }
+        assert!(client.streams.lock().await.is_empty());
+
+        let _ = server.shutdown().await;
     }
 }
