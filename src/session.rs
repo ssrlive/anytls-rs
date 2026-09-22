@@ -66,10 +66,13 @@ impl StreamEntry {
         let task_writer = Arc::clone(&writer);
         let close_token = CancellationToken::new();
         let task_close_token = close_token.clone();
+        let fin_token = CancellationToken::new();
+        let task_fin_token = fin_token.clone();
         tokio::spawn(async move {
             while let Some(data) = push_receiver.recv().await {
                 let Some(data) = data else {
                     let _ = task_writer.lock().await.shutdown().await;
+                    task_fin_token.cancel();
                     break;
                 };
                 let result = tokio::select! {
@@ -86,7 +89,7 @@ impl StreamEntry {
             push_sender,
             local_fin: false,
             close_token,
-            fin_token: CancellationToken::new(),
+            fin_token,
         }
     }
 }
@@ -472,15 +475,15 @@ impl Session {
     }
 
     async fn on_receive_fin_cmd(self: &Arc<Self>, stream_id: u32) -> std::io::Result<()> {
-        let (should_reply, push_sender, fin_token) = {
+        let (should_reply, push_sender) = {
             let mut streams = self.streams.lock().await;
             match streams.get_mut(&stream_id) {
                 Some(stream) if !stream.local_fin => {
                     stream.local_fin = true;
-                    (true, Some(stream.push_sender.clone()), Some(stream.fin_token.clone()))
+                    (true, Some(stream.push_sender.clone()))
                 }
-                Some(stream) => (false, Some(stream.push_sender.clone()), Some(stream.fin_token.clone())),
-                None => (false, None, None),
+                Some(stream) => (false, Some(stream.push_sender.clone())),
+                None => (false, None),
             }
         };
         let result = if should_reply {
@@ -492,8 +495,6 @@ impl Session {
             if let Some(push_sender) = push_sender {
                 if push_sender.send(None).is_err() {
                     self.finish_stream_by_id(stream_id).await;
-                } else if let Some(fin_token) = fin_token {
-                    fin_token.cancel();
                 }
             }
         }
@@ -804,6 +805,46 @@ mod tests {
 
         let _ = server.shutdown().await;
         let _ = client.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn drains_large_push_queue_before_fin_acknowledgement() {
+        let (client_io, server_io) = tokio::io::duplex(128 * 1024);
+        let client = Session::new_client(1, Box::new(client_io), padding(), 1);
+        let server = Session::new_server(1, Box::new(server_io), padding(), 1);
+        client.run().await.unwrap();
+        server.run().await.unwrap();
+
+        let client_stream = client.open_stream().await.unwrap();
+        let server_stream = server.accept_stream().await.unwrap();
+        let expected = vec![0x5a; 512 * 1024];
+        let send_payload = expected.clone();
+        let sender = tokio::spawn(async move {
+            for chunk in send_payload.chunks(16 * 1024) {
+                server_stream.write(chunk).await.unwrap();
+            }
+            let mut server_stream = server_stream;
+            server_stream.close().await.unwrap();
+        });
+
+        let mut received = Vec::with_capacity(expected.len());
+        let mut buffer = [0u8; 8192];
+        loop {
+            let size = tokio::time::timeout(Duration::from_secs(5), client_stream.read(&mut buffer))
+                .await
+                .expect("stream data should keep arriving")
+                .unwrap();
+            if size == 0 {
+                break;
+            }
+            received.extend_from_slice(&buffer[..size]);
+        }
+
+        sender.await.unwrap();
+        assert_eq!(received, expected);
+        drop(client_stream);
+        let _ = client.shutdown().await;
+        let _ = server.shutdown().await;
     }
 
     #[tokio::test]

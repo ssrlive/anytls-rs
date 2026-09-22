@@ -13,7 +13,7 @@ path = "bin/client.rs"
 
 [dependencies]
 clap = { version = "4.6.7", features = ["derive"] }
-env_logger = "0.11"
+env_logger = "0.11.11"
 log = "0.4.34"
 md-5 = "0.11.0"
 rand = "0.10.3"
