@@ -105,7 +105,7 @@ async fn handle_socks5(incoming: socks5_impl::server::IncomingConnection, client
         }
     };
     let started = std::time::Instant::now();
-    log::info!("opening SOCKS5 CONNECT to {target:?}");
+    log::info!("opening SOCKS5 CONNECT to {target}");
     let stream = client.create_stream().await?;
     let mut remote = StreamIo::new(stream);
     target.write_to_async_stream(&mut remote).await?;
@@ -114,7 +114,7 @@ async fn handle_socks5(incoming: socks5_impl::server::IncomingConnection, client
     ready.shutdown().await?;
     remote.shutdown().await?;
     log::info!(
-        "SOCKS5 relay to {target:?} closed: client_to_proxy={client_to_proxy} bytes, proxy_to_client={proxy_to_client} bytes, elapsed={:?}",
+        "SOCKS5 relay to {target} closed: client_to_proxy={client_to_proxy} bytes, proxy_to_client={proxy_to_client} bytes, elapsed={:?}",
         started.elapsed()
     );
     Ok(())

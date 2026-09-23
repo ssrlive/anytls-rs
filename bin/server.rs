@@ -1,7 +1,7 @@
 use anytls::{
     auth::read_auth,
     padding::{DEFAULT_SCHEME, PaddingFactory},
-    session::{BoxTransport, Session, Stream},
+    session::{BoxTransport, Session, Stream, is_peer_disconnect},
     stream_io::StreamIo,
 };
 use clap::Parser;
@@ -98,7 +98,11 @@ async fn handle_connection(
         tokio::spawn(async move {
             let stream_id = stream.id();
             if let Err(error) = relay_stream(stream).await {
-                log::warn!("session {session_id} stream {stream_id} relay failed: {error}");
+                if is_peer_disconnect(&error) {
+                    log::debug!("session {session_id} stream {stream_id} peer disconnected: {error}");
+                } else {
+                    log::warn!("session {session_id} stream {stream_id} relay failed: {error}");
+                }
             }
         });
     }
@@ -109,7 +113,7 @@ async fn relay_stream(stream: Stream) -> std::io::Result<()> {
     let started = std::time::Instant::now();
     let mut stream_io = StreamIo::new(stream);
     let destination = read_target(&mut stream_io).await?;
-    log::info!("stream {stream_id}: connecting to {destination:?}");
+    log::debug!("stream {stream_id}: connecting to {destination}");
     let addresses: Vec<SocketAddr> = destination.to_socket_addrs()?.collect();
     let outbound = match TcpStream::connect(&addresses[..]).await {
         Ok(outbound) => outbound,
@@ -120,14 +124,23 @@ async fn relay_stream(stream: Stream) -> std::io::Result<()> {
     };
     stream_io.handshake_success().await?;
     let mut outbound = outbound;
-    let (stream_to_target, target_to_stream) = tokio::io::copy_bidirectional(&mut stream_io, &mut outbound).await?;
-    stream_io.shutdown().await?;
-    outbound.shutdown().await?;
-    log::info!(
-        "stream {stream_id}: relay to {destination:?} closed: stream_to_target={stream_to_target} bytes, target_to_stream={target_to_stream} bytes, elapsed={:?}",
-        started.elapsed()
-    );
-    Ok(())
+    let relay_result = tokio::io::copy_bidirectional(&mut stream_io, &mut outbound).await;
+    let _ = stream_io.shutdown().await;
+    let _ = outbound.shutdown().await;
+    match relay_result {
+        Ok((stream_to_target, target_to_stream)) => {
+            log::info!(
+                "stream {stream_id}: relay to {destination} closed: stream_to_target={stream_to_target} bytes, target_to_stream={target_to_stream} bytes, elapsed={:?}",
+                started.elapsed()
+            );
+            Ok(())
+        }
+        Err(error) if is_peer_disconnect(&error) => {
+            log::debug!("stream {stream_id}: peer reset/closed relay: {error}");
+            Ok(())
+        }
+        Err(error) => Err(error),
+    }
 }
 
 async fn read_target(stream: &mut StreamIo) -> std::io::Result<Address> {

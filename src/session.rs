@@ -17,6 +17,17 @@ use crate::{
 
 pub type BoxTransport = Box<dyn AsyncReadWrite>;
 
+pub fn is_peer_disconnect(error: &std::io::Error) -> bool {
+    matches!(
+        error.kind(),
+        std::io::ErrorKind::ConnectionReset
+            | std::io::ErrorKind::ConnectionAborted
+            | std::io::ErrorKind::BrokenPipe
+            | std::io::ErrorKind::UnexpectedEof
+            | std::io::ErrorKind::NotConnected
+    )
+}
+
 pub trait AsyncReadWrite: AsyncRead + AsyncWrite + Unpin + Send {}
 impl<T: AsyncRead + AsyncWrite + Unpin + Send> AsyncReadWrite for T {}
 
@@ -238,7 +249,7 @@ impl Session {
         tokio::spawn(async move {
             let result = Arc::clone(&session).receive_loop().await;
             match result {
-                Ok(()) => log::info!("session {} receive loop stopped", session.session_id),
+                Ok(()) => log::debug!("session {} receive loop stopped", session.session_id),
                 Err(error) => log::warn!("session {} receive loop failed: {error}", session.session_id),
             }
             let _ = session.shutdown().await;
@@ -389,11 +400,19 @@ impl Session {
     async fn receive_loop(self: Arc<Self>) -> std::io::Result<()> {
         use std::io::{Error, ErrorKind::InvalidData};
         loop {
-            let frame = tokio::select! {
+            let result = tokio::select! {
                 result = async {
                     Frame::read_from(&mut *self.reader.lock().await).await
-                } => result?,
+                } => result,
                 _ = self.close_token.cancelled() => break Ok(()),
+            };
+            let frame = match result {
+                Ok(frame) => frame,
+                Err(error) if is_peer_disconnect(&error) => {
+                    log::debug!("session {} peer closed transport: {error}", self.session_id);
+                    break Ok(());
+                }
+                Err(error) => break Err(error),
             };
             let stream_id = frame.stream_id;
             if !frame.command.valid_stream_id(stream_id) {
@@ -785,6 +804,35 @@ impl Drop for Stream {
 mod tests {
     use super::*;
     use crate::padding::DEFAULT_SCHEME;
+
+    #[test]
+    fn classifies_peer_disconnect_errors() {
+        use std::io::ErrorKind;
+
+        for kind in [
+            ErrorKind::ConnectionReset,
+            ErrorKind::ConnectionAborted,
+            ErrorKind::BrokenPipe,
+            ErrorKind::UnexpectedEof,
+            ErrorKind::NotConnected,
+        ] {
+            assert!(is_peer_disconnect(&std::io::Error::from(kind)));
+        }
+        assert!(!is_peer_disconnect(&std::io::Error::from(ErrorKind::InvalidData)));
+    }
+
+    #[tokio::test]
+    async fn peer_eof_shuts_down_session_without_receive_error() {
+        let (session_io, peer_io) = tokio::io::duplex(128 * 1024);
+        let session = Session::new_client(1, Box::new(session_io), padding(), 1);
+        session.run().await.unwrap();
+
+        drop(peer_io);
+        tokio::time::timeout(Duration::from_secs(1), session.close_token.cancelled())
+            .await
+            .unwrap();
+        assert!(session.is_closed());
+    }
 
     fn padding() -> Arc<RwLock<PaddingFactory>> {
         Arc::new(RwLock::new(PaddingFactory::new(DEFAULT_SCHEME).unwrap()))
