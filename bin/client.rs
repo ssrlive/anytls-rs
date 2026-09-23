@@ -19,6 +19,7 @@ use socks5_impl::{
 };
 use std::{
     net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr},
+    path::PathBuf,
     pin::Pin,
     sync::{Arc, Mutex},
     task::{Context, Poll},
@@ -27,33 +28,60 @@ use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt, ReadBuf};
 use tokio::net::{TcpStream, UdpSocket};
 use tokio_rustls::TlsConnector;
 
-#[derive(Parser, Debug)]
+#[derive(Parser, serde::Serialize, serde::Deserialize, Debug, Clone)]
+#[command(version, author, name = "anytls-client", about = "AnyTLS rust client")]
 struct Args {
-    #[arg(short = 'l', long, default_value = "127.0.0.1:1080")]
+    /// Local address to listen for incoming SOCKS5 and HTTP connections
+    #[arg(short = 'l', long, value_name = "IP:PORT", default_value = "127.0.0.1:1080")]
     listen: SocketAddr,
-    #[arg(short = 's', long)]
+
+    /// Server address
+    #[arg(short = 's', long, value_name = "IP:PORT")]
     server: SocketAddr,
+
+    /// Password for anytls server authentication
     #[arg(short = 'p', long)]
     password: String,
-    #[arg(long, default_value = "localhost")]
-    sni: String,
-    #[arg(long, default_value_t = 16)]
+
+    /// Optional TLS server name indication (SNI); defaults to the server IP without sending SNI
+    #[arg(long, value_name = "DOMAIN")]
+    sni: Option<String>,
+
+    /// Padding scheme file
+    #[arg(long, value_name = "FILE")]
+    padding_scheme: Option<PathBuf>,
+
+    /// Maximum logical streams per AnyTLS session, if it is 1 then multiplexing is disabled
+    #[arg(short = 'm', long, value_name = "N", default_value_t = 16)]
     max_streams_per_session: usize,
+
+    /// Log level (off, error, warn, info, debug, trace)
+    #[arg(long, value_name = "LOG", default_value = "info")]
+    log: log::LevelFilter,
 }
 
 #[tokio::main]
 async fn main() -> std::io::Result<()> {
-    env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
+    use std::io::{Error, ErrorKind::InvalidInput};
     let args = Args::parse();
+    let default_log_filter = args.log.as_str().to_ascii_lowercase();
+    env_logger::Builder::from_env(env_logger::Env::default().default_filter_or(&default_log_filter)).init();
     let listener = tokio::net::TcpListener::bind(args.listen).await?;
     log::info!(
         "SOCKS5 + HTTP mixed listener started on {}; AnyTLS server {}",
         args.listen,
         args.server
     );
-    let padding = Arc::new(tokio::sync::RwLock::new(
-        PaddingFactory::new(DEFAULT_SCHEME).expect("default padding"),
-    ));
+    let padding_factory = if let Some(path) = &args.padding_scheme {
+        let content = tokio::fs::read(path).await?;
+        let factory = PaddingFactory::new(&content)
+            .ok_or_else(|| Error::new(InvalidInput, format!("Wrong format padding scheme file: {}", path.display())))?;
+        log::info!("Loaded padding scheme file: {}", path.display());
+        factory
+    } else {
+        PaddingFactory::new(DEFAULT_SCHEME).expect("default padding")
+    };
+    let padding = Arc::new(tokio::sync::RwLock::new(padding_factory));
     let password = Arc::new(args.password);
     let sni = Arc::new(args.sni);
     let server = args.server;
@@ -62,7 +90,7 @@ async fn main() -> std::io::Result<()> {
         let padding = Arc::clone(&dialer_padding);
         let password = password.clone();
         let sni = sni.clone();
-        Box::pin(async move { dial(server, &sni, &password, padding).await })
+        Box::pin(async move { dial(server, sni.as_deref(), &password, padding).await })
     });
     let client = Client::new(
         dialer,
@@ -259,13 +287,16 @@ impl AsyncWrite for HttpStreamIo {
 
 async fn dial(
     server: SocketAddr,
-    sni: &str,
+    sni: Option<&str>,
     password: &str,
     padding: Arc<tokio::sync::RwLock<PaddingFactory>>,
 ) -> std::io::Result<BoxTransport> {
     let tcp = TcpStream::connect(server).await?;
     log::info!("connecting to AnyTLS server {server}");
-    let name = ServerName::try_from(sni.to_owned()).map_err(std::io::Error::other)?;
+    let name = match sni {
+        Some(sni) => ServerName::try_from(sni.to_owned()).map_err(std::io::Error::other)?,
+        None => ServerName::IpAddress(server.ip().into()),
+    };
     let connector = TlsConnector::from(tls_config());
     let mut tls = connector.connect(name, tcp).await?;
     log::info!("TLS connection to AnyTLS server {server} established");
