@@ -21,6 +21,9 @@ rand = "0.10.3"
 rcgen = "0.14.10"
 rustls = "0.23.45"
 sha2 = "0.11.0"
+socks-hub = { version = "0.2.9", default-features = false, features = [
+    "httpproxy",
+] }
 socks5-impl = { version = "0.9.6", features = ["server", "serde"] }
 tokio = { version = "1.53.1", features = [
     "io-util",

@@ -12,15 +12,18 @@ use rustls::{
     client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier},
     pki_types::{CertificateDer, ServerName, UnixTime},
 };
+use socks_hub_core::{BoxedStream, HttpConnector, UserKey, run_http_service};
 use socks5_impl::{
     protocol::{Address, AsyncStreamOperation, Reply},
-    server::{AssociatedUdpSocket, ClientConnection, Server, UdpAssociate, auth::NoAuth, connection::associate},
+    server::{AssociatedUdpSocket, ClientConnection, IncomingConnection, UdpAssociate, auth::NoAuth, connection::associate},
 };
 use std::{
     net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr},
-    sync::Arc,
+    pin::Pin,
+    sync::{Arc, Mutex},
+    task::{Context, Poll},
 };
-use tokio::io::AsyncWriteExt;
+use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt, ReadBuf};
 use tokio::net::{TcpStream, UdpSocket};
 use tokio_rustls::TlsConnector;
 
@@ -42,8 +45,12 @@ struct Args {
 async fn main() -> std::io::Result<()> {
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
     let args = Args::parse();
-    let listener = Server::bind(args.listen, Arc::new(NoAuth)).await?;
-    log::info!("SOCKS5 listener started on {}; AnyTLS server {}", args.listen, args.server);
+    let listener = tokio::net::TcpListener::bind(args.listen).await?;
+    log::info!(
+        "SOCKS5 + HTTP mixed listener started on {}; AnyTLS server {}",
+        args.listen,
+        args.server
+    );
     let padding = Arc::new(tokio::sync::RwLock::new(
         PaddingFactory::new(DEFAULT_SCHEME).expect("default padding"),
     ));
@@ -64,15 +71,189 @@ async fn main() -> std::io::Result<()> {
         args.max_streams_per_session,
         std::time::Duration::from_secs(3600),
     );
+    let connector_client = Arc::clone(&client);
+    let connector: HttpConnector = Arc::new(move |destination: Address| {
+        let client = Arc::clone(&connector_client);
+        Box::pin(async move {
+            let stream = client.create_stream().await?;
+            let mut adapter = HttpStreamIo::new(StreamIo::new(stream));
+            destination.write_to_async_stream(&mut adapter).await?;
+            Ok(Box::new(adapter) as BoxedStream)
+        })
+    });
 
     loop {
         let (stream, _) = listener.accept().await?;
         let client = client.clone();
+        let connector = connector.clone();
         tokio::spawn(async move {
-            if let Err(error) = handle_socks5(stream, client).await {
-                log::warn!("SOCKS5 connection failed: {error}");
+            if let Err(error) = handle_listener_stream(stream, client, connector).await {
+                log::warn!("Proxy connection failed: {error}");
             }
         });
+    }
+}
+
+async fn handle_listener_stream(mut stream: TcpStream, client: Arc<Client>, connector: HttpConnector) -> std::io::Result<()> {
+    let peer_addr = stream.peer_addr().ok();
+    let protocol = match tokio::time::timeout(std::time::Duration::from_secs(5), detect_listener_protocol(&stream)).await {
+        Ok(protocol) => protocol?,
+        Err(_) => {
+            log::debug!("Timed out detecting proxy protocol from {peer_addr:?}");
+            stream.shutdown().await?;
+            return Ok(());
+        }
+    };
+    match protocol {
+        Some(ListenerProtocol::Socks5) => {
+            log::trace!("SOCKS5 client detected from {peer_addr:?}");
+            let incoming = IncomingConnection::new(stream, Arc::new(NoAuth));
+            handle_socks5(incoming, client).await
+        }
+        Some(ListenerProtocol::Socks4) => {
+            log::warn!("SOCKS4 is unsupported on mixed SOCKS5/HTTP listener from {peer_addr:?}");
+            stream.shutdown().await
+        }
+        Some(ListenerProtocol::Http) => {
+            log::trace!("HTTP proxy client detected from {peer_addr:?}");
+            run_http_service(stream, connector, UserKey::default()).await
+        }
+        None => {
+            let mut first_byte = [0u8; 1];
+            let _ = stream.peek(&mut first_byte).await?;
+            log::warn!("Unknown proxy protocol from {peer_addr:?}, first byte: 0x{:02x}", first_byte[0]);
+            stream.shutdown().await
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ListenerProtocol {
+    Socks5,
+    Socks4,
+    Http,
+}
+
+async fn detect_listener_protocol(stream: &TcpStream) -> std::io::Result<Option<ListenerProtocol>> {
+    let mut peek_buf = [0u8; 16];
+    loop {
+        let size = stream.peek(&mut peek_buf).await?;
+        if size == 0 {
+            return Ok(None);
+        }
+        let bytes = &peek_buf[..size];
+        match bytes[0] {
+            0x05 => return Ok(Some(ListenerProtocol::Socks5)),
+            0x04 => return Ok(Some(ListenerProtocol::Socks4)),
+            _ if is_http_request(bytes) => return Ok(Some(ListenerProtocol::Http)),
+            _ if could_be_http_request_prefix(bytes) => {
+                tokio::time::sleep(std::time::Duration::from_millis(2)).await;
+            }
+            _ => return Ok(None),
+        }
+    }
+}
+
+fn is_http_request(bytes: &[u8]) -> bool {
+    http_methods().iter().any(|method| {
+        bytes.get(..method.len()).is_some_and(|prefix| prefix.eq_ignore_ascii_case(method)) && bytes.get(method.len()) == Some(&b' ')
+    })
+}
+
+fn could_be_http_request_prefix(bytes: &[u8]) -> bool {
+    http_methods().iter().any(|method| {
+        let compared_len = bytes.len().min(method.len());
+        bytes
+            .get(..compared_len)
+            .zip(method.get(..compared_len))
+            .is_some_and(|(prefix, expected)| prefix.eq_ignore_ascii_case(expected))
+            && (bytes.len() <= method.len() || bytes.get(method.len()) == Some(&b' '))
+    })
+}
+
+fn http_methods() -> &'static [&'static [u8]] {
+    const METHODS: &[&[u8]] = &[
+        b"CONNECT",
+        b"GET",
+        b"POST",
+        b"HEAD",
+        b"PUT",
+        b"OPTIONS",
+        b"DELETE",
+        b"TRACE",
+        b"PATCH",
+        b"LOCK",
+        b"UNLOCK",
+        b"PROPFIND",
+        b"MKCOL",
+        b"COPY",
+        b"MOVE",
+    ];
+    METHODS
+}
+
+#[cfg(test)]
+mod listener_tests {
+    use super::{could_be_http_request_prefix, is_http_request};
+
+    #[test]
+    fn recognizes_complete_http_methods_case_insensitively() {
+        assert!(is_http_request(b"CONNECT example.com:443 HTTP/1.1\r\n"));
+        assert!(is_http_request(b"get http://example.com/ HTTP/1.1\r\n"));
+        assert!(!is_http_request(b"GARBAGE"));
+    }
+
+    #[test]
+    fn retains_partial_http_method_prefixes_for_more_peeking() {
+        assert!(could_be_http_request_prefix(b"CON"));
+        assert!(could_be_http_request_prefix(b"GET"));
+        assert!(!could_be_http_request_prefix(b"GARBAGE"));
+    }
+}
+
+struct HttpStreamIo {
+    inner: Mutex<StreamIo>,
+}
+
+impl HttpStreamIo {
+    fn new(inner: StreamIo) -> Self {
+        Self { inner: Mutex::new(inner) }
+    }
+}
+
+impl AsyncRead for HttpStreamIo {
+    fn poll_read(self: Pin<&mut Self>, cx: &mut Context<'_>, buf: &mut ReadBuf<'_>) -> Poll<std::io::Result<()>> {
+        let mut inner = match self.inner.lock() {
+            Ok(inner) => inner,
+            Err(_) => return Poll::Ready(Err(std::io::Error::other("HTTP stream lock poisoned"))),
+        };
+        Pin::new(&mut *inner).poll_read(cx, buf)
+    }
+}
+
+impl AsyncWrite for HttpStreamIo {
+    fn poll_write(self: Pin<&mut Self>, cx: &mut Context<'_>, buf: &[u8]) -> Poll<std::io::Result<usize>> {
+        let mut inner = match self.inner.lock() {
+            Ok(inner) => inner,
+            Err(_) => return Poll::Ready(Err(std::io::Error::other("HTTP stream lock poisoned"))),
+        };
+        Pin::new(&mut *inner).poll_write(cx, buf)
+    }
+
+    fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+        let mut inner = match self.inner.lock() {
+            Ok(inner) => inner,
+            Err(_) => return Poll::Ready(Err(std::io::Error::other("HTTP stream lock poisoned"))),
+        };
+        Pin::new(&mut *inner).poll_flush(cx)
+    }
+
+    fn poll_shutdown(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+        let mut inner = match self.inner.lock() {
+            Ok(inner) => inner,
+            Err(_) => return Poll::Ready(Err(std::io::Error::other("HTTP stream lock poisoned"))),
+        };
+        Pin::new(&mut *inner).poll_shutdown(cx)
     }
 }
 
