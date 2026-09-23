@@ -38,18 +38,6 @@ impl StreamIo {
     }
 }
 
-impl Clone for StreamIo {
-    fn clone(&self) -> Self {
-        Self {
-            stream: Arc::clone(&self.stream),
-            read_future: None,
-            write_future: None,
-            shutdown_future: None,
-            shutdown_complete: false,
-        }
-    }
-}
-
 impl AsyncRead for StreamIo {
     fn poll_read(mut self: Pin<&mut Self>, cx: &mut Context<'_>, buf: &mut ReadBuf<'_>) -> Poll<std::io::Result<()>> {
         if self.read_future.is_none() {

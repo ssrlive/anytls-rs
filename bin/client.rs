@@ -30,7 +30,7 @@ struct Args {
     password: String,
     #[arg(long, default_value = "localhost")]
     sni: String,
-    #[arg(long, default_value_t = 128)]
+    #[arg(long, default_value_t = 16)]
     max_streams_per_session: usize,
 }
 
@@ -46,17 +46,16 @@ async fn main() -> std::io::Result<()> {
     let password = Arc::new(args.password);
     let sni = Arc::new(args.sni);
     let server = args.server;
+    let dialer_padding = Arc::clone(&padding);
     let dialer: Dialer = Arc::new(move || {
-        let padding = padding.clone();
+        let padding = Arc::clone(&dialer_padding);
         let password = password.clone();
         let sni = sni.clone();
         Box::pin(async move { dial(server, &sni, &password, padding).await })
     });
     let client = Client::new(
         dialer,
-        Arc::new(tokio::sync::RwLock::new(
-            PaddingFactory::new(DEFAULT_SCHEME).expect("default padding"),
-        )),
+        padding,
         std::time::Duration::from_secs(30),
         args.max_streams_per_session,
         std::time::Duration::from_secs(3600),
