@@ -20,6 +20,8 @@ md-5 = "0.11.0"
 rand = "0.10.3"
 rcgen = "0.14.10"
 rustls = "0.23.45"
+rustls-native-certs = "0.8.4"
+rustls-pemfile = "2.2.0"
 serde = { version = "1.0.229", features = ["derive"] }
 sha2 = "0.11.0"
 socks-hub = { version = "0.2.9", default-features = false, features = [

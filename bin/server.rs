@@ -13,6 +13,7 @@ use rustls::{
 use socks5_impl::protocol::{Address, AsyncStreamOperation};
 use std::{
     net::{SocketAddr, ToSocketAddrs},
+    path::PathBuf,
     sync::Arc,
 };
 use tokio::io::AsyncWriteExt;
@@ -20,23 +21,42 @@ use tokio::net::{TcpListener, TcpStream, UdpSocket};
 use tokio::time::Duration;
 use tokio_rustls::TlsAcceptor;
 
-#[derive(Parser, Debug)]
+#[derive(Parser, serde::Serialize, serde::Deserialize, Debug, Clone)]
+#[command(version, author, name = "anytls-server", about = "AnyTLS rust server")]
 struct Args {
-    #[arg(short = 'l', long, default_value = "0.0.0.0:8443")]
+    /// Server listen port
+    #[arg(short = 'l', long, value_name = "IP:PORT", default_value = "0.0.0.0:8443")]
     listen: SocketAddr,
+
+    /// Password for anytls server authentication
     #[arg(short = 'p', long)]
     password: String,
-    #[arg(long, default_value_t = 1024)]
+
+    /// Maximum logical streams accepted on one authenticated TLS session
+    #[arg(long, value_name = "N", default_value_t = 1024)]
     max_streams_per_session: usize,
+
+    /// TLS certificate PEM file (optional)
+    #[arg(long, value_name = "FILE")]
+    cert: Option<PathBuf>,
+
+    /// TLS private key PEM file (optional)
+    #[arg(long, value_name = "FILE")]
+    key: Option<PathBuf>,
+
+    /// Log level (off, error, warn, info, debug, trace)
+    #[arg(long, value_name = "LOG", default_value = "info")]
+    log: log::LevelFilter,
 }
 
 #[tokio::main]
 async fn main() -> std::io::Result<()> {
-    env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
     let args = Args::parse();
+    let log_level = args.log.to_string().to_ascii_lowercase();
+    env_logger::Builder::from_env(env_logger::Env::default().default_filter_or(log_level)).init();
+    let acceptor = TlsAcceptor::from(Arc::new(tls_config(args.cert.as_deref(), args.key.as_deref())?));
     let listener = TcpListener::bind(args.listen).await?;
     log::info!("AnyTLS server listening on {}", args.listen);
-    let acceptor = TlsAcceptor::from(Arc::new(tls_config()?));
     let padding = Arc::new(tokio::sync::RwLock::new(
         PaddingFactory::new(DEFAULT_SCHEME).expect("default padding"),
     ));
@@ -219,12 +239,51 @@ async fn read_target(stream: &mut StreamIo) -> std::io::Result<Address> {
     Address::retrieve_from_async_stream(stream).await
 }
 
-fn tls_config() -> std::io::Result<ServerConfig> {
-    let certified = rcgen::generate_simple_self_signed(vec!["localhost".to_owned()]).map_err(std::io::Error::other)?;
+fn tls_config(cert_path: Option<&std::path::Path>, key_path: Option<&std::path::Path>) -> std::io::Result<ServerConfig> {
+    use std::io::{Error, ErrorKind::InvalidData, ErrorKind::InvalidInput};
+    if let (Some(cert_path), Some(key_path)) = (cert_path, key_path) {
+        let cert_file = std::fs::File::open(cert_path)?;
+        let mut cert_reader = std::io::BufReader::new(cert_file);
+        let certs: Vec<CertificateDer<'static>> = rustls_pemfile::certs(&mut cert_reader).collect::<Result<_, _>>()?;
+        if certs.is_empty() {
+            return Err(Error::new(InvalidData, "failed to parse certificate PEM"));
+        }
+
+        let key_file = std::fs::File::open(key_path)?;
+        let mut key_reader = std::io::BufReader::new(key_file);
+        let key = rustls_pemfile::private_key(&mut key_reader)?
+            .ok_or_else(|| Error::new(InvalidData, "failed to parse a supported private key"))?;
+
+        return ServerConfig::builder()
+            .with_no_client_auth()
+            .with_single_cert(certs, key)
+            .map_err(std::io::Error::other);
+    }
+
+    if cert_path.is_some() || key_path.is_some() {
+        return Err(Error::new(InvalidInput, "both --cert and --key must be provided"));
+    }
+
+    let certified = rcgen::generate_simple_self_signed(vec!["localhost".to_owned()]).map_err(Error::other)?;
     let cert = CertificateDer::from(certified.cert.der().to_vec());
     let key = PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(certified.signing_key.serialize_der()));
     ServerConfig::builder()
         .with_no_client_auth()
         .with_single_cert(vec![cert], key)
         .map_err(std::io::Error::other)
+}
+
+#[cfg(test)]
+mod tls_config_tests {
+    use super::tls_config;
+    use std::path::Path;
+
+    #[test]
+    fn requires_certificate_and_key_together() {
+        let cert_only = tls_config(Some(Path::new("certificate.pem")), None).unwrap_err();
+        assert_eq!(cert_only.kind(), std::io::ErrorKind::InvalidInput);
+
+        let key_only = tls_config(None, Some(Path::new("private-key.pem"))).unwrap_err();
+        assert_eq!(key_only.kind(), std::io::ErrorKind::InvalidInput);
+    }
 }

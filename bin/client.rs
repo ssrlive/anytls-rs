@@ -19,7 +19,7 @@ use socks5_impl::{
 };
 use std::{
     net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr},
-    path::PathBuf,
+    path::{Path, PathBuf},
     pin::Pin,
     sync::{Arc, Mutex},
     task::{Context, Poll},
@@ -42,6 +42,14 @@ struct Args {
     /// Password for anytls server authentication
     #[arg(short = 'p', long)]
     password: String,
+
+    /// Root CA certificate PEM file to verify server (optional)
+    #[arg(long, value_name = "FILE")]
+    root_cert: Option<PathBuf>,
+
+    /// Allow an insecure TLS connection
+    #[arg(long)]
+    insecure: bool,
 
     /// Optional TLS server name indication (SNI); defaults to the server IP without sending SNI
     #[arg(long, value_name = "DOMAIN")]
@@ -66,6 +74,8 @@ async fn main() -> std::io::Result<()> {
     let args = Args::parse();
     let default_log_filter = args.log.as_str().to_ascii_lowercase();
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or(&default_log_filter)).init();
+    let insecure = insecure_tls_enabled(args.root_cert.as_deref(), args.insecure);
+    let client_tls_config = tls_config(args.root_cert.as_deref(), insecure)?;
     let listener = tokio::net::TcpListener::bind(args.listen).await?;
     log::info!(
         "SOCKS5 + HTTP mixed listener started on {}; AnyTLS server {}",
@@ -85,12 +95,14 @@ async fn main() -> std::io::Result<()> {
     let password = Arc::new(args.password);
     let sni = Arc::new(args.sni);
     let server = args.server;
+    let dialer_tls_config = Arc::clone(&client_tls_config);
     let dialer_padding = Arc::clone(&padding);
     let dialer: Dialer = Arc::new(move || {
         let padding = Arc::clone(&dialer_padding);
+        let tls_config = Arc::clone(&dialer_tls_config);
         let password = password.clone();
         let sni = sni.clone();
-        Box::pin(async move { dial(server, sni.as_deref(), &password, padding).await })
+        Box::pin(async move { dial(server, sni.as_deref(), &password, padding, tls_config).await })
     });
     let client = Client::new(
         dialer,
@@ -222,7 +234,26 @@ fn http_methods() -> &'static [&'static [u8]] {
 
 #[cfg(test)]
 mod listener_tests {
-    use super::{could_be_http_request_prefix, is_http_request};
+    use super::{Args, could_be_http_request_prefix, insecure_tls_enabled, is_http_request};
+    use clap::Parser;
+    use std::path::Path;
+
+    #[test]
+    fn insecure_option_accepts_true_and_false_and_defaults_to_none() {
+        let args = Args::try_parse_from(["anytls-client", "--server", "127.0.0.1:443", "--password", "secret"]).unwrap();
+        assert!(!args.insecure);
+
+        let args = Args::try_parse_from(["anytls-client", "--server", "127.0.0.1:443", "--password", "secret", "--insecure"]).unwrap();
+        assert!(args.insecure);
+    }
+
+    #[test]
+    fn root_certificate_forces_secure_tls_even_when_insecure_is_true() {
+        assert!(!insecure_tls_enabled(None, false));
+        assert!(insecure_tls_enabled(None, true));
+        assert!(!insecure_tls_enabled(Some(Path::new("root.pem")), true));
+        assert!(!insecure_tls_enabled(Some(Path::new("root.pem")), false));
+    }
 
     #[test]
     fn recognizes_complete_http_methods_case_insensitively() {
@@ -290,6 +321,7 @@ async fn dial(
     sni: Option<&str>,
     password: &str,
     padding: Arc<tokio::sync::RwLock<PaddingFactory>>,
+    tls_config: Arc<ClientConfig>,
 ) -> std::io::Result<BoxTransport> {
     let tcp = TcpStream::connect(server).await?;
     log::info!("connecting to AnyTLS server {server}");
@@ -297,7 +329,7 @@ async fn dial(
         Some(sni) => ServerName::try_from(sni.to_owned()).map_err(std::io::Error::other)?,
         None => ServerName::IpAddress(server.ip().into()),
     };
-    let connector = TlsConnector::from(tls_config());
+    let connector = TlsConnector::from(tls_config);
     let mut tls = connector.connect(name, tcp).await?;
     log::info!("TLS connection to AnyTLS server {server} established");
     let padding = padding.read().await;
@@ -445,12 +477,45 @@ async fn write_stream_all(stream: &anytls::session::Stream, mut bytes: &[u8]) ->
     Ok(())
 }
 
-fn tls_config() -> Arc<ClientConfig> {
-    let mut config = ClientConfig::builder()
-        .with_root_certificates(rustls::RootCertStore::empty())
-        .with_no_client_auth();
-    config.dangerous().set_certificate_verifier(Arc::new(AnyCertificate));
-    Arc::new(config)
+fn tls_config(root_cert: Option<&Path>, insecure: bool) -> std::io::Result<Arc<ClientConfig>> {
+    if insecure {
+        let mut config = ClientConfig::builder()
+            .with_root_certificates(rustls::RootCertStore::empty())
+            .with_no_client_auth();
+        config.dangerous().set_certificate_verifier(Arc::new(AnyCertificate));
+        return Ok(Arc::new(config));
+    }
+
+    let mut root_store = rustls::RootCertStore::empty();
+    if let Some(path) = root_cert {
+        let file = std::fs::File::open(path)?;
+        let mut reader = std::io::BufReader::new(file);
+        for cert in rustls_pemfile::certs(&mut reader) {
+            root_store.add(cert?).map_err(std::io::Error::other)?;
+        }
+    } else {
+        let cert_result = rustls_native_certs::load_native_certs();
+        if !cert_result.errors.is_empty() {
+            log::warn!("Failed to load some native certificates: {:?}", cert_result.errors);
+        }
+        for cert in cert_result.certs {
+            root_store.add(cert).map_err(std::io::Error::other)?;
+        }
+    }
+
+    if root_store.roots.is_empty() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "No root certificates available for TLS verification",
+        ));
+    }
+
+    let config = ClientConfig::builder().with_root_certificates(root_store).with_no_client_auth();
+    Ok(Arc::new(config))
+}
+
+fn insecure_tls_enabled(root_cert: Option<&Path>, insecure: bool) -> bool {
+    root_cert.is_none() && insecure
 }
 
 #[derive(Debug)]
