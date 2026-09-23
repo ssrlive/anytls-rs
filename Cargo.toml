@@ -12,6 +12,7 @@ name = "anytls-client"
 path = "bin/client.rs"
 
 [dependencies]
+bytes = "1.12.1"
 clap = { version = "4.6.7", features = ["derive"] }
 env_logger = "0.11.11"
 log = "0.4.34"

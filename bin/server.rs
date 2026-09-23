@@ -3,6 +3,7 @@ use anytls::{
     padding::{DEFAULT_SCHEME, PaddingFactory},
     session::{BoxTransport, Session, Stream, is_peer_disconnect},
     stream_io::StreamIo,
+    uot::{UotMode, uot_encode_packet, uot_get_packet_from_stream, uot_get_request_from_stream, uot_is_sentinel_destination},
 };
 use clap::Parser;
 use rustls::{
@@ -15,7 +16,7 @@ use std::{
     sync::Arc,
 };
 use tokio::io::AsyncWriteExt;
-use tokio::net::{TcpListener, TcpStream};
+use tokio::net::{TcpListener, TcpStream, UdpSocket};
 use tokio::time::Duration;
 use tokio_rustls::TlsAcceptor;
 
@@ -61,11 +62,11 @@ async fn main() -> std::io::Result<()> {
         let password = password.clone();
         let max_streams = args.max_streams_per_session;
         tokio::spawn(async move {
-            log::info!("accepted TLS connection {session_id} from {peer}");
+            log::info!("accepted TLS session {session_id} from {peer}");
             if let Err(error) = handle_connection(tcp, acceptor, padding, password, session_id, max_streams).await {
-                log::warn!("connection {session_id} from {peer} failed: {error}");
+                log::warn!("session {session_id} from {peer} failed: {error}");
             } else {
-                log::info!("connection {session_id} from {peer} closed");
+                log::info!("session {session_id} from {peer} closed");
             }
         });
     }
@@ -81,7 +82,7 @@ async fn handle_connection(
 ) -> std::io::Result<()> {
     let mut tls = acceptor.accept(tcp).await?;
     read_auth(&mut tls, &password).await?;
-    log::info!("connection {session_id}: TLS and AnyTLS authentication completed");
+    log::info!("session {session_id}: TLS and AnyTLS authentication completed");
 
     let session = Session::new_server(session_id, Box::new(tls) as BoxTransport, padding, max_streams);
     session.run().await?;
@@ -89,7 +90,7 @@ async fn handle_connection(
         let stream = match session.accept_stream().await {
             Ok(stream) => stream,
             Err(error) if error.kind() == std::io::ErrorKind::BrokenPipe => {
-                log::info!("connection {session_id}: session closed by peer");
+                log::info!("session {session_id}: session closed by peer");
                 return Ok(());
             }
             Err(error) => return Err(error),
@@ -113,6 +114,9 @@ async fn relay_stream(stream: Stream) -> std::io::Result<()> {
     let started = std::time::Instant::now();
     let mut stream_io = StreamIo::new(stream);
     let destination = read_target(&mut stream_io).await?;
+    if uot_is_sentinel_destination(&destination) {
+        return relay_uot_datagrams(stream_io).await;
+    }
     log::debug!("session {session_id} stream {stream_id}: connecting to {destination}");
     let addresses: Vec<SocketAddr> = destination.to_socket_addrs()?.collect();
     let outbound = match TcpStream::connect(&addresses[..]).await {
@@ -141,6 +145,74 @@ async fn relay_stream(stream: Stream) -> std::io::Result<()> {
         }
         Err(error) => Err(error),
     }
+}
+
+async fn relay_uot_datagrams(mut stream_io: StreamIo) -> std::io::Result<()> {
+    let stream = stream_io.stream();
+    let request = uot_get_request_from_stream(&mut stream_io).await?;
+    let socket = UdpSocket::bind("0.0.0.0:0").await?;
+    if request.mode == UotMode::Connected {
+        socket.connect(request.destination.to_string()).await?;
+    }
+    stream_io.handshake_success().await?;
+    let mut outbound_buf = vec![0u8; 65_535];
+    let (packet_sender, mut packet_receiver) = tokio::sync::mpsc::channel(32);
+    let mode = request.mode;
+    let reader_task = tokio::spawn(async move {
+        loop {
+            let packet = uot_get_packet_from_stream(mode, &mut stream_io).await;
+            let failed = packet.is_err();
+            if packet_sender.send(packet).await.is_err() || failed {
+                break;
+            }
+        }
+    });
+    let result: std::io::Result<()> = async {
+        loop {
+            tokio::select! {
+            packet = packet_receiver.recv() => {
+                let packet = packet.ok_or_else(|| std::io::Error::new(std::io::ErrorKind::BrokenPipe, "UOT reader stopped"))?;
+                let (destination, payload) = match packet {
+                    Ok(packet) => packet,
+                    Err(error) if anytls::session::is_peer_disconnect(&error) => break Ok(()),
+                    Err(error) => break Err(error),
+                };
+                match request.mode {
+                    UotMode::Datagram => {
+                        let destination = destination.ok_or_else(|| std::io::Error::new(std::io::ErrorKind::InvalidData, "UOT datagram has no destination"))?;
+                        socket.send_to(&payload, destination.to_string()).await?;
+                    }
+                    UotMode::Connected => {
+                        socket.send(&payload).await?;
+                    }
+                }
+            }
+            packet = socket.recv_from(&mut outbound_buf) => {
+                let (size, source) = packet?;
+                let source = Address::from(source);
+                let frame = match request.mode {
+                    UotMode::Datagram => uot_encode_packet(UotMode::Datagram, Some(&source), &outbound_buf[..size])?,
+                    UotMode::Connected => uot_encode_packet(UotMode::Connected, None, &outbound_buf[..size])?,
+                };
+                write_stream_all(&stream, &frame).await?;
+            }
+            }
+        }
+    }
+    .await;
+    reader_task.abort();
+    result
+}
+
+async fn write_stream_all(stream: &Stream, mut bytes: &[u8]) -> std::io::Result<()> {
+    while !bytes.is_empty() {
+        let written = stream.write(bytes).await?;
+        if written == 0 {
+            return Err(std::io::Error::new(std::io::ErrorKind::WriteZero, "failed to write UOT stream"));
+        }
+        bytes = &bytes[written..];
+    }
+    Ok(())
 }
 
 async fn read_target(stream: &mut StreamIo) -> std::io::Result<Address> {

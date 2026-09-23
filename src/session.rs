@@ -426,13 +426,13 @@ impl Session {
             match frame.command {
                 Command::Push => {
                     let push_sender = self.streams.lock().await.get(&stream_id).map(|entry| entry.push_sender.clone());
-                    if let Some(push_sender) = push_sender {
-                        if push_sender.send(Some(frame.data)).is_err() {
-                            log::debug!("Push worker closed for session {session_id} stream {stream_id}; closing stream");
-                            if !self.is_closed() {
-                                self.send_fin_before_finish(stream_id).await;
-                                self.finish_stream_by_id(stream_id).await;
-                            }
+                    if let Some(push_sender) = push_sender
+                        && push_sender.send(Some(frame.data)).is_err()
+                    {
+                        log::debug!("Push worker closed for session {session_id} stream {stream_id}; closing stream");
+                        if !self.is_closed() {
+                            self.send_fin_before_finish(stream_id).await;
+                            self.finish_stream_by_id(stream_id).await;
                         }
                     }
                 }

@@ -4,6 +4,7 @@ use anytls::{
     padding::{DEFAULT_SCHEME, PaddingFactory},
     session::BoxTransport,
     stream_io::StreamIo,
+    uot::{UotMode, UotRequest, uot_encode_packet, uot_get_packet_from_stream, uot_sentinel_destination},
 };
 use clap::Parser;
 use rustls::{
@@ -13,11 +14,14 @@ use rustls::{
 };
 use socks5_impl::{
     protocol::{Address, AsyncStreamOperation, Reply},
-    server::{ClientConnection, Server, auth::NoAuth},
+    server::{AssociatedUdpSocket, ClientConnection, Server, UdpAssociate, auth::NoAuth, connection::associate},
 };
-use std::{net::SocketAddr, sync::Arc};
+use std::{
+    net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr},
+    sync::Arc,
+};
 use tokio::io::AsyncWriteExt;
-use tokio::net::TcpStream;
+use tokio::net::{TcpStream, UdpSocket};
 use tokio_rustls::TlsConnector;
 
 #[derive(Parser, Debug)]
@@ -99,9 +103,8 @@ async fn handle_socks5(incoming: socks5_impl::server::IncomingConnection, client
             let _ = bind.shutdown().await;
             return Err(std::io::Error::other(format!("SOCKS5 BIND is unsupported: {target}")));
         }
-        ClientConnection::UdpAssociate(mut associate, _) => {
-            let _ = associate.shutdown().await;
-            return Err(std::io::Error::other("SOCKS5 UDP ASSOCIATE is unsupported"));
+        ClientConnection::UdpAssociate(associate, _) => {
+            return handle_udp_associate(associate, client).await;
         }
     };
     let started = std::time::Instant::now();
@@ -117,6 +120,116 @@ async fn handle_socks5(incoming: socks5_impl::server::IncomingConnection, client
         "SOCKS5 relay to {target} closed: client_to_proxy={client_to_proxy} bytes, proxy_to_client={proxy_to_client} bytes, elapsed={:?}",
         started.elapsed()
     );
+    Ok(())
+}
+
+const MAX_UDP_RELAY_PACKET_SIZE: usize = 65_535;
+
+async fn handle_udp_associate(associate: UdpAssociate<associate::NeedReply>, client: Arc<Client>) -> std::io::Result<()> {
+    let (tcp_local_addr, udp_listener, listen_addr) = match async {
+        let tcp_local_addr = associate.local_addr()?;
+        let udp_listener = UdpSocket::bind(SocketAddr::from((tcp_local_addr.ip(), 0))).await?;
+        let listen_addr = udp_listener.local_addr()?;
+        Ok::<_, std::io::Error>((tcp_local_addr, udp_listener, listen_addr))
+    }
+    .await
+    {
+        Ok(result) => result,
+        Err(error) => {
+            let mut reply = associate.reply(Reply::GeneralFailure, Address::unspecified()).await?;
+            reply.shutdown().await?;
+            return Err(error);
+        }
+    };
+    let mut proxy_reader = match client.create_stream().await {
+        Ok(stream) => StreamIo::new(stream),
+        Err(error) => {
+            let mut reply = associate.reply(Reply::GeneralFailure, Address::unspecified()).await?;
+            reply.shutdown().await?;
+            return Err(error);
+        }
+    };
+    let proxy_stream = proxy_reader.stream();
+
+    let outer_address: Vec<u8> = uot_sentinel_destination().into();
+    let request: Vec<u8> = UotRequest::new(UotMode::Datagram, Address::unspecified()).into();
+    if let Err(error) = write_stream_all(&proxy_stream, &outer_address).await {
+        let _ = proxy_stream.shutdown_write().await;
+        let mut reply = associate.reply(Reply::GeneralFailure, Address::unspecified()).await?;
+        reply.shutdown().await?;
+        return Err(error);
+    }
+    if let Err(error) = write_stream_all(&proxy_stream, &request).await {
+        let _ = proxy_stream.shutdown_write().await;
+        let mut reply = associate.reply(Reply::GeneralFailure, Address::unspecified()).await?;
+        reply.shutdown().await?;
+        return Err(error);
+    }
+
+    let advertised_addr = SocketAddr::new(tcp_local_addr.ip(), listen_addr.port());
+    let mut control = associate.reply(Reply::Succeeded, Address::from(advertised_addr)).await?;
+    let listen_udp = Arc::new(AssociatedUdpSocket::from((udp_listener, MAX_UDP_RELAY_PACKET_SIZE)));
+    let zero_ip = match listen_addr {
+        SocketAddr::V4(_) => IpAddr::V4(Ipv4Addr::UNSPECIFIED),
+        SocketAddr::V6(_) => IpAddr::V6(Ipv6Addr::UNSPECIFIED),
+    };
+    let incoming_addr = Arc::new(tokio::sync::Mutex::new(SocketAddr::from((zero_ip, 0))));
+    let (packet_sender, mut packet_receiver) = tokio::sync::mpsc::channel(32);
+    let reader_task = tokio::spawn(async move {
+        loop {
+            let packet = uot_get_packet_from_stream(UotMode::Datagram, &mut proxy_reader).await;
+            let failed = packet.is_err();
+            if packet_sender.send(packet).await.is_err() || failed {
+                break;
+            }
+        }
+    });
+
+    let result: std::io::Result<()> = async {
+        loop {
+            tokio::select! {
+            packet = listen_udp.recv_from() => {
+                let (payload, fragment, destination, source) = packet?;
+                if fragment != 0 {
+                    break Err(std::io::Error::new(std::io::ErrorKind::InvalidData, "UDP fragmentation is not supported"));
+                }
+                *incoming_addr.lock().await = source;
+                let frame = uot_encode_packet(UotMode::Datagram, Some(&destination), &payload)?;
+                write_stream_all(&proxy_stream, &frame).await?;
+            }
+            packet = packet_receiver.recv() => {
+                let packet = packet.ok_or_else(|| std::io::Error::new(std::io::ErrorKind::BrokenPipe, "UOT reader stopped"))??;
+                let (source, payload) = packet;
+                let incoming = *incoming_addr.lock().await;
+                if incoming.port() == 0 {
+                    continue;
+                }
+                let source = source.ok_or_else(|| std::io::Error::new(std::io::ErrorKind::InvalidData, "UOT response has no source address"))?;
+                listen_udp.send_to(&payload, 0, source, incoming).await?;
+            }
+            closed = control.wait_until_closed() => {
+                closed?;
+                break Ok(());
+            }
+            }
+        }
+    }
+    .await;
+
+    reader_task.abort();
+    let _ = proxy_stream.shutdown_write().await;
+    let _ = control.shutdown().await;
+    result
+}
+
+async fn write_stream_all(stream: &anytls::session::Stream, mut bytes: &[u8]) -> std::io::Result<()> {
+    while !bytes.is_empty() {
+        let written = stream.write(bytes).await?;
+        if written == 0 {
+            return Err(std::io::Error::new(std::io::ErrorKind::WriteZero, "failed to write UOT stream"));
+        }
+        bytes = &bytes[written..];
+    }
     Ok(())
 }
 

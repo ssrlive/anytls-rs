@@ -29,6 +29,10 @@ impl StreamIo {
         }
     }
 
+    pub fn stream(&self) -> Arc<Stream> {
+        Arc::clone(&self.stream)
+    }
+
     pub async fn handshake_success(&mut self) -> std::io::Result<()> {
         self.stream.handshake_success().await
     }
