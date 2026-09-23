@@ -94,7 +94,6 @@ async fn handle_connection(
             }
             Err(error) => return Err(error),
         };
-        let session_id = session_id;
         tokio::spawn(async move {
             let stream_id = stream.id();
             if let Err(error) = relay_stream(stream).await {
@@ -109,11 +108,12 @@ async fn handle_connection(
 }
 
 async fn relay_stream(stream: Stream) -> std::io::Result<()> {
+    let session_id = stream.session_id().unwrap_or_default();
     let stream_id = stream.id();
     let started = std::time::Instant::now();
     let mut stream_io = StreamIo::new(stream);
     let destination = read_target(&mut stream_io).await?;
-    log::debug!("stream {stream_id}: connecting to {destination}");
+    log::debug!("session {session_id} stream {stream_id}: connecting to {destination}");
     let addresses: Vec<SocketAddr> = destination.to_socket_addrs()?.collect();
     let outbound = match TcpStream::connect(&addresses[..]).await {
         Ok(outbound) => outbound,
@@ -130,13 +130,13 @@ async fn relay_stream(stream: Stream) -> std::io::Result<()> {
     match relay_result {
         Ok((stream_to_target, target_to_stream)) => {
             log::info!(
-                "stream {stream_id}: relay to {destination} closed: stream_to_target={stream_to_target} bytes, target_to_stream={target_to_stream} bytes, elapsed={:?}",
+                "session {session_id} stream {stream_id}: relay to {destination} closed: stream_to_target={stream_to_target} bytes, target_to_stream={target_to_stream} bytes, elapsed={:?}",
                 started.elapsed()
             );
             Ok(())
         }
         Err(error) if is_peer_disconnect(&error) => {
-            log::debug!("stream {stream_id}: peer reset/closed relay: {error}");
+            log::debug!("session {session_id} stream {stream_id}: peer reset/closed relay: {error}");
             Ok(())
         }
         Err(error) => Err(error),

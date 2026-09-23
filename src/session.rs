@@ -246,14 +246,15 @@ impl Session {
         }
 
         let session = Arc::clone(self);
+        let session_id = self.id();
         tokio::spawn(async move {
             let result = Arc::clone(&session).receive_loop().await;
             match result {
-                Ok(()) => log::debug!("session {} receive loop stopped", session.session_id),
-                Err(error) => log::warn!("session {} receive loop failed: {error}", session.session_id),
+                Ok(()) => log::debug!("session {session_id} receive loop stopped",),
+                Err(error) => log::warn!("session {session_id} receive loop failed: {error}"),
             }
             let _ = session.shutdown().await;
-            log::info!("session {} shut down", session.session_id);
+            log::info!("session {session_id} shut down");
         });
         Ok(())
     }
@@ -399,6 +400,7 @@ impl Session {
 
     async fn receive_loop(self: Arc<Self>) -> std::io::Result<()> {
         use std::io::{Error, ErrorKind::InvalidData};
+        let session_id = self.id();
         loop {
             let result = tokio::select! {
                 result = async {
@@ -409,7 +411,7 @@ impl Session {
             let frame = match result {
                 Ok(frame) => frame,
                 Err(error) if is_peer_disconnect(&error) => {
-                    log::debug!("session {} peer closed transport: {error}", self.session_id);
+                    log::debug!("session {session_id} peer closed transport: {error}");
                     break Ok(());
                 }
                 Err(error) => break Err(error),
@@ -426,7 +428,7 @@ impl Session {
                     let push_sender = self.streams.lock().await.get(&stream_id).map(|entry| entry.push_sender.clone());
                     if let Some(push_sender) = push_sender {
                         if push_sender.send(Some(frame.data)).is_err() {
-                            log::debug!("Push worker closed for stream {stream_id}; closing stream");
+                            log::debug!("Push worker closed for session {session_id} stream {stream_id}; closing stream");
                             if !self.is_closed() {
                                 self.send_fin_before_finish(stream_id).await;
                                 self.finish_stream_by_id(stream_id).await;
@@ -442,13 +444,13 @@ impl Session {
                     if !frame.data.is_empty() {
                         self.finish_stream_by_id(stream_id).await;
                         let info = String::from_utf8_lossy(&frame.data);
-                        log::warn!("Received SynAck with unexpected data for stream {stream_id}, error: {info}");
+                        log::warn!("Received SynAck with unexpected data for session {session_id} stream {stream_id}, error: {info}");
                     }
                     // TODO: Handle additional SynAck logic if necessary
                 }
                 Command::HeartRequest => {
                     if let Err(error) = self.enqueue_frame(Frame::new(Command::HeartResponse, stream_id), false).await {
-                        log::warn!("Failed to queue heart response: {error}");
+                        log::warn!("Session {session_id}: Failed to queue heart response: {error}");
                     }
                 }
                 Command::HeartResponse => {}
@@ -468,7 +470,7 @@ impl Session {
                     }
                 }
                 Command::Alert => {
-                    log::warn!("Received session alert: {}", String::from_utf8_lossy(&frame.data));
+                    log::warn!("Session {session_id}: Received alert: {}", String::from_utf8_lossy(&frame.data));
                     break Ok(());
                 }
             }
@@ -476,6 +478,7 @@ impl Session {
     }
 
     async fn on_receive_settings(&self, data: &[u8]) -> std::io::Result<()> {
+        let session_id = self.id();
         if self.is_client {
             return Ok(());
         }
@@ -489,7 +492,7 @@ impl Session {
             let mut update = Frame::new(Command::UpdatePaddingScheme, 0);
             update.data = scheme;
             if let Err(error) = self.enqueue_frame(update, false).await {
-                log::warn!("Failed to queue padding scheme update: {error}");
+                log::warn!("Session {session_id}: Failed to queue padding scheme update: {error}");
             }
         }
         if map.get("v").and_then(|value| value.parse::<u8>().ok()).unwrap_or(0) >= 2 {
@@ -497,7 +500,7 @@ impl Session {
             let mut settings = Frame::new(Command::ServerSettings, 0);
             settings.data = b"v=2".to_vec();
             if let Err(error) = self.enqueue_frame(settings, false).await {
-                log::warn!("Failed to queue server settings: {error}");
+                log::warn!("Session {session_id}: Failed to queue server settings: {error}");
             }
         }
         Ok(())
@@ -542,6 +545,7 @@ impl Session {
     }
 
     async fn drop_stream_by_id(self: &Arc<Self>, stream_id: u32) {
+        let session_id = self.id();
         let should_send_fin = {
             let mut streams = self.streams.lock().await;
             match streams.get_mut(&stream_id) {
@@ -553,18 +557,20 @@ impl Session {
             }
         };
         if should_send_fin && let Err(e) = self.write_control(Frame::new(Command::Fin, stream_id)).await {
-            log::warn!("Failed to send FIN for stream {stream_id}: {e}");
+            log::warn!("Session {session_id}: Failed to send FIN for stream {stream_id}: {e}");
         }
         self.finish_stream_by_id(stream_id).await;
     }
 
     async fn send_fin_before_finish(&self, stream_id: u32) {
+        let session_id = self.id();
         if let Err(error) = self.enqueue_frame(Frame::new(Command::Fin, stream_id), false).await {
-            log::warn!("Failed to queue FIN for stream {stream_id}: {error}");
+            log::warn!("Session {session_id}: Failed to queue FIN for stream {stream_id}: {error}");
         }
     }
 
     async fn finish_stream_by_id(self: &Arc<Self>, stream_id: u32) {
+        let session_id = self.id();
         let became_idle = {
             let mut streams = self.streams.lock().await;
             if let Some(entry) = streams.remove(&stream_id) {
@@ -579,7 +585,7 @@ impl Session {
             if let Some(sender) = sender
                 && let Err(e) = sender.send(Arc::clone(self))
             {
-                log::warn!("Failed to send idle session: {e}");
+                log::warn!("Session {session_id}: Failed to send idle session: {e}");
             }
         }
     }
@@ -718,9 +724,12 @@ impl Stream {
         self.closed
     }
 
-    #[cfg(test)]
-    pub(crate) fn session(&self) -> Arc<Session> {
-        self.session.upgrade().expect("session should still be alive")
+    pub fn session_id(&self) -> Option<usize> {
+        self.session().map(|s| s.id())
+    }
+
+    pub(crate) fn session(&self) -> Option<Arc<Session>> {
+        self.session.upgrade()
     }
 
     pub async fn read(&self, data: &mut [u8]) -> std::io::Result<usize> {
