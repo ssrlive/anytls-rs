@@ -1,4 +1,5 @@
 use anytls::{
+    cli::ClientArgs,
     client::{Client, Dialer},
     padding::{DEFAULT_SCHEME, PaddingFactory},
     session::BoxTransport,
@@ -17,8 +18,8 @@ use socks5_impl::{
     server::{AssociatedUdpSocket, ClientConnection, IncomingConnection, UdpAssociate, auth::NoAuth, connection::associate},
 };
 use std::{
-    net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr},
-    path::{Path, PathBuf},
+    net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, ToSocketAddrs},
+    path::Path,
     pin::Pin,
     sync::{Arc, Mutex},
     task::{Context, Poll},
@@ -28,75 +29,21 @@ use tokio::net::{TcpStream, UdpSocket};
 use tokio_rustls::TlsConnector;
 use uuid::Uuid;
 
-#[derive(Parser, serde::Serialize, serde::Deserialize, Debug, Clone)]
-#[command(version, author, name = "anytls-client", about = "AnyTLS rust client")]
-struct Args {
-    /// Local address to listen for incoming SOCKS5 and HTTP connections
-    #[arg(short = 'l', long, value_name = "IP:PORT", default_value = "127.0.0.1:1080")]
-    listen: SocketAddr,
-
-    /// Server address
-    #[arg(short = 's', long, value_name = "IP:PORT")]
-    server: SocketAddr,
-
-    /// Password for anytls server authentication
-    #[serde(skip_serializing_if = "Option::is_none")]
-    #[arg(short = 'p', long)]
-    password: Option<String>,
-
-    /// Client UUID for panel-managed access
-    #[serde(skip_serializing_if = "Option::is_none")]
-    #[arg(long, value_name = "UUID")]
-    client_id: Option<Uuid>,
-
-    /// Root CA certificate PEM file to verify server (optional)
-    #[serde(skip_serializing_if = "Option::is_none")]
-    #[arg(long, value_name = "FILE")]
-    root_cert: Option<PathBuf>,
-
-    /// Allow an insecure TLS connection
-    #[arg(long)]
-    insecure: bool,
-
-    /// Optional TLS server name indication (SNI); defaults to the server IP without sending SNI
-    #[serde(skip_serializing_if = "Option::is_none")]
-    #[arg(long, value_name = "DOMAIN")]
-    sni: Option<String>,
-
-    /// Padding scheme file
-    #[serde(skip_serializing_if = "Option::is_none")]
-    #[arg(long, value_name = "FILE")]
-    padding_scheme: Option<PathBuf>,
-
-    /// Maximum logical streams per AnyTLS session, if it is 1 then multiplexing is disabled
-    #[arg(short = 'm', long, value_name = "N", default_value_t = 16)]
-    #[serde(skip)]
-    max_streams_per_session: usize,
-
-    /// Log level (off, error, warn, info, debug, trace)
-    #[serde(skip, default = "default_log_level")]
-    #[arg(long, value_name = "LEVEL", default_value = "info")]
-    log: log::LevelFilter,
-}
-
-fn default_log_level() -> log::LevelFilter {
-    log::LevelFilter::Info
-}
-
 #[tokio::main]
 async fn main() -> std::io::Result<()> {
     use std::io::{Error, ErrorKind::InvalidInput};
-    let args = Args::parse();
+    let args = ClientArgs::parse().resolve()?;
     let default_log_filter = args.log.as_str().to_ascii_lowercase();
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or(&default_log_filter)).init();
-    let insecure = insecure_tls_enabled(args.root_cert.as_deref(), args.insecure);
+    if args.print_url {
+        println!("{}", args.format_url()?);
+        return Ok(());
+    }
+    let insecure = insecure_tls_enabled(args.root_cert.as_deref(), args.insecure.unwrap_or(false));
     let client_tls_config = tls_config(args.root_cert.as_deref(), insecure)?;
     let listener = tokio::net::TcpListener::bind(args.listen).await?;
-    log::info!(
-        "SOCKS5 + HTTP mixed listener started on {}; AnyTLS server {}",
-        args.listen,
-        args.server
-    );
+    let server = args.server.clone().expect("server is validated by ClientArgs::resolve");
+    log::info!("SOCKS5 + HTTP mixed listener started on {}; AnyTLS server {}", args.listen, server);
     let padding_factory = if let Some(path) = &args.padding_scheme {
         let content = tokio::fs::read(path).await?;
         let factory = PaddingFactory::new(&content)
@@ -110,7 +57,6 @@ async fn main() -> std::io::Result<()> {
     let password = Arc::new(args.password.clone().unwrap_or_default());
     let client_id = args.client_id;
     let sni = Arc::new(args.sni);
-    let server = args.server;
     let dialer_tls_config = Arc::clone(&client_tls_config);
     let dialer_padding = Arc::clone(&padding);
     let dialer: Dialer = Arc::new(move || {
@@ -118,7 +64,8 @@ async fn main() -> std::io::Result<()> {
         let tls_config = Arc::clone(&dialer_tls_config);
         let password = password.clone();
         let sni = sni.clone();
-        Box::pin(async move { dial(server, sni.as_deref(), &password, padding, tls_config, client_id).await })
+        let server = server.clone();
+        Box::pin(async move { dial(&server, sni.as_deref(), &password, padding, tls_config, client_id).await })
     });
     let client = Client::new(
         dialer,
@@ -250,33 +197,8 @@ fn http_methods() -> &'static [&'static [u8]] {
 
 #[cfg(test)]
 mod listener_tests {
-    use super::{Args, could_be_http_request_prefix, insecure_tls_enabled, is_http_request};
-    use clap::Parser;
+    use super::{could_be_http_request_prefix, insecure_tls_enabled, is_http_request};
     use std::path::Path;
-
-    #[test]
-    fn insecure_option_accepts_true_and_false_and_defaults_to_none() {
-        let args = Args::try_parse_from(["anytls-client", "--server", "127.0.0.1:443", "--password", "secret"]).unwrap();
-        assert!(!args.insecure);
-
-        let args = Args::try_parse_from(["anytls-client", "--server", "127.0.0.1:443", "--password", "secret", "--insecure"]).unwrap();
-        assert!(args.insecure);
-    }
-
-    #[test]
-    fn parses_optional_client_uuid() {
-        let args = Args::try_parse_from([
-            "anytls-client",
-            "--server",
-            "127.0.0.1:443",
-            "--password",
-            "secret",
-            "--client-id",
-            "f2d46ca2-8d6d-4c5c-ae77-80c902ce68d7",
-        ])
-        .unwrap();
-        assert_eq!(args.client_id.unwrap().to_string(), "f2d46ca2-8d6d-4c5c-ae77-80c902ce68d7");
-    }
 
     #[test]
     fn root_certificate_forces_secure_tls_even_when_insecure_is_true() {
@@ -348,18 +270,22 @@ impl AsyncWrite for HttpStreamIo {
 }
 
 async fn dial(
-    server: SocketAddr,
+    server: &Address,
     sni: Option<&str>,
     password: &str,
     padding: Arc<tokio::sync::RwLock<PaddingFactory>>,
     tls_config: Arc<ClientConfig>,
     client_id: Option<Uuid>,
 ) -> std::io::Result<BoxTransport> {
-    let tcp = TcpStream::connect(server).await?;
+    let addr = server
+        .to_socket_addrs()?
+        .next()
+        .ok_or(std::io::Error::other("No socket addresses found"))?;
+    let tcp = TcpStream::connect(addr).await?;
     log::info!("connecting to AnyTLS server {server}");
     let name = match sni {
         Some(sni) => ServerName::try_from(sni.to_owned()).map_err(std::io::Error::other)?,
-        None => ServerName::IpAddress(server.ip().into()),
+        None => ServerName::try_from(server.host()).map_err(std::io::Error::other)?,
     };
     let connector = TlsConnector::from(tls_config);
     let mut tls = connector.connect(name, tcp).await?;

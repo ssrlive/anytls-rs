@@ -1,10 +1,12 @@
 use anytls::{
     auth::{AUTH_HEADER_SIZE, PASSWORD_DIGEST_SIZE, extract_client_id_from_padding, password_digest},
+    cli::ServerArgs,
     padding::{DEFAULT_SCHEME, PaddingFactory},
-    panel_sync::{PanelSyncClient, PanelSyncConfig, TrafficAudit, TrafficAuditPtr},
+    panel_sync::{PanelSyncClient, TrafficAudit, TrafficAuditPtr},
     session::{BoxTransport, Session, Stream, is_peer_disconnect},
     stream_io::StreamIo,
     uot::{UotMode, uot_encode_packet, uot_get_packet_from_stream, uot_get_request_from_stream, uot_is_sentinel_destination},
+    url_util,
 };
 use clap::Parser;
 use rustls::{
@@ -14,7 +16,7 @@ use rustls::{
 use socks5_impl::protocol::{Address, AsyncStreamOperation};
 use std::{
     net::{SocketAddr, ToSocketAddrs},
-    path::{Path, PathBuf},
+    path::Path,
     pin::Pin,
     sync::{
         Arc,
@@ -31,104 +33,23 @@ use url::Url;
 use uuid::Uuid;
 use x509_parser::extensions::{GeneralName, ParsedExtension};
 
-#[derive(Parser, serde::Serialize, serde::Deserialize, Debug, Clone)]
-#[command(version, author, name = "anytls-server", about = "AnyTLS rust server")]
-struct Args {
-    /// Server listen port
-    #[arg(short = 'l', long, value_name = "IP:PORT", default_value = "0.0.0.0:8443")]
-    listen: SocketAddr,
-
-    /// Password for anytls server authentication
-    #[serde(skip_serializing_if = "Option::is_none")]
-    #[arg(short = 'p', long)]
-    password: Option<String>,
-
-    /// Padding scheme file
-    #[serde(skip_serializing_if = "Option::is_none")]
-    #[arg(long, value_name = "FILE")]
-    padding_scheme: Option<PathBuf>,
-
-    /// TLS server name indication (SNI)
-    #[serde(skip_serializing_if = "Option::is_none")]
-    #[arg(long, value_name = "SNI")]
-    sni: Option<String>,
-
-    /// Redirect unauthenticated TLS probes to a direct target URL instead of SNI probe fallback; accepts http:// or https:// URLs.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    #[arg(long, value_name = "URL")]
-    forward: Option<Url>,
-
-    /// Maximum logical streams accepted on one authenticated TLS session
-    #[arg(short = 'm', long, value_name = "N", default_value_t = 1024)]
-    max_streams_per_session: usize,
-
-    /// TLS certificate PEM file (optional)
-    #[serde(skip_serializing_if = "Option::is_none")]
-    #[arg(long, value_name = "FILE")]
-    cert: Option<PathBuf>,
-
-    /// TLS private key PEM file (optional)
-    #[serde(skip_serializing_if = "Option::is_none")]
-    #[arg(long, value_name = "FILE")]
-    key: Option<PathBuf>,
-
-    /// Panel webapi base url for sync
-    #[arg(long, value_name = "URL")]
-    #[serde(skip_serializing_if = "Option::is_none")]
-    panel_webapi_url: Option<Url>,
-
-    /// Panel webapi token
-    #[arg(long, value_name = "TOKEN")]
-    #[serde(skip_serializing_if = "Option::is_none")]
-    panel_webapi_token: Option<String>,
-
-    /// Panel node id
-    #[serde(skip_serializing_if = "Option::is_none")]
-    #[arg(long, value_name = "ID")]
-    panel_node_id: Option<usize>,
-
-    /// Panel API update interval seconds
-    #[serde(skip_serializing_if = "Option::is_none")]
-    #[arg(long, value_name = "SECS")]
-    panel_update_interval_secs: Option<u64>,
-
-    /// Log level (off, error, warn, info, debug, trace)
-    #[serde(skip, default = "default_log_level")]
-    #[arg(long, value_name = "LEVEL", default_value = "info")]
-    log: log::LevelFilter,
-}
-
-fn default_log_level() -> log::LevelFilter {
-    log::LevelFilter::Info
-}
-
-impl Args {
-    fn panel_sync_config(&self) -> std::io::Result<Option<PanelSyncConfig>> {
-        let has_required_value = self.panel_webapi_url.is_some() || self.panel_webapi_token.is_some() || self.panel_node_id.is_some();
-        if !has_required_value && self.panel_update_interval_secs.is_none() {
-            return Ok(None);
-        }
-
-        match (&self.panel_webapi_url, &self.panel_webapi_token, self.panel_node_id) {
-            (Some(webapi_url), Some(webapi_token), Some(node_id)) => Ok(Some(PanelSyncConfig {
-                webapi_url: webapi_url.clone(),
-                webapi_token: webapi_token.clone(),
-                node_id,
-                update_interval_secs: self.panel_update_interval_secs.unwrap_or(10).max(5),
-            })),
-            _ => Err(std::io::Error::new(
-                std::io::ErrorKind::InvalidInput,
-                "--panel-webapi-url, --panel-webapi-token, and --panel-node-id must be provided together",
-            )),
-        }
-    }
-}
-
 #[tokio::main]
 async fn main() -> std::io::Result<()> {
-    let args = Args::parse();
+    let args = ServerArgs::parse();
     let log_level = args.log.to_string().to_ascii_lowercase();
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or(log_level)).init();
+    if args.print_args {
+        println!("\n{}\n", url_util::print_args(&args, args.listen.port()).await?);
+        return Ok(());
+    }
+    if args.print_url {
+        let port = args.listen.port();
+        let password = args.password.as_deref().unwrap_or_default();
+        let enable = args.panel_sync_enabled();
+        println!("{}", url_util::print_url(port, password, args.sni.as_deref(), enable).await?);
+        return Ok(());
+    }
+
     let forward_target = validate_forward_url(args.forward.clone())?;
     let (server_tls_config, probe_sni_allowlist) = tls_config(args.sni.as_deref(), args.cert.as_deref(), args.key.as_deref())?;
     let acceptor = TlsAcceptor::from(Arc::new(server_tls_config));
@@ -641,8 +562,7 @@ where
 
 #[cfg(test)]
 mod tls_config_tests {
-    use super::{Args, relay_forward_stream, tls_config, validate_forward_url};
-    use clap::Parser;
+    use super::{relay_forward_stream, tls_config, validate_forward_url};
     use std::path::Path;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::TcpListener;
@@ -655,55 +575,6 @@ mod tls_config_tests {
 
         let key_only = tls_config(None, None, Some(Path::new("private-key.pem"))).unwrap_err();
         assert_eq!(key_only.kind(), std::io::ErrorKind::InvalidInput);
-    }
-
-    #[test]
-    fn panel_sync_requires_all_connection_parameters_and_clamps_interval() {
-        let args = Args::try_parse_from([
-            "anytls-server",
-            "--password",
-            "secret",
-            "--panel-webapi-url",
-            "https://panel.example/api",
-            "--panel-webapi-token",
-            "token",
-            "--panel-node-id",
-            "42",
-            "--panel-update-interval-secs",
-            "2",
-        ])
-        .unwrap();
-        assert_eq!(args.panel_sync_config().unwrap().unwrap().update_interval_secs, 5);
-
-        let incomplete = Args::try_parse_from([
-            "anytls-server",
-            "--password",
-            "secret",
-            "--panel-webapi-url",
-            "https://panel.example/api",
-        ])
-        .unwrap();
-        assert_eq!(incomplete.panel_sync_config().unwrap_err().kind(), std::io::ErrorKind::InvalidInput);
-    }
-
-    #[test]
-    fn parses_padding_sni_and_forward_options() {
-        let args = Args::try_parse_from([
-            "anytls-server",
-            "--password",
-            "secret",
-            "--padding-scheme",
-            "scheme.json",
-            "--sni",
-            "probe.example.com",
-            "--forward",
-            "https://target.example.com:8443/path",
-        ])
-        .unwrap();
-
-        assert_eq!(args.padding_scheme.as_deref(), Some(Path::new("scheme.json")));
-        assert_eq!(args.sni.as_deref(), Some("probe.example.com"));
-        assert_eq!(args.forward.unwrap().as_str(), "https://target.example.com:8443/path");
     }
 
     #[test]
