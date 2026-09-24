@@ -3,19 +3,13 @@ use std::{
     sync::{Arc, Weak},
 };
 use tokio::{
-    io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt},
+    io::{AsyncReadExt, AsyncWriteExt},
     sync::{Mutex, RwLock, mpsc, oneshot},
     time::Duration,
 };
 use tokio_util::sync::CancellationToken;
 
-use crate::{
-    frame::{Command, Frame},
-    padding::PaddingFactory,
-    string_map,
-};
-
-pub type BoxTransport = Box<dyn AsyncReadWrite>;
+use crate::{CHECK_MARK, Command, Frame, HEADER_OVERHEAD_SIZE, PaddingFactory, from_bytes, runtime::BoxTransport, to_bytes};
 
 pub fn is_peer_disconnect(error: &std::io::Error) -> bool {
     matches!(
@@ -27,9 +21,6 @@ pub fn is_peer_disconnect(error: &std::io::Error) -> bool {
             | std::io::ErrorKind::NotConnected
     )
 }
-
-pub trait AsyncReadWrite: AsyncRead + AsyncWrite + Unpin + Send {}
-impl<T: AsyncRead + AsyncWrite + Unpin + Send> AsyncReadWrite for T {}
 
 struct Writer {
     transport: tokio::io::WriteHalf<BoxTransport>,
@@ -241,7 +232,7 @@ impl Session {
             settings.insert("padding-md5".to_owned(), padding.md5.clone());
             drop(padding);
             let mut frame = Frame::new(Command::Settings, 0);
-            frame.data = string_map::to_bytes(&settings);
+            frame.data = to_bytes(&settings);
             self.write_control(frame).await?;
         }
 
@@ -455,7 +446,7 @@ impl Session {
                 }
                 Command::HeartResponse => {}
                 Command::ServerSettings => {
-                    let map = string_map::from_bytes(&frame.data);
+                    let map = from_bytes(&frame.data);
                     if self.is_client
                         && let Some(version) = map.get("v").and_then(|value| value.parse().ok())
                     {
@@ -483,7 +474,7 @@ impl Session {
             return Ok(());
         }
         self.received_settings.store(true, std::sync::atomic::Ordering::Release);
-        let map = string_map::from_bytes(data);
+        let map = from_bytes(data);
         let update_scheme = {
             let padding = self.padding.read().await;
             (map.get("padding-md5") != Some(&padding.md5)).then(|| padding.raw_scheme().to_vec())
@@ -655,7 +646,7 @@ impl Writer {
             let factory = padding.read().await;
             if packet_counter < factory.stop {
                 for size in factory.generate_record_payload_sizes(packet_counter) {
-                    if size == crate::padding::CHECK_MARK {
+                    if size == CHECK_MARK {
                         if bytes.is_empty() {
                             break;
                         }
@@ -666,11 +657,11 @@ impl Writer {
                         self.transport.write_all(&bytes[..size]).await?;
                         bytes.drain(..size);
                     } else if !bytes.is_empty() {
-                        let padding_len = size.saturating_sub(bytes.len() + crate::frame::HEADER_OVERHEAD_SIZE);
+                        let padding_len = size.saturating_sub(bytes.len() + HEADER_OVERHEAD_SIZE);
                         if padding_len > 0 {
                             let mut waste = Frame::new(Command::Waste, 0).encode()?;
                             waste[5..7].copy_from_slice(&(padding_len as u16).to_be_bytes());
-                            waste.resize(crate::frame::HEADER_OVERHEAD_SIZE + padding_len, 0);
+                            waste.resize(HEADER_OVERHEAD_SIZE + padding_len, 0);
                             bytes.extend_from_slice(&waste);
                         }
                         self.transport.write_all(&bytes).await?;
@@ -678,7 +669,7 @@ impl Writer {
                     } else {
                         let mut waste = Frame::new(Command::Waste, 0).encode()?;
                         waste[5..7].copy_from_slice(&(size as u16).to_be_bytes());
-                        waste.resize(crate::frame::HEADER_OVERHEAD_SIZE + size, 0);
+                        waste.resize(HEADER_OVERHEAD_SIZE + size, 0);
                         self.transport.write_all(&waste).await?;
                     }
                 }
@@ -812,7 +803,7 @@ impl Drop for Stream {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::padding::DEFAULT_SCHEME;
+    use crate::DEFAULT_SCHEME;
 
     #[test]
     fn classifies_peer_disconnect_errors() {

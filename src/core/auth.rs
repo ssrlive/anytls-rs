@@ -1,7 +1,7 @@
 use sha2::{Digest, Sha256};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
-use crate::padding::PaddingFactory;
+use crate::PaddingFactory;
 use uuid::Uuid;
 
 pub const PASSWORD_DIGEST_SIZE: usize = 32;
@@ -68,7 +68,7 @@ pub fn extract_client_id_from_padding(padding: &[u8]) -> Option<Uuid> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::padding::DEFAULT_SCHEME;
+    use crate::DEFAULT_SCHEME;
     use tokio::io::BufReader;
 
     #[tokio::test]

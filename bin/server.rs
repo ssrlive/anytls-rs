@@ -1,12 +1,7 @@
 use anytls::{
-    auth::{AUTH_HEADER_SIZE, PASSWORD_DIGEST_SIZE, extract_client_id_from_padding, password_digest},
-    cli::ServerArgs,
-    padding::{DEFAULT_SCHEME, PaddingFactory},
-    panel_sync::{PanelSyncClient, TrafficAudit, TrafficAuditPtr},
-    session::{BoxTransport, Session, Stream, is_peer_disconnect},
-    stream_io::StreamIo,
-    uot::{UotMode, uot_encode_packet, uot_get_packet_from_stream, uot_get_request_from_stream, uot_is_sentinel_destination},
-    url_util,
+    AUTH_HEADER_SIZE, BoxTransport, DEFAULT_SCHEME, PASSWORD_DIGEST_SIZE, PaddingFactory, PanelSyncClient, ServerArgs, Session, Stream,
+    StreamIo, TrafficAudit, TrafficAuditPtr, UotMode, extract_client_id_from_padding, is_peer_disconnect, password_digest, print_args,
+    print_url, uot_encode_packet, uot_get_packet_from_stream, uot_get_request_from_stream, uot_is_sentinel_destination,
 };
 use clap::Parser;
 use rustls::{
@@ -39,14 +34,14 @@ async fn main() -> std::io::Result<()> {
     let log_level = args.log.to_string().to_ascii_lowercase();
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or(log_level)).init();
     if args.print_args {
-        println!("\n{}\n", url_util::print_args(&args, args.listen.port()).await?);
+        println!("\n{}\n", print_args(&args, args.listen.port()).await?);
         return Ok(());
     }
     if args.print_url {
         let port = args.listen.port();
         let password = args.password.as_deref().unwrap_or_default();
         let enable = args.panel_sync_enabled();
-        println!("{}", url_util::print_url(port, password, args.sni.as_deref(), enable).await?);
+        println!("{}", print_url(port, password, args.sni.as_deref(), enable).await?);
         return Ok(());
     }
 
@@ -333,7 +328,7 @@ async fn relay_uot_datagrams(mut stream_io: StreamIo, traffic_audit: TrafficAudi
                 let packet = packet.ok_or_else(|| std::io::Error::new(std::io::ErrorKind::BrokenPipe, "UOT reader stopped"))?;
                 let (destination, payload) = match packet {
                     Ok(packet) => packet,
-                    Err(error) if anytls::session::is_peer_disconnect(&error) => break Ok(()),
+                    Err(error) if is_peer_disconnect(&error) => break Ok(()),
                     Err(error) => break Err(error),
                 };
                 match request.mode {

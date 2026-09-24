@@ -1,10 +1,6 @@
 use anytls::{
-    cli::ClientArgs,
-    client::{Client, Dialer},
-    padding::{DEFAULT_SCHEME, PaddingFactory},
-    session::BoxTransport,
-    stream_io::StreamIo,
-    uot::{UotMode, UotRequest, uot_encode_packet, uot_get_packet_from_stream, uot_sentinel_destination},
+    BoxTransport, Client, ClientArgs, DEFAULT_SCHEME, Dialer, PaddingFactory, Stream, StreamIo, UotMode, UotRequest, uot_encode_packet,
+    uot_get_packet_from_stream, uot_sentinel_destination, write_auth_with_client_id,
 };
 use clap::Parser;
 use rustls::{
@@ -291,7 +287,7 @@ async fn dial(
     let mut tls = connector.connect(name, tcp).await?;
     log::info!("TLS connection to AnyTLS server {server} established");
     let padding = padding.read().await;
-    anytls::auth::write_auth_with_client_id(&mut tls, password, &padding, client_id).await?;
+    write_auth_with_client_id(&mut tls, password, &padding, client_id).await?;
     log::info!("AnyTLS authentication to {server} completed");
     Ok(Box::new(tls))
 }
@@ -424,7 +420,7 @@ async fn handle_udp_associate(associate: UdpAssociate<associate::NeedReply>, cli
     result
 }
 
-async fn write_stream_all(stream: &anytls::session::Stream, mut bytes: &[u8]) -> std::io::Result<()> {
+async fn write_stream_all(stream: &Stream, mut bytes: &[u8]) -> std::io::Result<()> {
     while !bytes.is_empty() {
         let written = stream.write(bytes).await?;
         if written == 0 {

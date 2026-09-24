@@ -1,6 +1,8 @@
 use md5::{Digest, Md5};
 use rand::RngExt;
 
+use super::string_map::{self, StringMap};
+
 pub const CHECK_MARK: i32 = -1;
 pub const DEFAULT_SCHEME: &[u8] = b"stop=8\n0=30-30\n1=100-400\n2=400-500,c,500-1000,c,500-1000,c,500-1000,c,500-1000\n3=9-9,500-1000\n4=500-1000\n5=500-1000\n6=500-1000\n7=500-1000";
 
@@ -9,12 +11,12 @@ pub struct PaddingFactory {
     raw_scheme: Vec<u8>,
     pub stop: u32,
     pub md5: String,
-    scheme: crate::string_map::StringMap,
+    scheme: StringMap,
 }
 
 impl PaddingFactory {
     pub fn new(raw_scheme: &[u8]) -> Option<Self> {
-        let scheme = crate::string_map::from_bytes(raw_scheme);
+        let scheme = string_map::from_bytes(raw_scheme);
         let stop = scheme.get("stop")?.parse().ok()?;
         let mut digest = Md5::new();
         digest.update(raw_scheme);

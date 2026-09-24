@@ -7,10 +7,7 @@ use std::{
 
 use tokio::sync::{Mutex, RwLock, mpsc};
 
-use crate::{
-    padding::PaddingFactory,
-    session::{BoxTransport, Session, Stream},
-};
+use crate::{PaddingFactory, Session, Stream, runtime::BoxTransport};
 
 const MAX_IDLE_SESSIONS: usize = 2;
 
@@ -171,7 +168,7 @@ impl Client {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::padding::DEFAULT_SCHEME;
+    use crate::DEFAULT_SCHEME;
     use std::sync::atomic::Ordering;
 
     #[tokio::test]

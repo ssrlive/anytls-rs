@@ -7,7 +7,7 @@ use std::{
 
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 
-use crate::session::Stream;
+use crate::Stream;
 
 pub struct StreamIo {
     stream: Arc<Stream>,
@@ -114,16 +114,14 @@ impl AsyncWrite for StreamIo {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{padding::PaddingFactory, session::Session};
+    use crate::{DEFAULT_SCHEME, PaddingFactory, Session};
     use std::time::Duration;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
     #[tokio::test]
     async fn shutdown_sends_fin_and_peer_observes_eof() {
         let (client_io, server_io) = tokio::io::duplex(128 * 1024);
-        let padding = Arc::new(tokio::sync::RwLock::new(
-            PaddingFactory::new(crate::padding::DEFAULT_SCHEME).unwrap(),
-        ));
+        let padding = Arc::new(tokio::sync::RwLock::new(PaddingFactory::new(DEFAULT_SCHEME).unwrap()));
         let client = Session::new_client(1, Box::new(client_io), Arc::clone(&padding), 1);
         let server = Session::new_server(1, Box::new(server_io), padding, 1);
         client.run().await.unwrap();

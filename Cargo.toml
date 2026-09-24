@@ -6,45 +6,98 @@ edition = "2024"
 [[bin]]
 name = "anytls-server"
 path = "bin/server.rs"
+required-features = ["server"]
 
 [[bin]]
 name = "anytls-client"
 path = "bin/client.rs"
+required-features = ["client_runner"]
+
+[features]
+default = ["client_runner", "server"]
+core = [
+    "dep:md-5",
+    "dep:rand",
+    "dep:sha2",
+    "dep:tokio",
+    "dep:uuid",
+    "tokio/io-util",
+    "tokio/macros",
+    "tokio/rt",
+]
+runtime = ["core", "dep:log", "dep:tokio-util", "tokio/sync", "tokio/time"]
+uot = ["core", "dep:bytes", "dep:socks5-impl"]
+client_runner = ["client"]
+client = [
+    "runtime",
+    "uot",
+    "dep:clap",
+    "dep:env_logger",
+    "dep:percent-encoding",
+    "dep:rustls",
+    "dep:rustls-native-certs",
+    "dep:rustls-pemfile",
+    "dep:serde",
+    "dep:socks-hub",
+    "dep:tokio-rustls",
+    "dep:url",
+    "tokio/fs",
+    "tokio/net",
+    "tokio/rt-multi-thread",
+    "socks-hub/httpproxy",
+]
+server = [
+    "runtime",
+    "uot",
+    "dep:clap",
+    "dep:env_logger",
+    "dep:percent-encoding",
+    "dep:rcgen",
+    "dep:reqwest",
+    "dep:rustls",
+    "dep:rustls-native-certs",
+    "dep:rustls-pemfile",
+    "dep:serde",
+    "dep:serde_json",
+    "dep:tokio-rustls",
+    "dep:url",
+    "dep:x509-parser",
+    "tokio/fs",
+    "tokio/net",
+    "tokio/rt-multi-thread",
+    "socks5-impl/client",
+]
 
 [dependencies]
-bytes = "1.12.1"
-clap = { version = "4.6.7", features = ["derive", "wrap_help"] }
-env_logger = "0.11.11"
-log = { version = "0.4.34", features = ["serde"] }
-md-5 = "0.11.0"
-percent-encoding = "2.3.2"
-rand = "0.10.3"
-rcgen = "0.14.10"
+bytes = { version = "1.12.1", optional = true }
+clap = { version = "4.6.7", features = [
+    "derive",
+    "wrap_help",
+], optional = true }
+env_logger = { version = "0.11.11", optional = true }
+log = { version = "0.4.34", features = ["serde"], optional = true }
+md-5 = { version = "0.11.0", optional = true }
+percent-encoding = { version = "2.3.2", optional = true }
+rand = { version = "0.10.3", optional = true }
+rcgen = { version = "0.14.10", optional = true }
 reqwest = { version = "0.13.5", default-features = false, features = [
     "json",
     "rustls",
-] }
-rustls = "0.23.45"
-rustls-native-certs = "0.8.4"
-rustls-pemfile = "2.2.0"
-serde = { version = "1.0.229", features = ["derive"] }
-serde_json = "1.0.151"
-sha2 = "0.11.0"
-socks-hub = { version = "0.2.9", default-features = false, features = [
-    "httpproxy",
-] }
-socks5-impl = { version = "0.9.6", features = ["server", "serde"] }
-tokio = { version = "1.53.1", features = [
-    "fs",
-    "io-util",
-    "macros",
-    "net",
-    "rt-multi-thread",
-    "sync",
-    "time",
-] }
-tokio-rustls = "0.26.5"
-tokio-util = { version = "0.7.19", features = ["rt"] }
-url = { version = "2.5.8", features = ["serde"] }
-uuid = { version = "1.26.1", features = ["serde"] }
-x509-parser = "0.18.1"
+], optional = true }
+rustls = { version = "0.23.45", optional = true }
+rustls-native-certs = { version = "0.8.4", optional = true }
+rustls-pemfile = { version = "2.2.0", optional = true }
+serde = { version = "1.0.229", features = ["derive"], optional = true }
+serde_json = { version = "1.0.151", optional = true }
+sha2 = { version = "0.11.0", optional = true }
+socks-hub = { version = "0.2.9", default-features = false, optional = true }
+socks5-impl = { version = "0.9.6", features = [
+    "server",
+    "serde",
+], optional = true }
+tokio = { version = "1.53.1", default-features = false, optional = true }
+tokio-rustls = { version = "0.26.5", optional = true }
+tokio-util = { version = "0.7.19", features = ["rt"], optional = true }
+url = { version = "2.5.8", features = ["serde"], optional = true }
+uuid = { version = "1.26.1", features = ["serde"], optional = true }
+x509-parser = { version = "0.18.1", optional = true }
