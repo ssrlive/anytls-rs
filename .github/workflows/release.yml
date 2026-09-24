@@ -1,0 +1,195 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*.*.*"
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Version to release (e.g., v0.1.0). This will create a new tag."
+        required: true
+        type: string
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build:
+    name: Build ${{ matrix.target }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+          - os: ubuntu-latest
+            target: aarch64-unknown-linux-gnu
+            use_cross: true
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-musl
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+          - os: windows-latest
+            target: aarch64-pc-windows-msvc
+          - os: windows-latest
+            target: x86_64-win7-windows-msvc
+          - os: windows-latest
+            target: i686-win7-windows-msvc
+          - os: macos-latest
+            target: x86_64-apple-darwin
+          - os: macos-latest
+            target: aarch64-apple-darwin
+
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Install musl toolchain (for musl targets)
+        if: matrix.os == 'ubuntu-latest' && contains(matrix.target, 'musl')
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y musl-tools gcc-multilib
+        shell: bash
+
+      - name: Install cross
+        if: matrix.use_cross
+        run: cargo install cross
+
+      - name: Build
+        if: ${{ !cancelled() }}
+        run: |
+          if [[ "${{ matrix.target }}" == "x86_64-win7-windows-msvc" || "${{ matrix.target }}" == "i686-win7-windows-msvc" ]]; then
+            rustup toolchain install nightly
+            rustup component add rust-src --toolchain nightly
+            cargo +nightly build --release -Z build-std --target ${{ matrix.target }}
+          else
+            rustup target add ${{ matrix.target }}
+            if [ "${{ matrix.use_cross }}" = "true" ]; then
+              cross build --release --target ${{ matrix.target }}
+            else
+              cargo build --release --target ${{ matrix.target }}
+            fi
+          fi
+        shell: bash
+
+      - name: Package binaries
+        if: ${{ !cancelled() }}
+        run: |
+          mkdir -p dist
+          if [ "${{ matrix.os }}" = "windows-latest" ]; then
+            cp target/${{ matrix.target }}/release/anytls-client.exe dist/anytls-client.exe
+            cp target/${{ matrix.target }}/release/anytls-server.exe dist/anytls-server.exe
+            cd dist && 7z a -tzip ../anytls-${{ matrix.target }}.zip *
+          else
+            cp target/${{ matrix.target }}/release/anytls-client dist/
+            cp target/${{ matrix.target }}/release/anytls-server dist/
+            cd dist && zip -j ../anytls-${{ matrix.target }}.zip *
+          fi
+        shell: bash
+
+      - name: Upload artifacts
+        if: ${{ !cancelled() }}
+        uses: actions/upload-artifact@v7
+        with:
+          name: anytls-${{ matrix.target }}
+          path: |
+            *.zip
+
+  release:
+    name: Create Release
+    needs: build
+    if: ${{ always() }}
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    strategy:
+      fail-fast: false
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+
+      - name: Configure Git User
+        run: |
+          git config user.name "GitHub Actions Bot"
+          git config user.email "actions@github.com"
+
+      - name: Create and Push Tag (Manual Dispatch)
+        if: github.event_name == 'workflow_dispatch'
+        run: |
+          echo "Creating and pushing tag ${{ github.event.inputs.version }}"
+          git tag ${{ github.event.inputs.version }}
+          git push origin ${{ github.event.inputs.version }}
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Download artifacts
+        uses: actions/download-artifact@v8
+        with:
+          path: artifacts
+
+      - name: Set Release Version
+        id: set_version
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            echo "version=${{ github.event.inputs.version }}" >> $GITHUB_OUTPUT
+          else
+            echo "version=${{ github.ref_name }}" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Check for existing release
+        id: check_release
+        run: |
+          echo "Checking if release ${{ steps.set_version.outputs.version }} exists..."
+          status=$(curl -s -o /dev/null -w "%{http_code}" -H "Authorization: token $GITHUB_TOKEN" -H "Accept: application/vnd.github.v3+json" https://api.github.com/repos/${{ github.repository }}/releases/tags/${{ steps.set_version.outputs.version }})
+          if [ "$status" = "200" ]; then
+            echo "exists=true" >> $GITHUB_OUTPUT
+          else
+            echo "exists=false" >> $GITHUB_OUTPUT
+          fi
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Create Release
+        if: steps.check_release.outputs.exists == 'false'
+        id: create_release
+        uses: actions/create-release@v1
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          tag_name: ${{ steps.set_version.outputs.version }}
+          release_name: Release ${{ steps.set_version.outputs.version }}
+          draft: false
+          prerelease: false
+
+      - name: Upload Release Assets
+        run: |
+          version=${{ steps.set_version.outputs.version }}
+
+          # Retrieve existing asset names for the release
+          existing_assets=$(gh api -H "Accept: application/vnd.github.v3+json" /repos/${{ github.repository }}/releases/tags/${version} --jq '.assets[].name' 2>/dev/null || true)
+
+          for artifact_dir in artifacts/*; do
+            if [ -d "$artifact_dir" ]; then
+              for file_in_artifact_dir in "$artifact_dir"/*; do
+                if [ -f "$file_in_artifact_dir" ]; then
+                  asset_filename=$(basename "$file_in_artifact_dir")
+                  echo "Considering $asset_filename for upload to release ${version}"
+                  if echo "$existing_assets" | grep -Fqx "$asset_filename"; then
+                    echo "Asset $asset_filename already exists on release ${version}; skipping upload"
+                  else
+                    echo "Uploading $asset_filename from $file_in_artifact_dir to release ${version}"
+                    gh release upload "${version}" "$file_in_artifact_dir"
+                  fi
+                fi
+              done
+            fi
+          done
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

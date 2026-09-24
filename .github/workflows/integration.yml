@@ -1,0 +1,64 @@
+name: Integration Tests
+
+on:
+  push:
+    branches:
+      - "**"
+    tags-ignore: ["*"]
+  pull_request:
+    branches:
+      - "**"
+  workflow_dispatch:
+
+jobs:
+  integration:
+    strategy:
+      fail-fast: false
+
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Setup Python
+        uses: actions/setup-python@v7
+        with:
+          python-version: "3.x"
+
+      - name: Build binaries
+        run: |
+          cargo build --workspace --bins --verbose
+
+      - name: Ensure tools
+        run: |
+          sudo apt-get update -y
+          sudo apt-get install -y curl openssl
+
+      - name: Run smoke test (Python)
+        if: ${{ !cancelled() }}
+        env:
+          SMOKE_KEEP_PROCS: "1"
+          SMOKE_LOG: "debug"
+        run: |
+          python scripts/gen_cert.py
+          python scripts/smoke_test.py
+
+      - name: Run UOT repro (Python)
+        if: ${{ !cancelled() }}
+        run: |
+          python scripts/repro_uot_local.py
+
+      - name: Upload artifacts
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: integration-logs
+          path: |
+            scripts/server.log
+            scripts/s_client.out
+            scripts/integration_client.out
+            target/uot-local-py/**

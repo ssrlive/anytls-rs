@@ -1,0 +1,73 @@
+name: Publish FreeBSD
+
+on:
+  push:
+    tags:
+      - "v*.*.*"
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}-${{ github.event_name }}
+  cancel-in-progress: true
+
+jobs:
+  Publish_FreeBSD:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        toolchain: ["stable"] # ["nightly", "beta", "stable"] #
+    steps:
+      - uses: actions/checkout@v6
+      - name: Build in FreeBSD
+        id: test
+        uses: vmactions/freebsd-vm@v1
+        with:
+          usesh: true
+          sync: rsync
+          copyback: true
+          prepare: |
+            pkg install -y curl pkgconf glib git
+            curl --proto '=https' --tlsv1.2 https://sh.rustup.rs -sSf > install.sh
+            chmod +x install.sh
+            ./install.sh -y --default-toolchain ${{ matrix.toolchain }}
+          run: |
+            . "$HOME/.cargo/env"
+            set -ex
+
+            # Add feature "nightly" if toolchain is nightly
+            if [ "${{ matrix.toolchain }}" = "nightly" ]; then
+                ARGS="$ARGS --features nightly"
+            fi
+
+            RUST_BACKTRACE=1 cargo +${{ matrix.toolchain }} fmt --all -- --check
+            RUST_BACKTRACE=1 cargo +${{ matrix.toolchain }} clippy --all-features --release -- -D warnings
+            RUST_BACKTRACE=1 cargo +${{ matrix.toolchain }} build --all-features --release
+
+      - name: Archive
+        run: |
+          mkdir -p pubdir
+          zip -j pubdir/anytls-x86_64-unknown-freebsd.zip ./target/release/anytls-client ./target/release/anytls-server
+
+      - name: Ensure Release exists and upload FreeBSD assets
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          TAG=${GITHUB_REF#refs/tags/}
+
+          # Create release if it does not exist
+          if ! gh api repos/${GITHUB_REPOSITORY}/releases/tags/$TAG >/dev/null 2>&1; then
+            gh release create "$TAG" --title "$TAG" --notes "Automated FreeBSD build for $TAG"
+          fi
+
+          # Get existing asset names
+          existing=$(gh api repos/${GITHUB_REPOSITORY}/releases/tags/$TAG --jq '.assets[].name' || true)
+
+          # Upload only missing files
+          for f in pubdir/*; do
+            name=$(basename "$f")
+            if echo "$existing" | grep -Fxq "$name"; then
+              echo "Skipping existing asset $name"
+            else
+              gh release upload "$TAG" "$f"
+            fi
+          done
