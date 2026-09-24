@@ -1,7 +1,13 @@
 [package]
 name = "anytls"
-version = "0.1.0"
+version = "0.4.0"
 edition = "2024"
+authors = ["@ssrlive"]
+description = "A proxy protocol that attempts to mitigate the TLS in TLS fingerprinting problem"
+license = "MIT"
+repository = "https://github.com/ssrlive/anytls-rs"
+keywords = ["proxy", "tls", "privacy", "networking"]
+categories = ["network-programming", "command-line-utilities"]
 
 [[bin]]
 name = "anytls-server"
