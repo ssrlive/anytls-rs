@@ -60,7 +60,7 @@ pub async fn read_auth_with_client_id<R: AsyncRead + Unpin>(reader: &mut R, pass
     Ok(extract_client_id_from_padding(&padding))
 }
 
-fn extract_client_id_from_padding(padding: &[u8]) -> Option<Uuid> {
+pub fn extract_client_id_from_padding(padding: &[u8]) -> Option<Uuid> {
     let candidate = std::str::from_utf8(padding.get(..36)?).ok()?.trim_end_matches('\0').trim();
     Uuid::parse_str(candidate).ok()
 }

@@ -1,4 +1,5 @@
 use anytls::{
+    auth::{AUTH_HEADER_SIZE, PASSWORD_DIGEST_SIZE, extract_client_id_from_padding, password_digest},
     padding::{DEFAULT_SCHEME, PaddingFactory},
     panel_sync::{PanelSyncClient, PanelSyncConfig, TrafficAudit, TrafficAuditPtr},
     session::{BoxTransport, Session, Stream, is_peer_disconnect},
@@ -7,13 +8,13 @@ use anytls::{
 };
 use clap::Parser;
 use rustls::{
-    ServerConfig,
+    ClientConfig, RootCertStore, ServerConfig,
     pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer},
 };
 use socks5_impl::protocol::{Address, AsyncStreamOperation};
 use std::{
     net::{SocketAddr, ToSocketAddrs},
-    path::PathBuf,
+    path::{Path, PathBuf},
     pin::Pin,
     sync::{
         Arc,
@@ -21,12 +22,14 @@ use std::{
     },
     task::{Context, Poll},
 };
-use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt, ReadBuf};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadBuf};
 use tokio::net::{TcpListener, TcpStream, UdpSocket};
 use tokio::time::Duration;
 use tokio_rustls::TlsAcceptor;
+use tokio_rustls::client::TlsConnector;
 use url::Url;
 use uuid::Uuid;
+use x509_parser::extensions::{GeneralName, ParsedExtension};
 
 #[derive(Parser, serde::Serialize, serde::Deserialize, Debug, Clone)]
 #[command(version, author, name = "anytls-server", about = "AnyTLS rust server")]
@@ -39,6 +42,21 @@ struct Args {
     #[serde(skip_serializing_if = "Option::is_none")]
     #[arg(short = 'p', long)]
     password: Option<String>,
+
+    /// Padding scheme file
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[arg(long, value_name = "FILE")]
+    padding_scheme: Option<PathBuf>,
+
+    /// TLS server name indication (SNI)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[arg(long, value_name = "SNI")]
+    sni: Option<String>,
+
+    /// Redirect unauthenticated TLS probes to a direct target URL instead of SNI probe fallback; accepts http:// or https:// URLs.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[arg(long, value_name = "URL")]
+    forward: Option<Url>,
 
     /// Maximum logical streams accepted on one authenticated TLS session
     #[arg(short = 'm', long, value_name = "N", default_value_t = 1024)]
@@ -111,7 +129,10 @@ async fn main() -> std::io::Result<()> {
     let args = Args::parse();
     let log_level = args.log.to_string().to_ascii_lowercase();
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or(log_level)).init();
-    let acceptor = TlsAcceptor::from(Arc::new(tls_config(args.cert.as_deref(), args.key.as_deref())?));
+    let forward_target = validate_forward_url(args.forward.clone())?;
+    let (server_tls_config, probe_sni_allowlist) = tls_config(args.sni.as_deref(), args.cert.as_deref(), args.key.as_deref())?;
+    let acceptor = TlsAcceptor::from(Arc::new(server_tls_config));
+    let probe_sni_allowlist = Arc::new(probe_sni_allowlist);
     let panel_config = args.panel_sync_config()?;
     let panel_sync_enabled = panel_config.is_some();
     let traffic_audit: TrafficAuditPtr = Arc::new(tokio::sync::Mutex::new(TrafficAudit::new()));
@@ -121,11 +142,17 @@ async fn main() -> std::io::Result<()> {
         let audit = Arc::clone(&traffic_audit);
         tokio::spawn(async move { panel_client.run(audit).await });
     }
+    let padding_factory = if let Some(path) = &args.padding_scheme {
+        let content = tokio::fs::read(path).await?;
+        use std::io::{Error, ErrorKind::InvalidInput};
+        PaddingFactory::new(&content)
+            .ok_or_else(|| Error::new(InvalidInput, format!("Wrong format padding scheme file: {}", path.display())))?
+    } else {
+        PaddingFactory::new(DEFAULT_SCHEME).expect("default scheme is valid")
+    };
     let listener = TcpListener::bind(args.listen).await?;
     log::info!("AnyTLS server listening on {}", args.listen);
-    let padding = Arc::new(tokio::sync::RwLock::new(
-        PaddingFactory::new(DEFAULT_SCHEME).expect("default padding"),
-    ));
+    let padding = Arc::new(tokio::sync::RwLock::new(padding_factory));
     let password = Arc::new(args.password.clone().unwrap_or_default());
     let mut session_id = 0usize;
     let mut last_emfile_warning = tokio::time::Instant::now() - Duration::from_secs(5);
@@ -148,6 +175,8 @@ async fn main() -> std::io::Result<()> {
         let password = password.clone();
         let max_streams = args.max_streams_per_session;
         let traffic_audit = Arc::clone(&traffic_audit);
+        let probe_sni_allowlist = Arc::clone(&probe_sni_allowlist);
+        let forward_target = forward_target.clone();
         tokio::spawn(async move {
             log::info!("accepted TLS session {session_id} from {peer}");
             if let Err(error) = handle_connection(
@@ -159,6 +188,8 @@ async fn main() -> std::io::Result<()> {
                 max_streams,
                 traffic_audit,
                 panel_sync_enabled,
+                probe_sni_allowlist,
+                forward_target,
             )
             .await
             {
@@ -180,9 +211,43 @@ async fn handle_connection(
     max_streams: usize,
     traffic_audit: TrafficAuditPtr,
     panel_sync_enabled: bool,
+    probe_sni_allowlist: Arc<Vec<String>>,
+    forward_target: Option<Url>,
 ) -> std::io::Result<()> {
     let mut tls = acceptor.accept(tcp).await?;
-    let client_id = anytls::auth::read_auth_with_client_id(&mut tls, &password).await?;
+    let client_addr = tls.get_ref().0.peer_addr()?;
+    let probe_target = tls.get_ref().1.server_name().map(str::to_owned);
+    let mut auth_data = [0u8; AUTH_HEADER_SIZE];
+    let mut auth_bytes_read = 0;
+    while auth_bytes_read < auth_data.len() {
+        let bytes_read = tls.read(&mut auth_data[auth_bytes_read..]).await?;
+        if bytes_read == 0 {
+            break;
+        }
+        auth_bytes_read += bytes_read;
+    }
+
+    let authenticated = auth_bytes_read == AUTH_HEADER_SIZE && auth_data[..PASSWORD_DIGEST_SIZE] == password_digest(&password);
+    if !authenticated {
+        let prefix = auth_data[..auth_bytes_read].to_vec();
+        if let Some(target_url) = forward_target.as_ref() {
+            if let Err(error) = relay_forward_stream(client_addr, target_url, tls, prefix).await {
+                log::debug!("forward relay failed for {client_addr}: {error}");
+            }
+        } else if let Some(target_host) = probe_target.filter(|target| sni_is_allowed(target, &probe_sni_allowlist)) {
+            if let Err(error) = relay_probe_stream(client_addr, target_host, tls, prefix).await {
+                log::debug!("SNI probe relay failed for {client_addr}: {error}");
+            }
+        } else {
+            log::debug!("authentication failed for {client_addr}; no forward target or matching probe SNI");
+        }
+        return Ok(());
+    }
+
+    let padding_len = u16::from_be_bytes([auth_data[32], auth_data[33]]) as usize;
+    let mut padding_data = vec![0; padding_len];
+    tls.read_exact(&mut padding_data).await?;
+    let client_id = extract_client_id_from_padding(&padding_data);
     if panel_sync_enabled {
         let approved = match client_id {
             Some(client_id) => traffic_audit.lock().await.is_enabled(&client_id),
@@ -398,7 +463,7 @@ async fn read_target(stream: &mut StreamIo) -> std::io::Result<Address> {
     Address::retrieve_from_async_stream(stream).await
 }
 
-fn tls_config(cert_path: Option<&std::path::Path>, key_path: Option<&std::path::Path>) -> std::io::Result<ServerConfig> {
+fn tls_config(sni: Option<&str>, cert_path: Option<&Path>, key_path: Option<&Path>) -> std::io::Result<(ServerConfig, Vec<String>)> {
     use std::io::{Error, ErrorKind::InvalidData, ErrorKind::InvalidInput};
     if let (Some(cert_path), Some(key_path)) = (cert_path, key_path) {
         let cert_file = std::fs::File::open(cert_path)?;
@@ -413,37 +478,182 @@ fn tls_config(cert_path: Option<&std::path::Path>, key_path: Option<&std::path::
         let key = rustls_pemfile::private_key(&mut key_reader)?
             .ok_or_else(|| Error::new(InvalidData, "failed to parse a supported private key"))?;
 
-        return ServerConfig::builder()
+        let probe_sni_allowlist = extract_dns_names_from_certs(&certs, sni);
+        let config = ServerConfig::builder()
             .with_no_client_auth()
             .with_single_cert(certs, key)
-            .map_err(std::io::Error::other);
+            .map_err(std::io::Error::other)?;
+        return Ok((config, probe_sni_allowlist));
     }
 
     if cert_path.is_some() || key_path.is_some() {
         return Err(Error::new(InvalidInput, "both --cert and --key must be provided"));
     }
 
-    let certified = rcgen::generate_simple_self_signed(vec!["localhost".to_owned()]).map_err(Error::other)?;
+    let sni_name = sni.unwrap_or("localhost");
+    let certified = rcgen::generate_simple_self_signed(vec![sni_name.to_owned()]).map_err(Error::other)?;
     let cert = CertificateDer::from(certified.cert.der().to_vec());
     let key = PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(certified.signing_key.serialize_der()));
-    ServerConfig::builder()
+    let config = ServerConfig::builder()
         .with_no_client_auth()
         .with_single_cert(vec![cert], key)
-        .map_err(std::io::Error::other)
+        .map_err(std::io::Error::other)?;
+    let probe_sni_allowlist = sni.map_or_else(Vec::new, |name| vec![name.to_owned()]);
+    Ok((config, probe_sni_allowlist))
+}
+
+fn validate_forward_url(forward: Option<Url>) -> std::io::Result<Option<Url>> {
+    use std::io::{Error, ErrorKind::InvalidInput};
+    match forward {
+        Some(url) if matches!(url.scheme(), "http" | "https") && url.host_str().is_some() => Ok(Some(url)),
+        Some(url) => Err(Error::new(
+            InvalidInput,
+            format!("forward URL must be an http:// or https:// URL with a host: {url}"),
+        )),
+        None => Ok(None),
+    }
+}
+
+fn extract_dns_names_from_certs(certs: &[CertificateDer<'static>], fallback_sni: Option<&str>) -> Vec<String> {
+    let mut names = Vec::new();
+    if let Some(cert) = certs.first()
+        && let Ok((_, parsed_cert)) = x509_parser::parse_x509_certificate(cert.as_ref())
+    {
+        for extension in parsed_cert.extensions() {
+            if let ParsedExtension::SubjectAlternativeName(san) = extension.parsed_extension() {
+                for name in &san.general_names {
+                    if let GeneralName::DNSName(name) = name {
+                        names.push(name.to_string());
+                    }
+                }
+            }
+        }
+    }
+    if names.is_empty()
+        && let Some(sni) = fallback_sni
+    {
+        names.push(sni.to_owned());
+    }
+    names.sort_unstable();
+    names.dedup();
+    names
+}
+
+fn sni_is_allowed(target: &str, allowlist: &[String]) -> bool {
+    allowlist.iter().any(|allowed| allowed.eq_ignore_ascii_case(target))
+}
+
+fn create_probe_target_tls_config() -> std::io::Result<Arc<ClientConfig>> {
+    let mut root_store = RootCertStore::empty();
+    let cert_result = rustls_native_certs::load_native_certs();
+    if !cert_result.errors.is_empty() {
+        log::warn!("failed to load some system root certificates: {:?}", cert_result.errors);
+    }
+    for cert in cert_result.certs {
+        root_store.add(cert).map_err(std::io::Error::other)?;
+    }
+    Ok(Arc::new(
+        ClientConfig::builder().with_root_certificates(root_store).with_no_client_auth(),
+    ))
+}
+
+async fn relay_probe_stream<S>(client_addr: SocketAddr, target_host: String, mut inbound: S, prefix: Vec<u8>) -> std::io::Result<()>
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
+    let tcp = TcpStream::connect((target_host.as_str(), 443)).await?;
+    let connector = TlsConnector::from(create_probe_target_tls_config()?);
+    let server_name = target_host.clone().try_into().map_err(std::io::Error::other)?;
+    let mut outbound = connector.connect(server_name, tcp).await?;
+    log::info!("SNI probe relay for {client_addr} to {target_host}:443");
+    outbound.write_all(&prefix).await?;
+    outbound.flush().await?;
+    let _ = tokio::io::copy_bidirectional(&mut inbound, &mut outbound).await?;
+    Ok(())
+}
+
+enum ForwardOutbound {
+    Http(TcpStream),
+    Https(Box<tokio_rustls::client::TlsStream<TcpStream>>),
+}
+
+impl AsyncRead for ForwardOutbound {
+    fn poll_read(mut self: Pin<&mut Self>, cx: &mut Context<'_>, buffer: &mut ReadBuf<'_>) -> Poll<std::io::Result<()>> {
+        match &mut *self {
+            Self::Http(stream) => Pin::new(stream).poll_read(cx, buffer),
+            Self::Https(stream) => Pin::new(&mut **stream).poll_read(cx, buffer),
+        }
+    }
+}
+
+impl AsyncWrite for ForwardOutbound {
+    fn poll_write(mut self: Pin<&mut Self>, cx: &mut Context<'_>, buffer: &[u8]) -> Poll<std::io::Result<usize>> {
+        match &mut *self {
+            Self::Http(stream) => Pin::new(stream).poll_write(cx, buffer),
+            Self::Https(stream) => Pin::new(&mut **stream).poll_write(cx, buffer),
+        }
+    }
+
+    fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+        match &mut *self {
+            Self::Http(stream) => Pin::new(stream).poll_flush(cx),
+            Self::Https(stream) => Pin::new(&mut **stream).poll_flush(cx),
+        }
+    }
+
+    fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+        match &mut *self {
+            Self::Http(stream) => Pin::new(stream).poll_shutdown(cx),
+            Self::Https(stream) => Pin::new(&mut **stream).poll_shutdown(cx),
+        }
+    }
+}
+
+async fn relay_forward_stream<S>(client_addr: SocketAddr, target: &Url, mut inbound: S, prefix: Vec<u8>) -> std::io::Result<()>
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
+    use std::io::{Error, ErrorKind::InvalidInput};
+    let host = target
+        .host_str()
+        .ok_or(Error::new(InvalidInput, "forward URL must include a host"))?;
+    let port = target
+        .port_or_known_default()
+        .ok_or(Error::new(InvalidInput, "forward URL must include a port"))?;
+    let tcp = TcpStream::connect((host, port)).await?;
+    let mut outbound = match target.scheme() {
+        "http" => ForwardOutbound::Http(tcp),
+        "https" => {
+            let connector = TlsConnector::from(create_probe_target_tls_config()?);
+            let server_name = host.to_owned().try_into().map_err(std::io::Error::other)?;
+            ForwardOutbound::Https(Box::new(connector.connect(server_name, tcp).await?))
+        }
+        scheme => {
+            return Err(Error::new(InvalidInput, format!("unsupported forward URL scheme: {scheme}")));
+        }
+    };
+    log::info!("forward relay for {client_addr} to {host}:{port} ({})", target.scheme());
+    outbound.write_all(&prefix).await?;
+    outbound.flush().await?;
+    let _ = tokio::io::copy_bidirectional(&mut inbound, &mut outbound).await?;
+    Ok(())
 }
 
 #[cfg(test)]
 mod tls_config_tests {
-    use super::{Args, tls_config};
+    use super::{Args, relay_forward_stream, tls_config, validate_forward_url};
     use clap::Parser;
     use std::path::Path;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::TcpListener;
+    use url::Url;
 
     #[test]
     fn requires_certificate_and_key_together() {
-        let cert_only = tls_config(Some(Path::new("certificate.pem")), None).unwrap_err();
+        let cert_only = tls_config(None, Some(Path::new("certificate.pem")), None).unwrap_err();
         assert_eq!(cert_only.kind(), std::io::ErrorKind::InvalidInput);
 
-        let key_only = tls_config(None, Some(Path::new("private-key.pem"))).unwrap_err();
+        let key_only = tls_config(None, None, Some(Path::new("private-key.pem"))).unwrap_err();
         assert_eq!(key_only.kind(), std::io::ErrorKind::InvalidInput);
     }
 
@@ -474,5 +684,65 @@ mod tls_config_tests {
         ])
         .unwrap();
         assert_eq!(incomplete.panel_sync_config().unwrap_err().kind(), std::io::ErrorKind::InvalidInput);
+    }
+
+    #[test]
+    fn parses_padding_sni_and_forward_options() {
+        let args = Args::try_parse_from([
+            "anytls-server",
+            "--password",
+            "secret",
+            "--padding-scheme",
+            "scheme.json",
+            "--sni",
+            "probe.example.com",
+            "--forward",
+            "https://target.example.com:8443/path",
+        ])
+        .unwrap();
+
+        assert_eq!(args.padding_scheme.as_deref(), Some(Path::new("scheme.json")));
+        assert_eq!(args.sni.as_deref(), Some("probe.example.com"));
+        assert_eq!(args.forward.unwrap().as_str(), "https://target.example.com:8443/path");
+    }
+
+    #[test]
+    fn generates_probe_certificate_for_configured_sni() {
+        let (_, allowlist) = tls_config(Some("probe.example.com"), None, None).unwrap();
+        assert_eq!(allowlist, ["probe.example.com"]);
+    }
+
+    #[test]
+    fn forward_url_accepts_only_http_and_https() {
+        for value in ["http://example.com", "https://example.com:8443"] {
+            assert!(validate_forward_url(Some(Url::parse(value).unwrap())).is_ok());
+        }
+        let error = validate_forward_url(Some(Url::parse("ftp://example.com").unwrap())).unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::InvalidInput);
+    }
+
+    #[tokio::test]
+    async fn forward_relay_preserves_probe_prefix() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let target_addr = listener.local_addr().unwrap();
+        let target = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut request = Vec::new();
+            stream.read_to_end(&mut request).await.unwrap();
+            stream.write_all(b"probe response").await.unwrap();
+            request
+        });
+
+        let (inbound, mut client) = tokio::io::duplex(1024);
+        let target_url = Url::parse(&format!("http://{target_addr}/")).unwrap();
+        let relay = tokio::spawn(async move { relay_forward_stream(target_addr, &target_url, inbound, b"GET /".to_vec()).await });
+        client.write_all(b" HTTP/1.1\r\n\r\n").await.unwrap();
+        client.shutdown().await.unwrap();
+        let mut response = Vec::new();
+        client.read_to_end(&mut response).await.unwrap();
+
+        assert_eq!(response, b"probe response");
+        assert_eq!(target.await.unwrap(), b"GET / HTTP/1.1\r\n\r\n");
+        relay.await.unwrap().unwrap();
     }
 }

@@ -46,3 +46,4 @@ tokio-rustls = "0.26.5"
 tokio-util = { version = "0.7.19", features = ["rt"] }
 url = { version = "2.5.8", features = ["serde"] }
 uuid = { version = "1.26.1", features = ["serde"] }
+x509-parser = "0.18.1"
