@@ -12,14 +12,7 @@ use tokio_util::sync::CancellationToken;
 use crate::{CHECK_MARK, Command, Frame, HEADER_OVERHEAD_SIZE, PaddingFactory, from_bytes, runtime::BoxTransport, to_bytes};
 
 pub fn is_peer_disconnect(error: &std::io::Error) -> bool {
-    matches!(
-        error.kind(),
-        std::io::ErrorKind::ConnectionReset
-            | std::io::ErrorKind::ConnectionAborted
-            | std::io::ErrorKind::BrokenPipe
-            | std::io::ErrorKind::UnexpectedEof
-            | std::io::ErrorKind::NotConnected
-    )
+    error.kind() == std::io::ErrorKind::ConnectionReset
 }
 
 struct Writer {
@@ -395,14 +388,18 @@ impl Session {
         loop {
             let result = tokio::select! {
                 result = async {
-                    Frame::read_from(&mut *self.reader.lock().await).await
+                    Frame::read_from_or_eof(&mut *self.reader.lock().await).await
                 } => result,
                 _ = self.close_token.cancelled() => break Ok(()),
             };
             let frame = match result {
-                Ok(frame) => frame,
+                Ok(Some(frame)) => frame,
+                Ok(None) => {
+                    log::debug!("session {session_id} peer closed transport");
+                    break Ok(());
+                }
                 Err(error) if is_peer_disconnect(&error) => {
-                    log::debug!("session {session_id} peer closed transport: {error}");
+                    log::debug!("session {session_id} transport reset: {error}");
                     break Ok(());
                 }
                 Err(error) => break Err(error),
@@ -810,15 +807,15 @@ mod tests {
         use std::io::ErrorKind;
 
         for kind in [
-            ErrorKind::ConnectionReset,
+            ErrorKind::InvalidData,
             ErrorKind::ConnectionAborted,
             ErrorKind::BrokenPipe,
             ErrorKind::UnexpectedEof,
             ErrorKind::NotConnected,
         ] {
-            assert!(is_peer_disconnect(&std::io::Error::from(kind)));
+            assert!(!is_peer_disconnect(&std::io::Error::from(kind)));
         }
-        assert!(!is_peer_disconnect(&std::io::Error::from(ErrorKind::InvalidData)));
+        assert!(is_peer_disconnect(&std::io::Error::from(ErrorKind::ConnectionReset)));
     }
 
     #[tokio::test]

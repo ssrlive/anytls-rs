@@ -7,8 +7,6 @@ mod core;
 #[cfg(feature = "server")]
 mod panel_sync;
 #[cfg(feature = "runtime")]
-mod proxy;
-#[cfg(feature = "runtime")]
 mod runtime;
 #[cfg(feature = "uot")]
 mod uot;
@@ -32,9 +30,7 @@ pub use core::{
 #[cfg(feature = "server")]
 pub use panel_sync::{PanelSyncClient, PanelSyncConfig, TrafficAudit, TrafficAuditPtr};
 #[cfg(feature = "runtime")]
-pub use proxy::{Session, Stream, is_peer_disconnect};
-#[cfg(feature = "runtime")]
-pub use runtime::{AsyncReadWrite, BoxTransport, StreamIo};
+pub use runtime::{AsyncReadWrite, BoxTransport, Session, Stream, StreamIo, is_peer_disconnect};
 #[cfg(feature = "uot")]
 pub use uot::{
     UotMode, UotRequest, V2_MAGIC_ADDRESS, uot_encode_packet, uot_get_packet_from_stream, uot_get_request_from_stream,

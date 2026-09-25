@@ -89,9 +89,20 @@ impl Frame {
 
     #[cfg(feature = "runtime")]
     pub async fn read_from<R: AsyncRead + Unpin>(reader: &mut R) -> std::io::Result<Self> {
+        use std::io::{Error, ErrorKind::UnexpectedEof};
+        Self::read_from_or_eof(reader)
+            .await?
+            .ok_or_else(|| Error::new(UnexpectedEof, "stream ended before frame"))
+    }
+
+    #[cfg(feature = "runtime")]
+    pub(crate) async fn read_from_or_eof<R: AsyncRead + Unpin>(reader: &mut R) -> std::io::Result<Option<Self>> {
         use std::io::{Error, ErrorKind::InvalidData};
         let mut header = [0u8; HEADER_OVERHEAD_SIZE];
-        reader.read_exact(&mut header).await?;
+        if reader.read(&mut header[..1]).await? == 0 {
+            return Ok(None);
+        }
+        reader.read_exact(&mut header[1..]).await?;
         let command = Command::try_from(header[0]).map_err(|value| Error::new(InvalidData, format!("unknown command {value}")))?;
         let stream_id = u32::from_be_bytes(
             header[1..5]
@@ -105,7 +116,7 @@ impl Frame {
         ) as usize;
         let mut data = vec![0u8; data_len];
         reader.read_exact(&mut data).await?;
-        Ok(Self { command, stream_id, data })
+        Ok(Some(Self { command, stream_id, data }))
     }
 }
 
@@ -130,5 +141,26 @@ mod tests {
         frame.data = b"hello".to_vec();
         let bytes = frame.encode().unwrap();
         assert_eq!(Frame::read_from(&mut BufReader::new(bytes.as_slice())).await.unwrap(), frame);
+    }
+
+    #[cfg(feature = "runtime")]
+    #[tokio::test]
+    async fn distinguishes_frame_boundary_eof_from_truncated_frames() {
+        let mut empty = &[][..];
+        assert!(Frame::read_from_or_eof(&mut empty).await.unwrap().is_none());
+
+        let truncated_header = [Command::Push as u8, 0];
+        let mut input = truncated_header.as_slice();
+        assert_eq!(
+            Frame::read_from_or_eof(&mut input).await.unwrap_err().kind(),
+            std::io::ErrorKind::UnexpectedEof
+        );
+
+        let truncated_payload = [Command::Push as u8, 0, 0, 0, 1, 0, 2, b'x'];
+        let mut input = truncated_payload.as_slice();
+        assert_eq!(
+            Frame::read_from_or_eof(&mut input).await.unwrap_err().kind(),
+            std::io::ErrorKind::UnexpectedEof
+        );
     }
 }
