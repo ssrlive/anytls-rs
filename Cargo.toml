@@ -12,15 +12,15 @@ categories = ["network-programming", "command-line-utilities"]
 [[bin]]
 name = "anytls-server"
 path = "bin/server.rs"
-required-features = ["server"]
+required-features = ["server", "relay"]
 
 [[bin]]
 name = "anytls-client"
 path = "bin/client.rs"
-required-features = ["client"]
+required-features = ["client", "relay"]
 
 [features]
-default = ["client", "server"]
+default = ["client", "server", "relay"]
 core = [
     "dep:md-5",
     "dep:rand",
@@ -33,6 +33,7 @@ core = [
 ]
 runtime = ["core", "dep:log", "dep:tokio-util", "tokio/sync", "tokio/time"]
 uot = ["core", "dep:bytes", "dep:socks5-impl"]
+relay = ["dep:tokio", "tokio/io-util", "tokio/macros"]
 client = [
     "runtime",
     "uot",

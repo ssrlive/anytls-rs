@@ -1,6 +1,6 @@
 use anytls::{
-    BoxTransport, Client, ClientArgs, DEFAULT_SCHEME, Dialer, PaddingFactory, Stream, StreamIo, UotMode, UotRequest, uot_encode_packet,
-    uot_get_packet_from_stream, uot_sentinel_destination, write_auth_with_client_id,
+    BoxTransport, Client, ClientArgs, DEFAULT_SCHEME, Dialer, PaddingFactory, Stream, StreamIo, UotMode, UotRequest, relay,
+    uot_encode_packet, uot_get_packet_from_stream, uot_sentinel_destination, write_auth_with_client_id,
 };
 use clap::Parser;
 use rustls::{
@@ -85,18 +85,60 @@ async fn main() -> std::io::Result<()> {
         let (stream, _) = listener.accept().await?;
         let client = client.clone();
         let connector = connector.clone();
+        let context = Arc::new(ProxyConnectionContext::new(stream.peer_addr().ok()));
         tokio::spawn(async move {
-            if let Err(error) = handle_listener_stream(stream, client, connector).await {
-                log::warn!("Proxy connection failed: {error}");
+            if let Err(error) = handle_listener_stream(stream, client, connector, Arc::clone(&context)).await {
+                log::warn!("Proxy connection failed: {}: {error}", context.label());
             }
         });
     }
 }
 
-async fn handle_listener_stream(mut stream: TcpStream, client: Arc<Client>, connector: HttpConnector) -> std::io::Result<()> {
-    let peer_addr = stream.peer_addr().ok();
+struct ProxyConnectionContext {
+    peer_addr: Option<SocketAddr>,
+    protocol: Mutex<&'static str>,
+    target: Mutex<Option<String>>,
+}
+
+impl ProxyConnectionContext {
+    fn new(peer_addr: Option<SocketAddr>) -> Self {
+        Self {
+            peer_addr,
+            protocol: Mutex::new("unknown"),
+            target: Mutex::new(None),
+        }
+    }
+
+    fn set_protocol(&self, protocol: &'static str) {
+        *self.protocol.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = protocol;
+    }
+
+    fn set_target(&self, target: String) {
+        *self.target.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = Some(target);
+    }
+
+    fn label(&self) -> String {
+        let protocol = *self.protocol.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let target = self.target.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let target = target.as_deref().unwrap_or("<unknown>");
+        format!("peer={:?} protocol={protocol} target={target}", self.peer_addr)
+    }
+}
+
+async fn handle_listener_stream(
+    mut stream: TcpStream,
+    client: Arc<Client>,
+    connector: HttpConnector,
+    context: Arc<ProxyConnectionContext>,
+) -> std::io::Result<()> {
+    let peer_addr = context.peer_addr;
     let protocol = match tokio::time::timeout(std::time::Duration::from_secs(5), detect_listener_protocol(&stream)).await {
-        Ok(protocol) => protocol?,
+        Ok(Ok(protocol)) => protocol,
+        Ok(Err(error)) if relay::is_peer_disconnect(&error) => {
+            log::debug!("Proxy peer disconnected during protocol detection: {}: {error}", context.label());
+            return Ok(());
+        }
+        Ok(Err(error)) => return Err(error),
         Err(_) => {
             log::debug!("Timed out detecting proxy protocol from {peer_addr:?}");
             stream.shutdown().await?;
@@ -105,22 +147,41 @@ async fn handle_listener_stream(mut stream: TcpStream, client: Arc<Client>, conn
     };
     match protocol {
         Some(ListenerProtocol::Socks5) => {
+            context.set_protocol("SOCKS5");
             log::trace!("SOCKS5 client detected from {peer_addr:?}");
             let incoming = IncomingConnection::new(stream, Arc::new(NoAuth));
-            handle_socks5(incoming, client).await
+            handle_socks5(incoming, client, context).await
         }
         Some(ListenerProtocol::Socks4) => {
-            log::warn!("SOCKS4 is unsupported on mixed SOCKS5/HTTP listener from {peer_addr:?}");
+            context.set_protocol("SOCKS4");
+            log::warn!("SOCKS4 is unsupported on mixed SOCKS5/HTTP listener: {}", context.label());
             stream.shutdown().await
         }
         Some(ListenerProtocol::Http) => {
+            context.set_protocol("HTTP");
             log::trace!("HTTP proxy client detected from {peer_addr:?}");
-            run_http_service(stream, connector, UserKey::default()).await
+            let request_context = Arc::clone(&context);
+            let contextual_connector: HttpConnector = Arc::new(move |destination: Address| {
+                request_context.set_target(destination.to_string());
+                connector(destination)
+            });
+            run_http_service(stream, contextual_connector, UserKey::default()).await
         }
         None => {
+            context.set_protocol("unknown");
             let mut first_byte = [0u8; 1];
-            let _ = stream.peek(&mut first_byte).await?;
-            log::warn!("Unknown proxy protocol from {peer_addr:?}, first byte: 0x{:02x}", first_byte[0]);
+            match stream.peek(&mut first_byte).await {
+                Ok(0) => {
+                    log::debug!("Proxy peer closed before sending a request: {}", context.label());
+                    return Ok(());
+                }
+                Ok(_) => log::warn!("Unknown proxy protocol: {}, first byte: 0x{:02x}", context.label(), first_byte[0]),
+                Err(error) if relay::is_peer_disconnect(&error) => {
+                    log::debug!("Proxy peer disconnected before sending a request: {}: {error}", context.label());
+                    return Ok(());
+                }
+                Err(error) => return Err(error),
+            }
             stream.shutdown().await
         }
     }
@@ -292,16 +353,21 @@ async fn dial(
     Ok(Box::new(tls))
 }
 
-async fn handle_socks5(incoming: socks5_impl::server::IncomingConnection, client: Arc<Client>) -> std::io::Result<()> {
+async fn handle_socks5(incoming: IncomingConnection, client: Arc<Client>, context: Arc<ProxyConnectionContext>) -> std::io::Result<()> {
     let authenticated = incoming.authenticate().await.map_err(std::io::Error::other)?;
     let request = authenticated.wait_request().await.map_err(std::io::Error::other)?;
     let (connect, target) = match request {
-        ClientConnection::Connect(connect, target) => (connect, target),
+        ClientConnection::Connect(connect, target) => {
+            context.set_target(target.to_string());
+            (connect, target)
+        }
         ClientConnection::Bind(mut bind, target) => {
+            context.set_target(target.to_string());
             let _ = bind.shutdown().await;
             return Err(std::io::Error::other(format!("SOCKS5 BIND is unsupported: {target}")));
         }
-        ClientConnection::UdpAssociate(associate, _) => {
+        ClientConnection::UdpAssociate(associate, target) => {
+            context.set_target(target.to_string());
             return handle_udp_associate(associate, client).await;
         }
     };
@@ -310,8 +376,22 @@ async fn handle_socks5(incoming: socks5_impl::server::IncomingConnection, client
     let stream = client.create_stream().await?;
     let mut remote = StreamIo::new(stream);
     target.write_to_async_stream(&mut remote).await?;
-    let mut ready = connect.reply(Reply::Succeeded, Address::unspecified()).await?;
-    let (client_to_proxy, proxy_to_client) = tokio::io::copy_bidirectional(&mut ready, &mut remote).await?;
+    let mut ready = match connect.reply(Reply::Succeeded, Address::unspecified()).await {
+        Ok(ready) => ready,
+        Err(error) if relay::is_peer_disconnect(&error) => {
+            log::debug!("Proxy peer disconnected before SOCKS5 reply: {}: {error}", context.label());
+            return Ok(());
+        }
+        Err(error) => return Err(error),
+    };
+    let (client_to_proxy, proxy_to_client) = match relay::copy_bidirectional(&mut ready, &mut remote).await {
+        Ok(counts) => counts,
+        Err(error) if error.is_peer_disconnect() => {
+            log::debug!("Proxy peer disconnected during SOCKS5 relay: {}: {error}", context.label());
+            return Ok(());
+        }
+        Err(error) => return Err(error.into()),
+    };
     ready.shutdown().await?;
     remote.shutdown().await?;
     log::info!(

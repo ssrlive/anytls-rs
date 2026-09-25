@@ -1,7 +1,7 @@
 use anytls::{
     AUTH_HEADER_SIZE, BoxTransport, DEFAULT_SCHEME, PASSWORD_DIGEST_SIZE, PaddingFactory, PanelSyncClient, ServerArgs, Session, Stream,
     StreamIo, TrafficAudit, TrafficAuditPtr, UotMode, extract_client_id_from_padding, is_peer_disconnect, password_digest, print_args,
-    print_url, uot_encode_packet, uot_get_packet_from_stream, uot_get_request_from_stream, uot_is_sentinel_destination,
+    print_url, relay, uot_encode_packet, uot_get_packet_from_stream, uot_get_request_from_stream, uot_is_sentinel_destination,
 };
 use clap::Parser;
 use rustls::{
@@ -240,7 +240,7 @@ async fn relay_stream(
     let downstream_bytes = Arc::new(AtomicU64::new(0));
     let mut stream_io = CountedIo::new(stream_io, Arc::clone(&downstream_bytes));
     let mut outbound = CountedIo::new(outbound, Arc::clone(&upstream_bytes));
-    let relay_result = tokio::io::copy_bidirectional(&mut stream_io, &mut outbound).await;
+    let relay_result = relay::copy_bidirectional(&mut outbound, &mut stream_io).await;
     let upstream = upstream_bytes.load(Ordering::Relaxed);
     let downstream = downstream_bytes.load(Ordering::Relaxed);
     if let Some(client_id) = client_id {
@@ -258,11 +258,11 @@ async fn relay_stream(
             );
             Ok(())
         }
-        Err(error) if is_peer_disconnect(&error) => {
-            log::debug!("session {session_id} stream {stream_id}: peer reset/closed relay: {error}");
+        Err(error) if error.is_peer_disconnect() => {
+            log::debug!("session {session_id} stream {stream_id}: peer disconnected from {destination}: {error}");
             Ok(())
         }
-        Err(error) => Err(error),
+        Err(error) => Err(error.into()),
     }
 }
 

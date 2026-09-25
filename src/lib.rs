@@ -6,6 +6,8 @@ mod client;
 mod core;
 #[cfg(feature = "server")]
 mod panel_sync;
+#[cfg(feature = "relay")]
+pub mod relay;
 #[cfg(feature = "runtime")]
 mod runtime;
 #[cfg(feature = "uot")]
