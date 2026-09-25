@@ -204,17 +204,16 @@ cargo test
 
 ### Cargo Features
 
-The default feature set builds both command-line applications: `client_runner` and `server`.
+The default feature set builds both command-line applications: `client` and `server`.
 Features can be disabled and selected explicitly for library consumers:
 
-| Feature         | Enables                                                       |
-| --------------- | ------------------------------------------------------------- |
-| `core`          | Authentication, frames, padding, and string-map primitives    |
-| `runtime`       | Core plus session transport and asynchronous stream I/O       |
-| `uot`           | UDP-over-TCP protocol v2 helpers                              |
-| `client`        | Client library and client CLI argument type                   |
-| `client_runner` | `client` plus the `anytls-client` binary                      |
-| `server`        | Server CLI, panel synchronization, and `anytls-server` binary |
+| Feature   | Enables                                                       |
+| --------- | ------------------------------------------------------------- |
+| `core`    | Authentication, frames, padding, and string-map primitives    |
+| `runtime` | Core plus session transport and asynchronous stream I/O       |
+| `uot`     | UDP-over-TCP protocol v2 helpers                              |
+| `client`  | Client library and client CLI argument type                   |
+| `server`  | Server CLI, panel synchronization, and `anytls-server` binary |
 
 For example, depend on the library without its default applications and select only the protocol core:
 

@@ -17,10 +17,10 @@ required-features = ["server"]
 [[bin]]
 name = "anytls-client"
 path = "bin/client.rs"
-required-features = ["client_runner"]
+required-features = ["client"]
 
 [features]
-default = ["client_runner", "server"]
+default = ["client", "server"]
 core = [
     "dep:md-5",
     "dep:rand",
@@ -33,7 +33,6 @@ core = [
 ]
 runtime = ["core", "dep:log", "dep:tokio-util", "tokio/sync", "tokio/time"]
 uot = ["core", "dep:bytes", "dep:socks5-impl"]
-client_runner = ["client"]
 client = [
     "runtime",
     "uot",

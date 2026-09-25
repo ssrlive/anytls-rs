@@ -1,5 +1,7 @@
 #[cfg(any(feature = "client", feature = "server"))]
 mod cli;
+#[cfg(feature = "client")]
+mod client;
 #[cfg(feature = "core")]
 mod core;
 #[cfg(feature = "server")]
@@ -19,6 +21,8 @@ pub use ::socks5_impl::protocol::Address;
 pub use cli::ClientArgs;
 #[cfg(feature = "server")]
 pub use cli::ServerArgs;
+#[cfg(feature = "client")]
+pub use client::{Client, Dialer};
 #[cfg(feature = "core")]
 pub use core::{
     AUTH_HEADER_SIZE, CHECK_MARK, Command, DEFAULT_SCHEME, Frame, HEADER_OVERHEAD_SIZE, MAX_FRAME_DATA_SIZE, PASSWORD_DIGEST_SIZE,
@@ -27,8 +31,6 @@ pub use core::{
 };
 #[cfg(feature = "server")]
 pub use panel_sync::{PanelSyncClient, PanelSyncConfig, TrafficAudit, TrafficAuditPtr};
-#[cfg(feature = "client")]
-pub use proxy::{Client, Dialer};
 #[cfg(feature = "runtime")]
 pub use proxy::{Session, Stream, is_peer_disconnect};
 #[cfg(feature = "runtime")]
@@ -41,5 +43,5 @@ pub use uot::{
 #[cfg(feature = "server")]
 pub use url_util::{args_json_for_public_ip, format_anytls_url, print_args, print_url};
 
-pub const PROGRAM_VERSION_NAME: &str = "anytls/0.1.0";
+pub const PROGRAM_VERSION_NAME: &str = concat!("anytls(rust)/", env!("CARGO_PKG_VERSION"));
 pub const PROTOCOL_VERSION: u8 = 2;
