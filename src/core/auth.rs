@@ -1,7 +1,7 @@
 use sha2::{Digest, Sha256};
+#[cfg(feature = "async")]
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
-use crate::PaddingFactory;
 use uuid::Uuid;
 
 pub const PASSWORD_DIGEST_SIZE: usize = 32;
@@ -13,14 +13,16 @@ pub fn password_digest(password: &str) -> [u8; PASSWORD_DIGEST_SIZE] {
     digest.finalize().into()
 }
 
-pub async fn write_auth<W: AsyncWrite + Unpin>(writer: &mut W, password: &str, padding: &PaddingFactory) -> std::io::Result<()> {
+#[cfg(feature = "async")]
+pub async fn write_auth<W: AsyncWrite + Unpin>(writer: &mut W, password: &str, padding: &crate::PaddingFactory) -> std::io::Result<()> {
     write_auth_with_client_id(writer, password, padding, None).await
 }
 
+#[cfg(feature = "async")]
 pub async fn write_auth_with_client_id<W: AsyncWrite + Unpin>(
     writer: &mut W,
     password: &str,
-    padding: &PaddingFactory,
+    padding: &crate::PaddingFactory,
     client_id: Option<Uuid>,
 ) -> std::io::Result<()> {
     use std::io::{Error, ErrorKind::InvalidInput};
@@ -44,10 +46,12 @@ pub async fn write_auth_with_client_id<W: AsyncWrite + Unpin>(
     writer.flush().await
 }
 
+#[cfg(feature = "async")]
 pub async fn read_auth<R: AsyncRead + Unpin>(reader: &mut R, password: &str) -> std::io::Result<()> {
     read_auth_with_client_id(reader, password).await.map(|_| ())
 }
 
+#[cfg(feature = "async")]
 pub async fn read_auth_with_client_id<R: AsyncRead + Unpin>(reader: &mut R, password: &str) -> std::io::Result<Option<Uuid>> {
     let mut header = [0u8; AUTH_HEADER_SIZE];
     reader.read_exact(&mut header).await?;
@@ -66,6 +70,7 @@ pub fn extract_client_id_from_padding(padding: &[u8]) -> Option<Uuid> {
 }
 
 #[cfg(test)]
+#[cfg(feature = "async")]
 mod tests {
     use super::*;
     use crate::DEFAULT_SCHEME;
@@ -73,7 +78,7 @@ mod tests {
 
     #[tokio::test]
     async fn writes_and_reads_go_compatible_authentication() {
-        let padding = PaddingFactory::new(DEFAULT_SCHEME).unwrap();
+        let padding = crate::PaddingFactory::new(DEFAULT_SCHEME).unwrap();
         let mut bytes = Vec::new();
         write_auth(&mut bytes, "password", &padding).await.unwrap();
         assert_eq!(&bytes[..32], &password_digest("password"));
@@ -83,7 +88,7 @@ mod tests {
 
     #[tokio::test]
     async fn rejects_wrong_password() {
-        let padding = PaddingFactory::new(DEFAULT_SCHEME).unwrap();
+        let padding = crate::PaddingFactory::new(DEFAULT_SCHEME).unwrap();
         let mut bytes = Vec::new();
         write_auth(&mut bytes, "password", &padding).await.unwrap();
         let error = read_auth(&mut BufReader::new(bytes.as_slice()), "wrong").await.unwrap_err();
@@ -92,7 +97,7 @@ mod tests {
 
     #[tokio::test]
     async fn carries_client_id_in_auth_padding() {
-        let padding = PaddingFactory::new(DEFAULT_SCHEME).unwrap();
+        let padding = crate::PaddingFactory::new(DEFAULT_SCHEME).unwrap();
         let client_id = Uuid::parse_str("f2d46ca2-8d6d-4c5c-ae77-80c902ce68d7").unwrap();
         let mut bytes = Vec::new();
         write_auth_with_client_id(&mut bytes, "password", &padding, Some(client_id))

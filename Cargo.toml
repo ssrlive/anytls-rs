@@ -21,18 +21,10 @@ required-features = ["client", "relay"]
 
 [features]
 default = ["client", "server", "relay"]
-core = [
-    "dep:md-5",
-    "dep:rand",
-    "dep:sha2",
-    "dep:tokio",
-    "dep:uuid",
-    "tokio/io-util",
-    "tokio/macros",
-    "tokio/rt",
-]
-runtime = ["core", "dep:log", "dep:tokio-util", "tokio/sync", "tokio/time"]
-uot = ["core", "dep:bytes", "dep:socks5-impl"]
+core = ["dep:md-5", "dep:rand", "dep:sha2", "dep:uuid"]
+async = ["core", "dep:tokio", "tokio/io-util"]
+runtime = ["async", "dep:log", "dep:tokio-util", "tokio/sync", "tokio/time"]
+uot = ["async", "dep:bytes", "dep:socks5-impl"]
 relay = ["dep:tokio", "tokio/io-util", "tokio/macros"]
 client = [
     "runtime",
@@ -107,3 +99,10 @@ tokio-util = { version = "0.7.19", features = ["rt"], optional = true }
 url = { version = "2.5.8", features = ["serde"], optional = true }
 uuid = { version = "1.26.1", features = ["serde"], optional = true }
 x509-parser = { version = "0.18.1", optional = true }
+
+[dev-dependencies]
+tokio = { version = "1.53.1", default-features = false, features = [
+    "io-util",
+    "macros",
+    "rt",
+] }

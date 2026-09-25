@@ -26,9 +26,10 @@ pub use client::{Client, Dialer};
 #[cfg(feature = "core")]
 pub use core::{
     AUTH_HEADER_SIZE, CHECK_MARK, Command, DEFAULT_SCHEME, Frame, HEADER_OVERHEAD_SIZE, MAX_FRAME_DATA_SIZE, PASSWORD_DIGEST_SIZE,
-    PaddingFactory, StringMap, extract_client_id_from_padding, from_bytes, password_digest, read_auth, read_auth_with_client_id, to_bytes,
-    write_auth, write_auth_with_client_id,
+    PaddingFactory, StringMap, extract_client_id_from_padding, from_bytes, password_digest, to_bytes,
 };
+#[cfg(all(feature = "core", feature = "async"))]
+pub use core::{read_auth, read_auth_with_client_id, write_auth, write_auth_with_client_id};
 #[cfg(feature = "server")]
 pub use panel_sync::{PanelSyncClient, PanelSyncConfig, TrafficAudit, TrafficAuditPtr};
 #[cfg(feature = "runtime")]

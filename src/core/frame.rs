@@ -1,4 +1,4 @@
-#[cfg(feature = "runtime")]
+#[cfg(feature = "async")]
 use tokio::io::{AsyncRead, AsyncReadExt};
 
 pub const HEADER_OVERHEAD_SIZE: usize = 1 + 4 + 2;
@@ -87,7 +87,7 @@ impl Frame {
         Ok(encoded)
     }
 
-    #[cfg(feature = "runtime")]
+    #[cfg(feature = "async")]
     pub async fn read_from<R: AsyncRead + Unpin>(reader: &mut R) -> std::io::Result<Self> {
         use std::io::{Error, ErrorKind::UnexpectedEof};
         Self::read_from_or_eof(reader)
@@ -95,7 +95,7 @@ impl Frame {
             .ok_or_else(|| Error::new(UnexpectedEof, "stream ended before frame"))
     }
 
-    #[cfg(feature = "runtime")]
+    #[cfg(feature = "async")]
     pub(crate) async fn read_from_or_eof<R: AsyncRead + Unpin>(reader: &mut R) -> std::io::Result<Option<Self>> {
         use std::io::{Error, ErrorKind::InvalidData};
         let mut header = [0u8; HEADER_OVERHEAD_SIZE];
@@ -123,7 +123,7 @@ impl Frame {
 #[cfg(test)]
 mod tests {
     use super::*;
-    #[cfg(feature = "runtime")]
+    #[cfg(feature = "async")]
     use tokio::io::BufReader;
 
     #[test]
@@ -134,7 +134,7 @@ mod tests {
         assert_eq!(&bytes[..], &[2, 1, 2, 3, 4, 0, 5, b'h', b'e', b'l', b'l', b'o']);
     }
 
-    #[cfg(feature = "runtime")]
+    #[cfg(feature = "async")]
     #[tokio::test]
     async fn reads_go_compatible_big_endian_frame() {
         let mut frame = Frame::new(Command::Push, 0x0102_0304);
@@ -143,7 +143,7 @@ mod tests {
         assert_eq!(Frame::read_from(&mut BufReader::new(bytes.as_slice())).await.unwrap(), frame);
     }
 
-    #[cfg(feature = "runtime")]
+    #[cfg(feature = "async")]
     #[tokio::test]
     async fn distinguishes_frame_boundary_eof_from_truncated_frames() {
         let mut empty = &[][..];
