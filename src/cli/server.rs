@@ -34,12 +34,12 @@ pub struct ServerArgs {
     #[arg(short = 'm', long, value_name = "N", default_value_t = 1024)]
     pub max_streams_per_session: usize,
 
-    /// TLS certificate PEM file (optional)
+    /// TLS certificate PEM file (optional; reloaded automatically when changed)
     #[serde(skip_serializing_if = "Option::is_none")]
     #[arg(long, value_name = "FILE")]
     pub cert: Option<PathBuf>,
 
-    /// TLS private key PEM file (optional)
+    /// TLS private key PEM file (optional; reloaded automatically when changed)
     #[serde(skip_serializing_if = "Option::is_none")]
     #[arg(long, value_name = "FILE")]
     pub key: Option<PathBuf>,

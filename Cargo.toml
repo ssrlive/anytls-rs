@@ -48,6 +48,7 @@ server = [
     "uot",
     "dep:clap",
     "dep:env_logger",
+    "dep:notify",
     "dep:percent-encoding",
     "dep:rcgen",
     "dep:reqwest",
@@ -78,7 +79,8 @@ ctrlc2 = { version = "4.0.0", optional = true, default-features = false, feature
 env_logger = { version = "0.11.11", optional = true }
 log = { version = "0.4.34", features = ["serde"], optional = true }
 md-5 = { version = "0.11.0", optional = true }
-method_name = { version = "0.3.1" }
+method_name = { version = "0.3.2", features = ["unstable"] }
+notify = { version = "8.2.0", optional = true }
 percent-encoding = { version = "2.3.2", optional = true }
 rand = { version = "0.10.3", optional = true }
 rcgen = { version = "0.14.10", optional = true }

@@ -6,14 +6,16 @@ use anytls::{
 };
 use clap::Parser;
 use method_name::method_name_unstable;
+use notify::{Event, RecommendedWatcher, RecursiveMode, Watcher};
 use rustls::{
     ClientConfig, RootCertStore, ServerConfig,
     pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer},
 };
 use socks5_impl::protocol::{Address, AsyncStreamOperation};
 use std::{
+    collections::HashSet,
     net::SocketAddr,
-    path::Path,
+    path::{Path, PathBuf},
     pin::Pin,
     sync::{
         Arc,
@@ -23,6 +25,7 @@ use std::{
 };
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadBuf};
 use tokio::net::{TcpListener, TcpStream, UdpSocket};
+use tokio::sync::{mpsc, watch};
 use tokio::task::{JoinHandle, JoinSet};
 use tokio::time::Duration;
 use tokio_rustls::TlsAcceptor;
@@ -31,6 +34,12 @@ use tokio_util::sync::CancellationToken;
 use url::Url;
 use uuid::Uuid;
 use x509_parser::extensions::{GeneralName, ParsedExtension};
+
+#[derive(Clone)]
+struct TlsState {
+    acceptor: TlsAcceptor,
+    probe_sni_allowlist: Arc<Vec<String>>,
+}
 
 #[tokio::main]
 async fn main() -> std::io::Result<()> {
@@ -71,9 +80,19 @@ async fn run_server(cancel_token: CancellationToken) -> std::io::Result<()> {
     }
 
     let forward_target = validate_forward_url(args.forward.clone())?;
+    let (tls_file_watcher, tls_events, cert_path, key_path) = match (&args.cert, &args.key) {
+        (Some(cert_path), Some(key_path)) => {
+            let (watcher, events, cert_path, key_path) = watch_tls_files(cert_path, key_path)?;
+            (Some(watcher), Some(events), Some(cert_path), Some(key_path))
+        }
+        _ => (None, None, None, None),
+    };
     let (server_tls_config, probe_sni_allowlist) = tls_config(args.sni.as_deref(), args.cert.as_deref(), args.key.as_deref())?;
-    let acceptor = TlsAcceptor::from(Arc::new(server_tls_config));
-    let probe_sni_allowlist = Arc::new(probe_sni_allowlist);
+    let tls_state = TlsState {
+        acceptor: TlsAcceptor::from(Arc::new(server_tls_config)),
+        probe_sni_allowlist: Arc::new(probe_sni_allowlist),
+    };
+    let (tls_state_tx, tls_state_rx) = watch::channel(tls_state);
     let panel_config = args.panel_sync_config()?;
     let panel_sync_enabled = panel_config.is_some();
     let traffic_audit: TrafficAuditPtr = Arc::new(tokio::sync::Mutex::new(TrafficAudit::new()));
@@ -94,6 +113,18 @@ async fn run_server(cancel_token: CancellationToken) -> std::io::Result<()> {
         PaddingFactory::new(DEFAULT_SCHEME).expect("default scheme is valid")
     };
     let listener = TcpListener::bind(args.listen).await?;
+    let _tls_file_watcher = tls_file_watcher;
+    let mut tls_reload_task = match (tls_events, cert_path, key_path) {
+        (Some(events), Some(cert_path), Some(key_path)) => Some(tokio::spawn(reload_tls_on_events(
+            events,
+            tls_state_tx,
+            cert_path,
+            key_path,
+            args.sni.clone(),
+            cancel_token.clone(),
+        ))),
+        _ => None,
+    };
     log::info!("{} -- AnyTLS server listening on {}", method_name_unstable!(), args.listen);
     let padding = Arc::new(tokio::sync::RwLock::new(padding_factory));
     let password = Arc::new(args.password.clone().unwrap_or_default());
@@ -118,26 +149,24 @@ async fn run_server(cancel_token: CancellationToken) -> std::io::Result<()> {
                     Err(error) => break Err(error),
                 };
                 session_id = session_id.wrapping_add(1);
-                let acceptor = acceptor.clone();
+                let tls_state = tls_state_rx.borrow().clone();
                 let padding = padding.clone();
                 let password = password.clone();
                 let max_streams = args.max_streams_per_session;
                 let traffic_audit = Arc::clone(&traffic_audit);
-                let probe_sni_allowlist = Arc::clone(&probe_sni_allowlist);
                 let forward_target = forward_target.clone();
                 let cancel_token = cancel_token.clone();
                 connection_tasks.spawn(async move {
                     log::trace!("{mn} -- accepted TLS session {session_id} from {peer}");
                     if let Err(error) = handle_connection(
                         tcp,
-                        acceptor,
+                        tls_state,
                         padding,
                         password,
                         session_id,
                         max_streams,
                         traffic_audit,
                         panel_sync_enabled,
-                        probe_sni_allowlist,
                         forward_target,
                         cancel_token,
                     )
@@ -158,6 +187,12 @@ async fn run_server(cancel_token: CancellationToken) -> std::io::Result<()> {
     };
 
     cancel_token.cancel();
+    if let Some(mut tls_reload_task) = tls_reload_task.take()
+        && tokio::time::timeout(Duration::from_secs(5), &mut tls_reload_task).await.is_err()
+    {
+        tls_reload_task.abort();
+        let _ = tls_reload_task.await;
+    }
     if let Some(mut panel_task) = panel_task
         && tokio::time::timeout(Duration::from_secs(5), &mut panel_task).await.is_err()
     {
@@ -182,20 +217,19 @@ async fn run_server(cancel_token: CancellationToken) -> std::io::Result<()> {
 #[allow(clippy::too_many_arguments)]
 async fn handle_connection(
     tcp: TcpStream,
-    acceptor: TlsAcceptor,
+    tls_state: TlsState,
     padding: Arc<tokio::sync::RwLock<PaddingFactory>>,
     password: Arc<String>,
     session_id: usize,
     max_streams: usize,
     traffic_audit: TrafficAuditPtr,
     panel_sync_enabled: bool,
-    probe_sni_allowlist: Arc<Vec<String>>,
     forward_target: Option<Url>,
     cancel_token: CancellationToken,
 ) -> std::io::Result<()> {
     let mut tls = tokio::select! {
         _ = cancel_token.cancelled() => return Ok(()),
-        result = acceptor.accept(tcp) => result?,
+        result = tls_state.acceptor.accept(tcp) => result?,
     };
     let client_addr = tls.get_ref().0.peer_addr()?;
     let probe_target = tls.get_ref().1.server_name().map(str::to_owned);
@@ -224,7 +258,7 @@ async fn handle_connection(
             if let Err(error) = relay_result {
                 log::debug!("{mn} -- forward relay failed for {client_addr}: {error}");
             }
-        } else if let Some(target_host) = probe_target.filter(|target| sni_is_allowed(target, &probe_sni_allowlist)) {
+        } else if let Some(target_host) = probe_target.filter(|target| sni_is_allowed(target, &tls_state.probe_sni_allowlist)) {
             let relay_result = tokio::select! {
                 _ = cancel_token.cancelled() => return Ok(()),
                 result = relay_probe_stream(client_addr, target_host, tls, prefix) => result,
@@ -500,6 +534,106 @@ async fn read_target(stream: &mut StreamIo) -> std::io::Result<Address> {
     Address::retrieve_from_async_stream(stream).await
 }
 
+fn watch_tls_files(
+    cert_path: &Path,
+    key_path: &Path,
+) -> std::io::Result<(RecommendedWatcher, mpsc::UnboundedReceiver<notify::Result<Event>>, PathBuf, PathBuf)> {
+    let absolute_path = |path: &Path| -> std::io::Result<PathBuf> {
+        if path.is_absolute() {
+            Ok(path.to_path_buf())
+        } else {
+            Ok(std::env::current_dir()?.join(path))
+        }
+    };
+    let cert_path = absolute_path(cert_path)?;
+    let key_path = absolute_path(key_path)?;
+    let (event_sender, events) = mpsc::unbounded_channel();
+    let mut watcher = notify::recommended_watcher(move |event| {
+        let _ = event_sender.send(event);
+    })
+    .map_err(std::io::Error::other)?;
+
+    let directories: HashSet<PathBuf> = [&cert_path, &key_path]
+        .into_iter()
+        .filter_map(|path| path.parent().map(Path::to_path_buf))
+        .collect();
+    for directory in directories {
+        watcher
+            .watch(&directory, RecursiveMode::NonRecursive)
+            .map_err(std::io::Error::other)?;
+    }
+
+    Ok((watcher, events, cert_path, key_path))
+}
+
+async fn reload_tls_on_events(
+    mut events: mpsc::UnboundedReceiver<notify::Result<Event>>,
+    tls_state: watch::Sender<TlsState>,
+    cert_path: PathBuf,
+    key_path: PathBuf,
+    sni: Option<String>,
+    cancel_token: CancellationToken,
+) {
+    const DEBOUNCE: Duration = Duration::from_millis(250);
+    let mn = method_name_unstable!();
+    loop {
+        tokio::select! {
+            _ = cancel_token.cancelled() => return,
+            event = events.recv() => match event {
+                Some(Ok(event)) if !event_affects_tls_files(&event, &cert_path, &key_path) => continue,
+                Some(Ok(_)) => {}
+                Some(Err(error)) => {
+                    log::warn!("{mn} -- TLS file watcher error: {error}");
+                    continue;
+                }
+                None => return,
+            },
+        };
+        let mut debounce = Box::pin(tokio::time::sleep(DEBOUNCE));
+        loop {
+            tokio::select! {
+                _ = cancel_token.cancelled() => return,
+                _ = &mut debounce => break,
+                event = events.recv() => match event {
+                    Some(Ok(event)) if event_affects_tls_files(&event, &cert_path, &key_path) => {
+                        debounce.as_mut().reset(tokio::time::Instant::now() + DEBOUNCE);
+                    }
+                    Some(Ok(_)) => {}
+                    Some(Err(error)) => log::warn!("{mn} -- TLS file watcher error: {error}"),
+                    None => return,
+                },
+            }
+        }
+
+        let cert_path_for_load = cert_path.clone();
+        let key_path_for_load = key_path.clone();
+        let sni_for_load = sni.clone();
+        let load =
+            tokio::task::spawn_blocking(move || tls_config(sni_for_load.as_deref(), Some(&cert_path_for_load), Some(&key_path_for_load)));
+        let result = tokio::select! {
+            _ = cancel_token.cancelled() => return,
+            result = load => result,
+        };
+        match result {
+            Ok(Ok((config, probe_sni_allowlist))) => {
+                tls_state.send_replace(TlsState {
+                    acceptor: TlsAcceptor::from(Arc::new(config)),
+                    probe_sni_allowlist: Arc::new(probe_sni_allowlist),
+                });
+                log::info!("{mn} -- reloaded TLS certificate and private key");
+            }
+            Ok(Err(error)) => {
+                log::warn!("{mn} -- failed to reload TLS certificate and private key; keeping the current configuration: {error}",);
+            }
+            Err(error) => log::error!("{mn} -- TLS reload task failed: {error}"),
+        }
+    }
+}
+
+fn event_affects_tls_files(event: &Event, cert_path: &Path, key_path: &Path) -> bool {
+    !event.kind.is_access() && event.paths.iter().any(|path| path == cert_path || path == key_path)
+}
+
 fn tls_config(sni: Option<&str>, cert_path: Option<&Path>, key_path: Option<&Path>) -> std::io::Result<(ServerConfig, Vec<String>)> {
     use std::io::{Error, ErrorKind::InvalidData, ErrorKind::InvalidInput};
     if let (Some(cert_path), Some(key_path)) = (cert_path, key_path) {
@@ -681,11 +815,34 @@ where
 
 #[cfg(test)]
 mod tls_config_tests {
-    use super::{relay_forward_stream, tls_config, validate_forward_url};
-    use std::path::Path;
+    use super::{
+        TlsState, event_affects_tls_files, relay_forward_stream, reload_tls_on_events, tls_config, validate_forward_url, watch_tls_files,
+    };
+    use notify::{Event, EventKind, event::AccessKind, event::ModifyKind};
+    use std::{path::Path, sync::Arc};
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::TcpListener;
+    use tokio::sync::watch;
+    use tokio_util::sync::CancellationToken;
     use url::Url;
+
+    #[test]
+    fn tls_reload_ignores_unrelated_and_access_events() {
+        let cert_path = Path::new("/tmp/certificate.pem");
+        let key_path = Path::new("/tmp/private-key.pem");
+
+        let mut unrelated = Event::new(EventKind::Modify(ModifyKind::Any));
+        unrelated.paths.push(Path::new("/tmp/other.txt").to_path_buf());
+        assert!(!event_affects_tls_files(&unrelated, cert_path, key_path));
+
+        let mut access = Event::new(EventKind::Access(AccessKind::Any));
+        access.paths.push(cert_path.to_path_buf());
+        assert!(!event_affects_tls_files(&access, cert_path, key_path));
+
+        let mut certificate_change = Event::new(EventKind::Modify(ModifyKind::Any));
+        certificate_change.paths.push(cert_path.to_path_buf());
+        assert!(event_affects_tls_files(&certificate_change, cert_path, key_path));
+    }
 
     #[test]
     fn requires_certificate_and_key_together() {
@@ -734,5 +891,75 @@ mod tls_config_tests {
         assert_eq!(response, b"probe response");
         assert_eq!(target.await.unwrap(), b"GET / HTTP/1.1\r\n\r\n");
         relay.await.unwrap().unwrap();
+    }
+
+    #[tokio::test]
+    async fn reloads_tls_state_after_certificate_and_key_change() {
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let directory = std::env::temp_dir().join(format!("anytls-tls-reload-{}-{nonce}", std::process::id()));
+        std::fs::create_dir(&directory).unwrap();
+        let cert_path = directory.join("certificate.pem");
+        let key_path = directory.join("private-key.pem");
+        let write_pair = |dns_name: &str, replace_atomically: bool| {
+            let certified = rcgen::generate_simple_self_signed(vec![dns_name.to_owned()]).unwrap();
+            let cert_output = if replace_atomically {
+                directory.join("certificate.pem.next")
+            } else {
+                cert_path.clone()
+            };
+            let key_output = if replace_atomically {
+                directory.join("private-key.pem.next")
+            } else {
+                key_path.clone()
+            };
+            std::fs::write(&cert_output, certified.cert.pem()).unwrap();
+            std::fs::write(&key_output, certified.signing_key.serialize_pem()).unwrap();
+            if replace_atomically {
+                std::fs::rename(cert_output, &cert_path).unwrap();
+                std::fs::rename(key_output, &key_path).unwrap();
+            }
+        };
+        write_pair("initial.example.com", false);
+
+        let (watcher, events, cert_path, key_path) = watch_tls_files(&cert_path, &key_path).unwrap();
+        let (config, probe_sni_allowlist) = tls_config(None, Some(&cert_path), Some(&key_path)).unwrap();
+        let (tls_state_tx, mut tls_state_rx) = watch::channel(TlsState {
+            acceptor: tokio_rustls::TlsAcceptor::from(Arc::new(config)),
+            probe_sni_allowlist: Arc::new(probe_sni_allowlist),
+        });
+        let cancel_token = CancellationToken::new();
+        let reload_task = tokio::spawn(reload_tls_on_events(
+            events,
+            tls_state_tx,
+            cert_path,
+            key_path,
+            None,
+            cancel_token.clone(),
+        ));
+
+        write_pair("updated.example.com", true);
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            loop {
+                tls_state_rx.changed().await.unwrap();
+                if tls_state_rx
+                    .borrow()
+                    .probe_sni_allowlist
+                    .iter()
+                    .any(|name| name == "updated.example.com")
+                {
+                    break;
+                }
+            }
+        })
+        .await
+        .expect("updated certificate should be loaded");
+
+        cancel_token.cancel();
+        reload_task.await.unwrap();
+        drop(watcher);
+        std::fs::remove_dir_all(directory).unwrap();
     }
 }
