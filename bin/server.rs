@@ -545,8 +545,18 @@ fn watch_tls_files(
             Ok(std::env::current_dir()?.join(path))
         }
     };
-    let cert_path = absolute_path(cert_path)?;
-    let key_path = absolute_path(key_path)?;
+    let normalize_path = |path: &Path| -> std::io::Result<PathBuf> {
+        let path = absolute_path(path)?;
+        let parent = path
+            .parent()
+            .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::InvalidInput, "TLS file path has no parent"))?;
+        let file_name = path
+            .file_name()
+            .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::InvalidInput, "TLS file path has no name"))?;
+        Ok(parent.canonicalize()?.join(file_name))
+    };
+    let cert_path = normalize_path(cert_path)?;
+    let key_path = normalize_path(key_path)?;
     let (event_sender, events) = mpsc::unbounded_channel();
     let mut watcher = notify::recommended_watcher(move |event| {
         let _ = event_sender.send(event);
@@ -827,21 +837,21 @@ mod tls_config_tests {
     use url::Url;
 
     #[test]
-    fn tls_reload_ignores_unrelated_and_access_events() {
+    fn tls_reload_filters_unrelated_and_access_events() {
         let cert_path = Path::new("/tmp/certificate.pem");
         let key_path = Path::new("/tmp/private-key.pem");
 
-        let mut unrelated = Event::new(EventKind::Modify(ModifyKind::Any));
-        unrelated.paths.push(Path::new("/tmp/other.txt").to_path_buf());
-        assert!(!event_affects_tls_files(&unrelated, cert_path, key_path));
-
-        let mut access = Event::new(EventKind::Access(AccessKind::Any));
-        access.paths.push(cert_path.to_path_buf());
-        assert!(!event_affects_tls_files(&access, cert_path, key_path));
+        let mut sibling = Event::new(EventKind::Modify(ModifyKind::Any));
+        sibling.paths.push(Path::new("/tmp/certificate.pem.next").to_path_buf());
+        assert!(!event_affects_tls_files(&sibling, cert_path, key_path));
 
         let mut certificate_change = Event::new(EventKind::Modify(ModifyKind::Any));
         certificate_change.paths.push(cert_path.to_path_buf());
         assert!(event_affects_tls_files(&certificate_change, cert_path, key_path));
+
+        let mut access = Event::new(EventKind::Access(AccessKind::Any));
+        access.paths.push(cert_path.to_path_buf());
+        assert!(!event_affects_tls_files(&access, cert_path, key_path));
     }
 
     #[test]
