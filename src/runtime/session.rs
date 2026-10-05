@@ -98,11 +98,11 @@ impl StreamState {
                 break Err(e);
             }
         };
-        let f_n = method_name_unstable!();
+        let mn = method_name_unstable!();
         if let Err(e) = result {
-            log::warn!("{f_n} -- Session {session_id} stream {stream_id} task encountered an error: {e}");
+            log::warn!("{mn} -- Session {session_id} stream {stream_id} task encountered an error: {e}");
         } else {
-            log::trace!("{f_n} -- Session {session_id} stream {stream_id} task completed successfully");
+            log::trace!("{mn} -- Session {session_id} stream {stream_id} task completed successfully");
         }
     }
 }
@@ -306,18 +306,18 @@ impl Session {
     }
 
     async fn do_main_loop_task(session: Arc<Session>, session_id: usize) {
-        let function_name = method_name_unstable!();
+        let mn = method_name_unstable!();
         let result = Arc::clone(&session).receive_loop().await;
         match result {
-            Ok(()) => log::debug!("{function_name} -- Session {session_id} receive loop stopped",),
-            Err(error) => log::warn!("{function_name} -- Session {session_id} receive loop failed: {error}"),
+            Ok(()) => log::debug!("{mn} -- Session {session_id} receive loop stopped",),
+            Err(error) => log::warn!("{mn} -- Session {session_id} receive loop failed: {error}"),
         }
         let _ = session.shutdown().await;
-        log::debug!("{function_name} -- Session {session_id} shut down");
+        log::debug!("{mn} -- Session {session_id} shut down");
     }
 
     async fn do_heartbeat_task(session: Weak<Session>, session_id: usize, close_token: CancellationToken) {
-        let function_name = method_name_unstable!();
+        let mn = method_name_unstable!();
         let mut ticker = tokio::time::interval(HEARTBEAT_INTERVAL);
         ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         ticker.tick().await;
@@ -332,6 +332,10 @@ impl Session {
             if session.peer_version.load(std::sync::atomic::Ordering::Acquire) < 2 {
                 continue;
             }
+
+            let len = session.streams.lock().await.len();
+            log::trace!("{mn} -- Session {session_id} sending heartbeat, total {len} streams");
+
             let response = session.heart_response.notified();
             tokio::pin!(response);
             response.as_mut().enable();
@@ -344,11 +348,8 @@ impl Session {
                 _ = close_token.cancelled() => break,
                 result = tokio::time::timeout(HEARTBEAT_TIMEOUT, probe) => result,
             };
-            if matches!(result, Ok(Ok(()))) {
-                let len = session.streams.lock().await.len();
-                log::trace!("{function_name} -- Session {session_id} heartbeat succeeded; {len} active streams");
-            } else {
-                log::warn!("{function_name} -- Session {session_id} heartbeat failed or timed out; closing stalled transport");
+            if !matches!(result, Ok(Ok(()))) {
+                log::warn!("{mn} -- Session {session_id} heartbeat failed or timed out; closing stalled transport");
                 let _ = session.shutdown().await;
                 break;
             }
@@ -363,8 +364,8 @@ impl Session {
         if let Some(session) = session.upgrade()
             && session.is_idle().await
         {
-            let function_name = method_name_unstable!();
-            log::debug!("{function_name} -- Session {session_id} reached its maximum age while idle; closing");
+            let mn = method_name_unstable!();
+            log::debug!("{mn} -- Session {session_id} reached its maximum age while idle; closing");
             let _ = session.shutdown().await;
         }
     }
@@ -417,9 +418,9 @@ impl Session {
                 return Err(Error::new(WouldBlock, format!("session {session_id} stream limit reached")));
             }
             streams.insert(id, StreamState::new(remote, id, Arc::downgrade(self)));
-            let f_n = method_name_unstable!();
+            let mn = method_name_unstable!();
             let l = streams.len();
-            log::debug!("{f_n} -- session {session_id} reserved stream {id}, total streams: {l}",);
+            log::debug!("{mn} -- session {session_id} reserved stream {id}, total streams: {l}",);
         }
         Ok(Stream::new(id, Arc::downgrade(self), local))
     }
@@ -554,7 +555,7 @@ impl Session {
     async fn receive_loop(self: Arc<Self>) -> std::io::Result<()> {
         use std::io::{Error, ErrorKind::InvalidData};
         let session_id = self.id();
-        let func_name = method_name_unstable!();
+        let mn = method_name_unstable!();
         loop {
             let result = tokio::select! {
                 result = async {
@@ -569,11 +570,11 @@ impl Session {
             let frame = match result {
                 Ok(Some(frame)) => frame,
                 Ok(None) => {
-                    log::debug!("{func_name} -- Session {session_id} peer closed transport");
+                    log::debug!("{mn} -- Session {session_id} peer closed transport");
                     break Ok(());
                 }
                 Err(error) if is_peer_disconnect(&error) => {
-                    log::debug!("{func_name} -- Session {session_id} transport reset: {error}");
+                    log::debug!("{mn} -- Session {session_id} transport reset: {error}");
                     break Ok(());
                 }
                 Err(error) => break Err(error),
@@ -591,7 +592,7 @@ impl Session {
                     if let Some(push_sender) = push_sender
                         && let Err(e) = push_sender.send(Some(frame.data))
                     {
-                        log::debug!("{func_name} -- Session {session_id} stream {stream_id} push worker closed, closing stream: {e}");
+                        log::debug!("{mn} -- Session {session_id} stream {stream_id} push worker closed, closing stream: {e}");
                         if !self.is_closed() {
                             self.queue_control(Frame::new(Command::Fin, stream_id))?;
                             self.remove_stream_by_id(stream_id).await;
@@ -606,15 +607,18 @@ impl Session {
                     if !frame.data.is_empty() {
                         self.remove_stream_by_id(stream_id).await;
                         let i = String::from_utf8_lossy(&frame.data);
-                        log::warn!("{func_name} -- Session {session_id} stream {stream_id} received SynAck with unexpected data: {i}");
+                        log::warn!("{mn} -- Session {session_id} stream {stream_id} received SynAck with unexpected data: {i}");
                     }
                     // TODO: Handle additional SynAck logic if necessary
                 }
                 Command::HeartRequest => {
-                    log::trace!("{func_name} -- Session {session_id}: Received HeartRequest");
+                    log::trace!("{mn} -- Session {session_id}: Received HeartRequest");
                     self.queue_control(Frame::new(Command::HeartResponse, stream_id))?;
                 }
-                Command::HeartResponse => self.heart_response.notify_waiters(),
+                Command::HeartResponse => {
+                    log::trace!("{mn} -- Session {session_id}: Received HeartResponse");
+                    self.heart_response.notify_waiters();
+                }
                 Command::ServerSettings => {
                     let map = from_bytes(&frame.data);
                     if self.is_client
@@ -632,7 +636,7 @@ impl Session {
                 }
                 Command::Alert => {
                     let info = String::from_utf8_lossy(&frame.data);
-                    log::warn!("{func_name} -- Session {session_id} received alert: {info}",);
+                    log::warn!("{mn} -- Session {session_id} received alert: {info}",);
                     break Ok(());
                 }
             }
@@ -714,7 +718,8 @@ impl Session {
             }
         };
         if should_send_fin && let Err(error) = self.enqueue_fin(stream_id).await {
-            log::warn!("Session {session_id}: Failed to send FIN for stream {stream_id}: {error}");
+            let mn = method_name_unstable!();
+            log::warn!("{mn} -- Session {session_id}: Failed to send FIN for stream {stream_id}: {error}");
         }
         self.remove_stream_by_id(stream_id).await;
     }
@@ -722,7 +727,7 @@ impl Session {
     /// Finish the stream state identified by `stream_id` by removing it from the container of active stream states and dropping its resources.
     /// If this was the last active stream state, mark the session as idle.
     async fn remove_stream_by_id(self: &Arc<Self>, stream_id: u32) {
-        let function_name = method_name_unstable!();
+        let mn = method_name_unstable!();
         let session_id = self.id();
         let became_idle = {
             let mut streams = self.streams.lock().await;
@@ -730,14 +735,14 @@ impl Session {
                 drop(entry.writer);
                 entry.close_token.cancel();
                 let l = streams.len();
-                log::trace!("{function_name} -- Stream {stream_id} removed in session {session_id}, remaining streams: {l}");
+                log::trace!("{mn} -- Stream {stream_id} removed in session {session_id}, remaining streams: {l}");
             }
             streams.is_empty()
         };
 
         if became_idle {
             if self.is_expired() {
-                log::debug!("{function_name} -- Expired session {session_id} drained; shutting it down");
+                log::debug!("{mn} -- Expired session {session_id} drained; shutting it down");
                 let _ = self.shutdown().await;
                 return;
             }
@@ -745,9 +750,9 @@ impl Session {
             if let Some(sender) = sender
                 && let Err(e) = sender.send(Arc::clone(self))
             {
-                log::warn!("{function_name} -- Failed to send session {session_id} to idle sessions pool: {e}");
+                log::warn!("{mn} -- Failed to send session {session_id} to idle sessions pool: {e}");
             }
-            log::trace!("{function_name} -- Session {session_id} became idle.");
+            log::trace!("{mn} -- Session {session_id} became idle.");
         }
     }
 
@@ -775,9 +780,9 @@ impl Session {
                 rejection = Some("session stream limit reached");
             } else {
                 streams.insert(stream_id, StreamState::new(remote, stream_id, Arc::downgrade(self)));
-                let f_n = method_name_unstable!();
+                let mn = method_name_unstable!();
                 let l = streams.len();
-                log::debug!("{f_n} -- session {} accepted new stream {stream_id}, total streams: {l}", self.id(),);
+                log::debug!("{mn} -- session {} accepted new stream {stream_id}, total streams: {l}", self.id(),);
             }
             rejection
         };
@@ -893,10 +898,10 @@ pub struct Stream {
 
 impl Stream {
     fn new(id: u32, session: Weak<Session>, io: tokio::io::DuplexStream) -> Self {
-        let function_name = method_name_unstable!();
+        let mn = method_name_unstable!();
         let (reader, writer) = tokio::io::split(io);
         let session_id = session.upgrade().map(|s| s.id()).unwrap_or_default();
-        log::trace!("{function_name} -- Creating stream {id} in session {session_id}");
+        log::trace!("{mn} -- Creating stream {id} in session {session_id}");
         Self {
             id,
             session,
@@ -932,7 +937,8 @@ impl Stream {
     pub async fn write(&self, data: &[u8]) -> std::io::Result<usize> {
         use std::io::{Error, ErrorKind::BrokenPipe};
         if self.closed {
-            log::debug!("Stream {} is closed, can't write data", self.id);
+            let mn = method_name_unstable!();
+            log::debug!("{mn} -- Stream {} is closed, can't write data", self.id);
             return Err(Error::new(BrokenPipe, format!("stream {} closed, can't write data", self.id)));
         }
         let session = self
@@ -998,25 +1004,23 @@ impl Drop for Stream {
     fn drop(&mut self) {
         let id = self.id;
         let session_id = self.session_id;
-        let function_name = method_name_unstable!();
+        let mn = method_name_unstable!();
 
-        log::trace!("{function_name} -- Dropping stream {id} of session {session_id}...");
+        log::trace!("{mn} -- Dropping stream {id} of session {session_id}...");
         if self.closed {
-            log::debug!("{function_name} -- Stream {id} of session {session_id} already closed, skipping drop it.");
+            log::debug!("{mn} -- Stream {id} of session {session_id} already closed, skipping drop it.");
             return;
         }
         self.closed = true;
 
         let Some(session) = self.session.upgrade() else {
-            log::debug!(
-                "{function_name} -- Stream {id}: Session {session_id} already closed but stream lifecycle not complete yet, skipping drop."
-            );
+            log::debug!("{mn} -- Stream {id}: Session {session_id} already closed but stream lifecycle not complete yet, skipping drop.");
             return;
         };
         if let Ok(handle) = tokio::runtime::Handle::try_current() {
             handle.spawn(async move {
                 session.helper_drop_stream_by_id(id).await;
-                log::debug!("{function_name} -- Dropped stream {id} of session {session_id} successfully.");
+                log::debug!("{mn} -- Dropped stream {id} of session {session_id} successfully.");
             });
         }
     }

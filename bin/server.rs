@@ -407,9 +407,9 @@ async fn relay_stream(
     let _ = outbound.shutdown().await;
     match relay_result {
         Ok(_) => {
-            let elapsed = started.elapsed();
+            let elapsed = started.elapsed().as_secs();
             log::trace!(
-                "{mn} -- session {session_id} stream {stream_id}: relay to {destination} closed: stream_to_target={upstream} bytes, target_to_stream={downstream} bytes, elapsed={elapsed:?}",
+                "{mn} -- session {session_id} stream {stream_id}: relay to {destination} closed: up={upstream}, down={downstream}, elapsed={elapsed}s",
             );
             Ok(())
         }

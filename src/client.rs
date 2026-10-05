@@ -169,10 +169,10 @@ impl Client {
                     break;
                 }
                 if !session.is_closed() && session.is_idle().await {
-                    let f_n = method_name_unstable!();
+                    let mn = method_name_unstable!();
                     let session_id = session.id();
                     if session.is_expired() {
-                        log::info!("{f_n} -- closing expired idle session {session_id}");
+                        log::info!("{mn} -- closing expired idle session {session_id}");
                         let _ = session.shutdown().await;
                         continue;
                     }
@@ -180,10 +180,10 @@ impl Client {
                     if !idle.iter().any(|item| item.session.id() == session.id()) {
                         if idle.len() < MAX_IDLE_SESSIONS {
                             idle.push(IdleSession::new(session));
-                            log::trace!("{f_n} -- added idle session {session_id}, total idle: {}", idle.len());
+                            log::trace!("{mn} -- added idle session {session_id}, total idle: {}", idle.len());
                         } else {
                             drop(idle);
-                            log::trace!("{f_n} -- closing excess idle session {session_id}");
+                            log::trace!("{mn} -- closing excess idle session {session_id}");
                             let _ = session.shutdown().await;
                         }
                     }
@@ -264,8 +264,8 @@ impl Client {
                 retained.push(item);
             }
         }
-        let f_n = method_name_unstable!();
-        log::trace!("{f_n} -- cleaned up idle sessions, total idle: {}", retained.len());
+        let mn = method_name_unstable!();
+        log::trace!("{mn} -- cleaned up idle sessions, total idle: {}", retained.len());
         *idle = retained;
     }
 }
