@@ -1,7 +1,10 @@
 use method_name::method_name_unstable;
 use std::{
     collections::HashMap,
-    sync::{Arc, Weak},
+    sync::{
+        Arc, Weak,
+        atomic::{AtomicU32, Ordering},
+    },
 };
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
@@ -16,6 +19,17 @@ const WRITE_TIMEOUT: Duration = Duration::from_secs(15);
 const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(15);
 const HEARTBEAT_TIMEOUT: Duration = Duration::from_secs(10);
 pub const DEFAULT_MAX_SESSION_AGE: Duration = Duration::from_secs(60 * 60);
+
+static NEXT_STREAM_ID: AtomicU32 = AtomicU32::new(0);
+
+fn allocate_stream_id(counter: &AtomicU32) -> u32 {
+    loop {
+        let stream_id = counter.fetch_add(1, Ordering::Relaxed).wrapping_add(1);
+        if stream_id != 0 {
+            return stream_id;
+        }
+    }
+}
 
 pub fn is_peer_disconnect(error: &std::io::Error) -> bool {
     error.kind() == std::io::ErrorKind::ConnectionReset
@@ -114,7 +128,6 @@ pub struct Session {
     max_streams: usize,
     write_sender: mpsc::Sender<WriteRequest>,
     streams: Mutex<HashMap<u32, StreamState>>,
-    next_stream_id: std::sync::atomic::AtomicU32,
     /// Indicates whether the session has been closed.
     closed: Arc<std::sync::atomic::AtomicBool>,
     is_client: bool,
@@ -188,7 +201,6 @@ impl Session {
             max_streams: max_streams.max(1),
             write_sender,
             streams: Mutex::new(HashMap::new()),
-            next_stream_id: std::sync::atomic::AtomicU32::new(0),
             closed,
             is_client,
             peer_version: std::sync::atomic::AtomicU8::new(0),
@@ -402,7 +414,7 @@ impl Session {
         if self.is_closed() {
             return Err(Error::new(BrokenPipe, format!("session {session_id} closed")));
         }
-        let id = self.next_stream_id.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+        let id = allocate_stream_id(&NEXT_STREAM_ID);
         let (local, remote) = tokio::io::duplex(64 * 1024);
 
         {
@@ -1031,6 +1043,22 @@ pub(crate) mod tests {
     use super::*;
     use crate::DEFAULT_SCHEME;
 
+    #[test]
+    fn stream_ids_skip_zero_when_wrapping() {
+        let counter = AtomicU32::new(u32::MAX - 1);
+        assert_eq!(allocate_stream_id(&counter), u32::MAX);
+        assert_eq!(allocate_stream_id(&counter), 1);
+    }
+
+    #[test]
+    fn stream_ids_are_allocated_globally() {
+        let first = allocate_stream_id(&NEXT_STREAM_ID);
+        let second = allocate_stream_id(&NEXT_STREAM_ID);
+        assert_ne!(first, 0);
+        assert_ne!(second, 0);
+        assert_ne!(first, second);
+    }
+
     #[derive(Default)]
     pub(crate) struct WriteGate {
         blocked: std::sync::atomic::AtomicBool,
@@ -1311,10 +1339,11 @@ pub(crate) mod tests {
         server.run().await.unwrap();
 
         let mut client_stream = client.open_stream().await.unwrap();
-        assert_eq!(client_stream.id(), 1);
+        assert_ne!(client_stream.id(), 0);
 
         client_stream.write(b"hello").await.unwrap();
         let server_stream = server.accept_stream().await.unwrap();
+        assert_eq!(server_stream.id(), client_stream.id());
         let mut received = [0u8; 5];
         server_stream.read(&mut received).await.unwrap();
         assert_eq!(&received, b"hello");

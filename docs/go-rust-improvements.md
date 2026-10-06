@@ -16,14 +16,16 @@ The Go implementation uses an atomic `uint64` sequence and starts at `1`. The Ru
 
 ## Logical Stream IDs
 
-A Session allocates logical stream IDs with an atomic `AtomicU32` counter. The first data stream has SID `1`.
+The Rust process uses one atomic `AtomicU32` counter to allocate logical stream IDs. Allocation increments the `u32` sequence, wraps after `u32::MAX`, and skips `0`, so the first ID is `1` and no data stream is assigned the control-frame SID.
 
 - `sid = 0` is reserved for control frames.
 - `sid > 0` identifies a data stream.
 - Data commands are `SYN`, `PSH`, `FIN`, and `SYNACK`.
 - Control commands include `Settings`, `Alert`, padding updates, server settings, and heartbeat commands.
 
-The Rust implementation rejects a frame whose SID does not match its command class. The Go implementation allocates the same non-zero SID sequence but does not enforce every SID class at the receive boundary.
+The allocator is an implementation detail; the wire protocol associates each data SID with a stream in its Session. IDs are eventually reused after the `u32` sequence wraps.
+
+The Rust implementation rejects a frame whose SID does not match its command class. The Go implementation also uses non-zero SIDs, but does not enforce every SID class at the receive boundary.
 
 ## Maximum Streams Per Session
 

@@ -6,9 +6,9 @@
 
 本协议基于 TLS 协议，TLS 握手完成后客户端立即发送认证请求：
 
-| sha256(password) | padding0 length | padding0 |
-|--|--|--|
-| 32 Bytes | Big-Endian uint16 | 可变长度 |
+| sha256(password) | padding0 length   | padding0 |
+| ---------------- | ----------------- | -------- |
+| 32 Bytes         | Big-Endian uint16 | 可变长度 |
 
 认证成功服务器会进入会话循环，认证失败服务器会关闭连接（或 fallback 到 http 服务）。
 
@@ -16,9 +16,9 @@
 
 认证完成后，客户端&服务器在 TLS 协议之上开启会话层事件循环，会话层 frame 格式如下：
 
-| command | streamId | data length | data |
-|--|--|--|--|
-| uint8 | Big-Endian uint32 | Big-Endian uint16 | 可变长度 |
+| command | streamId          | data length       | data     |
+| ------- | ----------------- | ----------------- | -------- |
+| uint8   | Big-Endian uint32 | Big-Endian uint16 | 可变长度 |
 
 **客户端每次开启新会话必须立即发送 `cmdSettings`。**
 
@@ -55,7 +55,7 @@
 
 #### cmdSYN
 
-客户端通知服务器打开一条新的 Stream。客户端应为每个 Stream 生成在 Session 内单调递增的 streamId。
+客户端通知服务器打开一条新的 Stream。~~客户端应为每个 Stream 生成在 Session 内单调递增的 streamId。~~数据 Stream 的 `streamId` 必须非零，并且在所属 Session 中不能与其他活动 Stream 冲突。`streamId = 0` 保留给控制帧。分配器可以跨 Session 共用；计数器回绕时必须跳过 `0`。
 
 #### cmdSYNACK
 
