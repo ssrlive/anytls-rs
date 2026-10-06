@@ -14,6 +14,8 @@ mod panel_sync;
 pub mod relay;
 #[cfg(feature = "runtime")]
 mod runtime;
+#[cfg(feature = "client")]
+mod traffic_status;
 #[cfg(feature = "uot")]
 mod uot;
 #[cfg(feature = "server")]
@@ -38,6 +40,8 @@ pub use core::{read_auth, read_auth_with_client_id, write_auth, write_auth_with_
 pub use panel_sync::{PanelSyncClient, PanelSyncConfig, TrafficAudit, TrafficAuditPtr};
 #[cfg(feature = "runtime")]
 pub use runtime::{AsyncReadWrite, BoxTransport, DEFAULT_MAX_SESSION_AGE, Session, Stream, StreamIo, is_peer_disconnect};
+#[cfg(feature = "client")]
+pub use traffic_status::TrafficStatus;
 #[cfg(feature = "uot")]
 pub use uot::{
     UotMode, UotRequest, V2_MAGIC_ADDRESS, uot_encode_packet, uot_get_packet_from_stream, uot_get_request_from_stream,

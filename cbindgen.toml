@@ -4,5 +4,14 @@ include_guard = "ANYTLS_H"
 documentation = true
 
 [export]
-include = ["anytls_client_run", "anytls_client_stop", "anytls_generate_url"]
-item_types = ["functions"]
+include = [
+    "anytls_client_run",
+    "anytls_client_stop",
+    "anytls_generate_url",
+    "anytls_set_traffic_status_callback",
+    "TrafficStatus",
+]
+item_types = ["functions", "structs"]
+
+[export.rename]
+"TrafficStatus" = "AnyTlsTrafficStatus"

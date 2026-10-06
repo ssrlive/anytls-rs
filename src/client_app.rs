@@ -1,5 +1,5 @@
 use crate::{
-    BoxTransport, Client, ClientArgs, DEFAULT_SCHEME, Dialer, PaddingFactory, Stream, StreamIo, UotMode, UotRequest, relay,
+    BoxTransport, Client, ClientArgs, DEFAULT_SCHEME, Dialer, PaddingFactory, Stream, StreamIo, UotMode, UotRequest, relay, traffic_status,
     uot_encode_packet, uot_get_packet_from_stream, uot_sentinel_destination, write_auth_with_client_id,
 };
 use clap::Parser;
@@ -411,11 +411,17 @@ impl HttpStreamIo {
 
 impl AsyncRead for HttpStreamIo {
     fn poll_read(self: Pin<&mut Self>, cx: &mut Context<'_>, buf: &mut ReadBuf<'_>) -> Poll<std::io::Result<()>> {
+        let filled_before = buf.filled().len();
         let mut inner = match self.inner.lock() {
             Ok(inner) => inner,
             Err(_) => return Poll::Ready(Err(std::io::Error::other("HTTP stream lock poisoned"))),
         };
-        Pin::new(&mut *inner).poll_read(cx, buf)
+        let result = Pin::new(&mut *inner).poll_read(cx, buf);
+        drop(inner);
+        if matches!(result, Poll::Ready(Ok(()))) {
+            traffic_status::record(0, buf.filled().len() - filled_before);
+        }
+        result
     }
 }
 
@@ -434,7 +440,14 @@ impl AsyncWrite for HttpStreamIo {
             Ok(inner) => inner,
             Err(_) => return Poll::Ready(Err(std::io::Error::other("HTTP stream lock poisoned"))),
         };
-        Pin::new(&mut *inner).poll_write(cx, buf)
+        let result = Pin::new(&mut *inner).poll_write(cx, buf);
+        drop(inner);
+        if let Poll::Ready(Ok(written)) = result {
+            traffic_status::record(written, 0);
+            Poll::Ready(Ok(written))
+        } else {
+            result
+        }
     }
 
     fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
@@ -451,6 +464,52 @@ impl AsyncWrite for HttpStreamIo {
             Err(_) => return Poll::Ready(Err(std::io::Error::other("HTTP stream lock poisoned"))),
         };
         Pin::new(&mut *inner).poll_shutdown(cx)
+    }
+}
+
+#[derive(Clone, Copy)]
+enum TrafficDirection {
+    Tx,
+    Rx,
+}
+
+struct TrafficCounter<S> {
+    inner: S,
+    direction: TrafficDirection,
+}
+
+impl<S> TrafficCounter<S> {
+    fn new(inner: S, direction: TrafficDirection) -> Self {
+        Self { inner, direction }
+    }
+}
+
+impl<S: AsyncRead + Unpin> AsyncRead for TrafficCounter<S> {
+    fn poll_read(mut self: Pin<&mut Self>, cx: &mut Context<'_>, buf: &mut ReadBuf<'_>) -> Poll<std::io::Result<()>> {
+        Pin::new(&mut self.inner).poll_read(cx, buf)
+    }
+}
+
+impl<S: AsyncWrite + Unpin> AsyncWrite for TrafficCounter<S> {
+    fn poll_write(mut self: Pin<&mut Self>, cx: &mut Context<'_>, buf: &[u8]) -> Poll<std::io::Result<usize>> {
+        let result = Pin::new(&mut self.inner).poll_write(cx, buf);
+        if let Poll::Ready(Ok(written)) = result {
+            match self.direction {
+                TrafficDirection::Tx => traffic_status::record(written, 0),
+                TrafficDirection::Rx => traffic_status::record(0, written),
+            }
+            Poll::Ready(Ok(written))
+        } else {
+            result
+        }
+    }
+
+    fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+        Pin::new(&mut self.inner).poll_flush(cx)
+    }
+
+    fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+        Pin::new(&mut self.inner).poll_shutdown(cx)
     }
 }
 
@@ -501,9 +560,9 @@ async fn handle_socks5(incoming: IncomingConnection, client: Arc<Client>, contex
     let started = std::time::Instant::now();
     log::trace!("{mn} -- opening SOCKS5 CONNECT to {target}");
     let stream = client.create_stream().await?;
-    let mut remote = StreamIo::new(stream);
+    let mut remote = TrafficCounter::new(StreamIo::new(stream), TrafficDirection::Tx);
     target.write_to_async_stream(&mut remote).await?;
-    let mut ready = match connect.reply(Reply::Succeeded, Address::unspecified()).await {
+    let ready = match connect.reply(Reply::Succeeded, Address::unspecified()).await {
         Ok(ready) => ready,
         Err(error) if relay::is_peer_disconnect(&error) => {
             log::debug!("{mn} -- Proxy peer disconnected before SOCKS5 reply: {}: {error}", context.label());
@@ -511,6 +570,7 @@ async fn handle_socks5(incoming: IncomingConnection, client: Arc<Client>, contex
         }
         Err(error) => return Err(error),
     };
+    let mut ready = TrafficCounter::new(ready, TrafficDirection::Rx);
     let (client_to_proxy, proxy_to_client) = match relay::copy_bidirectional(&mut ready, &mut remote).await {
         Ok(counts) => counts,
         Err(error) if error.is_peer_disconnect() => {
@@ -599,6 +659,7 @@ async fn handle_udp_associate(associate: UdpAssociate<associate::NeedReply>, cli
                 *incoming_addr.lock().await = source;
                 let frame = uot_encode_packet(UotMode::Datagram, Some(&destination), &payload)?;
                 write_stream_all(&proxy_stream, &frame).await?;
+                traffic_status::record(payload.len(), 0);
             }
             packet = packet_receiver.recv() => {
                 let packet = packet.ok_or_else(|| std::io::Error::new(std::io::ErrorKind::BrokenPipe, "UOT reader stopped"))??;
@@ -609,6 +670,7 @@ async fn handle_udp_associate(associate: UdpAssociate<associate::NeedReply>, cli
                 }
                 let source = source.ok_or_else(|| std::io::Error::new(std::io::ErrorKind::InvalidData, "UOT response has no source address"))?;
                 listen_udp.send_to(&payload, 0, source, incoming).await?;
+                traffic_status::record(0, payload.len());
             }
             closed = control.wait_until_closed() => {
                 closed?;

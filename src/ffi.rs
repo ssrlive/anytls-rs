@@ -1,4 +1,4 @@
-use crate::{ClientArgs, client_app};
+use crate::{ClientArgs, TrafficStatus, client_app, traffic_status};
 use clap::Parser;
 use method_name::method_name_unstable;
 use std::{
@@ -11,6 +11,28 @@ use std::{
 use tokio_util::sync::CancellationToken;
 
 static CLIENT_TOKEN: Mutex<Option<CancellationToken>> = Mutex::new(None);
+
+/// Register a callback for cumulative client traffic totals.
+///
+/// The callback runs on a client runtime worker thread after traffic changes
+/// and the configured interval has elapsed. Calls may be concurrent. Passing
+/// a null callback disables reporting. A zero interval keeps the current
+/// interval; the initial interval is one second.
+/// The status pointer is valid only for the duration of the callback.
+///
+/// # Safety
+///
+/// The callback and context must remain valid while registered and until any
+/// in-flight callback returns. The callback must be safe to invoke concurrently
+/// from client runtime threads.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn anytls_set_traffic_status_callback(
+    send_interval_secs: u32,
+    callback: Option<unsafe extern "C" fn(*const TrafficStatus, *mut c_void)>,
+    ctx: *mut c_void,
+) {
+    traffic_status::set_callback(send_interval_secs, callback, ctx);
+}
 
 fn client_args(command_line: &str) -> std::io::Result<ClientArgs> {
     let arguments = shlex::split(command_line).ok_or_else(|| Error::new(ErrorKind::InvalidInput, "invalid command-line quoting"))?;
