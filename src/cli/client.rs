@@ -62,9 +62,10 @@ pub struct ClientArgs {
     #[serde(skip)]
     pub print_url: bool,
 
-    #[serde(skip)]
-    #[arg(skip)]
-    pub display_name: Option<String>,
+    /// The Fragment part of the AnyTLS URI (optional)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[arg(long, value_name = "String")]
+    pub fragment: Option<String>,
 
     /// Log level (off, error, warn, info, debug, trace)
     #[serde(skip, default = "default_log_level")]
@@ -81,7 +82,7 @@ impl ClientArgs {
             self.sni = self.sni.or(parsed.sni);
             self.client_id = self.client_id.or(parsed.client_id);
             self.insecure = self.insecure.or(parsed.insecure);
-            self.display_name = parsed.display_name;
+            self.fragment = parsed.fragment;
         }
 
         use std::io::{Error, ErrorKind::InvalidInput};
@@ -133,9 +134,9 @@ impl ClientArgs {
             uri.push_str("/?");
             uri.push_str(&query);
         }
-        if let Some(display_name) = &self.display_name {
+        if let Some(fragment) = &self.fragment {
             uri.push('#');
-            uri.push_str(&utf8_percent_encode(display_name, FRAGMENT_ENCODE_SET).to_string());
+            uri.push_str(&utf8_percent_encode(fragment, FRAGMENT_ENCODE_SET).to_string());
         }
         Ok(uri)
     }
@@ -155,7 +156,7 @@ impl Default for ClientArgs {
             padding_scheme: None,
             max_streams_per_session: 16,
             print_url: false,
-            display_name: None,
+            fragment: None,
             log: log::LevelFilter::Info,
         }
     }
@@ -216,7 +217,7 @@ fn build_client_args(server: Address, password: String, query: &str, fragment: O
     let mut args = ClientArgs {
         server: Some(server),
         password: Some(password),
-        display_name: fragment
+        fragment: fragment
             .map(|fragment| percent_decode_str(fragment).decode_utf8_lossy().into_owned())
             .filter(|fragment| !fragment.is_empty()),
         ..Default::default()
@@ -321,7 +322,7 @@ mod tests {
         assert_eq!(args.password.as_deref(), Some("p@ss:word"));
         assert_eq!(args.sni.as_deref(), Some("override.example"));
         assert_eq!(args.insecure, Some(true));
-        assert_eq!(args.display_name.as_deref(), Some("node 1"));
+        assert_eq!(args.fragment.as_deref(), Some("node 1"));
         assert_eq!(
             args.format_url().unwrap(),
             "anytls://p%40ss%3Aword@example.com:8443/?sni=override.example&insecure=1&client_id=f2d46ca2-8d6d-4c5c-ae77-80c902ce68d7#node%201"

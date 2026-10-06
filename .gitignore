@@ -1,6 +1,7 @@
 .venv
 /Cargo.lock
 /target
+/include/anytls.h
 /.VSCodeCounter
 /dist
 /cmd/client/client

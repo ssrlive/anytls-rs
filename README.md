@@ -223,6 +223,7 @@ Features can be disabled and selected explicitly for library consumers:
 | `uot`     | UDP-over-TCP protocol v2 helpers (depends on `async`)                      |
 | `client`  | Client library and client CLI argument type                                |
 | `server`  | Server CLI, panel synchronization, and `anytls-server` binary              |
+| `ffi`     | C ABI client entry points                                                  |
 
 For example, depend on the library without its default applications and select only the protocol core:
 
@@ -230,7 +231,17 @@ For example, depend on the library without its default applications and select o
 anytls = { version = "0.1", default-features = false, features = ["core"] }
 ```
 
-Implementation modules are private; selected public types and functions are re-exported from the crate root.
+Most implementation modules are private; selected Rust APIs are re-exported from the crate root.
+The `ffi` feature exposes the C ABI in `anytls::ffi`.
+
+To generate the C header, install `cbindgen` and run:
+
+```bash
+cargo install cbindgen
+sh scripts/generate_c_header.sh
+```
+
+This writes `include/anytls.h`; the generated header is intentionally not tracked.
 
 ## Documentation
 

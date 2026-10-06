@@ -1,0 +1,8 @@
+language = "C"
+cpp_compat = true
+include_guard = "ANYTLS_H"
+documentation = true
+
+[export]
+include = ["anytls_client_run", "anytls_client_stop"]
+item_types = ["functions"]

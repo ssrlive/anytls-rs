@@ -2,8 +2,12 @@
 mod cli;
 #[cfg(feature = "client")]
 mod client;
+#[cfg(all(feature = "client", feature = "relay"))]
+pub mod client_app;
 #[cfg(feature = "core")]
 mod core;
+#[cfg(feature = "ffi")]
+pub mod ffi;
 #[cfg(feature = "server")]
 mod panel_sync;
 #[cfg(feature = "relay")]
