@@ -4,5 +4,5 @@ include_guard = "ANYTLS_H"
 documentation = true
 
 [export]
-include = ["anytls_client_run", "anytls_client_stop"]
+include = ["anytls_client_run", "anytls_client_stop", "anytls_generate_url"]
 item_types = ["functions"]

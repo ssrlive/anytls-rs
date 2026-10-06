@@ -5,6 +5,7 @@ use std::{
     ffi::{CStr, c_char, c_int, c_void},
     io::{Error, ErrorKind},
     net::SocketAddr,
+    ptr,
     sync::Mutex,
 };
 use tokio_util::sync::CancellationToken;
@@ -16,6 +17,10 @@ fn client_args(command_line: &str) -> std::io::Result<ClientArgs> {
     ClientArgs::try_parse_from(arguments)
         .map_err(|error| Error::new(ErrorKind::InvalidInput, error.to_string()))?
         .resolve()
+}
+
+fn generate_url(command_line: &str) -> std::io::Result<String> {
+    client_args(command_line)?.format_url()
 }
 
 /// Run the client using a shell-style, complete client command line.
@@ -71,6 +76,50 @@ pub unsafe extern "C" fn anytls_client_run(
     }
 }
 
+/// Generate an AnyTLS URL from the complete client command line.
+///
+/// Returns the required buffer size in bytes, including the trailing NUL. If
+/// `buf` is null or `size` is too small, the buffer is not modified. Returns 0
+/// if the command line is invalid or does not describe a valid client.
+///
+/// # Safety
+///
+/// `command_line` must point to a valid NUL-terminated UTF-8 string. If `buf`
+/// is non-null and `size` is large enough, it must point to writable memory of
+/// at least `size` bytes.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn anytls_generate_url(command_line: *const c_char, buf: *mut c_char, size: usize) -> usize {
+    let url = match (|| -> std::io::Result<String> {
+        if command_line.is_null() {
+            return Err(Error::new(ErrorKind::InvalidInput, "command_line is null"));
+        }
+        let command_line = unsafe { CStr::from_ptr(command_line) }
+            .to_str()
+            .map_err(|error| Error::new(ErrorKind::InvalidInput, error))?;
+        generate_url(command_line)
+    })() {
+        Ok(url) => url,
+        Err(error) => {
+            log::error!("{} failed: {error}", method_name_unstable!());
+            return 0;
+        }
+    };
+
+    let required = match url.len().checked_add(1) {
+        Some(required) => required,
+        None => return 0,
+    };
+    if buf.is_null() || size < required {
+        return required;
+    }
+
+    unsafe {
+        ptr::copy_nonoverlapping(url.as_ptr(), buf.cast::<u8>(), url.len());
+        *buf.add(url.len()) = 0;
+    }
+    required
+}
+
 /// Request cancellation of a client started by `anytls_client_run`.
 #[unsafe(no_mangle)]
 pub extern "C" fn anytls_client_stop() -> c_int {
@@ -83,7 +132,8 @@ pub extern "C" fn anytls_client_stop() -> c_int {
 
 #[cfg(test)]
 mod tests {
-    use super::client_args;
+    use super::{client_args, generate_url};
+    use std::ffi::{CStr, CString};
 
     #[test]
     fn ffi_client_parses_complete_cli_command_line() {
@@ -96,5 +146,23 @@ mod tests {
     #[test]
     fn ffi_client_rejects_unclosed_cli_quotes() {
         assert!(client_args("anytls-client --url 'anytls://secret@example.com").is_err());
+    }
+
+    #[test]
+    fn ffi_generate_url_uses_caller_buffer_and_reports_required_size() {
+        let command_line = CString::new("anytls-client --url anytls://secret@example.com").unwrap();
+        let expected = generate_url(command_line.to_str().unwrap()).unwrap();
+        let required = unsafe { super::anytls_generate_url(command_line.as_ptr(), std::ptr::null_mut(), 0) };
+        assert_eq!(required, expected.len() + 1);
+
+        let mut small_buffer = vec![b'x' as std::ffi::c_char; required - 1];
+        let reported = unsafe { super::anytls_generate_url(command_line.as_ptr(), small_buffer.as_mut_ptr(), small_buffer.len()) };
+        assert_eq!(reported, required);
+        assert!(small_buffer.iter().all(|byte| *byte == b'x' as std::ffi::c_char));
+
+        let mut buffer = vec![0; required];
+        let written = unsafe { super::anytls_generate_url(command_line.as_ptr(), buffer.as_mut_ptr(), buffer.len()) };
+        assert_eq!(written, required);
+        assert_eq!(unsafe { CStr::from_ptr(buffer.as_ptr()) }.to_str().unwrap(), expected);
     }
 }
