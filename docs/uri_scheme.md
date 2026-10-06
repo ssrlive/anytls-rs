@@ -30,9 +30,12 @@ anytls://[auth@]hostname[:port]/?[key=value]&[key=value]...
 
 - `insecure`：是否允许不安全的 TLS 连接。接受 `1` 表示 `true`，`0` 表示 `false`。
 
+- `client_id`：可选的客户端 UUID，用于识别面板管理的客户端。UUID 必须使用标准格式，例如 `f2d46ca2-8d6d-4c5c-ae77-80c902ce68d7`。服务器启用面板同步时，会要求该 ID 对应当前节点上已启用的客户端；未启用面板同步时，此参数不参与访问控制。
+
 ### 片段 (Fragment)
 
 URI 中 `?` 参数列表之后的 `#` 部分称为片段（Fragment）。在 AnyTLS 中，**片段用于指定节点的显示名称**。
+
 - 片段内容必须使用 [URL 编码（百分号编码）](https://datatracker.ietf.org/doc/html/rfc3986#section-2.1) 处理，以确保空格和特殊字符能被正确解析与传输。
 - 客户端在解析 URI 时，应对片段进行 URL 解码以获取可读的节点名称/标签。
 - 示例：`#my%20tag%20with%20spaces` 解码后为 `my tag with spaces`。
@@ -42,6 +45,7 @@ URI 中 `?` 参数列表之后的 `#` 部分称为片段（Fragment）。在 Any
 ```
 anytls://letmein@example.com/?sni=real.example.com
 anytls://letmein@example.com/?sni=127.0.0.1&insecure=1
+anytls://letmein@example.com/?sni=real.example.com&client_id=f2d46ca2-8d6d-4c5c-ae77-80c902ce68d7
 anytls://0fdf77d7-d4ba-455e-9ed9-a98dd6d5489a@[2409:8a71:6a00:1953::615]:8964/?insecure=1
 ```
 

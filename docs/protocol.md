@@ -12,6 +12,15 @@
 
 认证成功服务器会进入会话循环，认证失败服务器会关闭连接（或 fallback 到 http 服务）。
 
+#### 可选 Client ID 扩展（AnyTLS-RS）
+
+AnyTLS-RS 客户端可以在 `padding0` 的前 36 字节携带一个标准格式的 UUID 文本作为 client ID；
+使用此扩展时，`padding0 length` 至少为 36 字节，后续 padding 按常规方式填充。
+不配置 client ID 时，认证格式和行为不变。client ID 随 TLS 内的认证请求发送，不代替密码认证。
+
+当服务器启用面板同步时，服务器要求该 UUID 对应面板当前节点上已启用的客户端，并在认证时及每条逻辑 Stream 建立时检查授权。
+未启用面板同步时，client ID 不用于访问控制。
+
 ### 会话
 
 认证完成后，客户端&服务器在 TLS 协议之上开启会话层事件循环，会话层 frame 格式如下：

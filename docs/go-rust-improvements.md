@@ -14,6 +14,12 @@ The Session ID is an implementation-level identity used by the client session po
 
 The Go implementation uses an atomic `uint64` sequence and starts at `1`. The Rust implementation intentionally starts at `0` to follow the repository requirement that Session IDs grow from `0` through `usize::MAX`.
 
+## Client ID and Panel Authorization
+
+The Rust client optionally carries a client UUID in the first 36 bytes of the authentication padding. This is an AnyTLS-RS extension; it does not change password authentication, and clients that omit the UUID remain compatible when server panel synchronization is disabled.
+
+When panel synchronization is enabled, the Rust server requires the UUID to identify an enabled client on the configured panel node. It checks the client after authentication and again before relaying each logical stream. TCP and UOT traffic is counted against that client for panel synchronization. Without panel synchronization, the UUID does not gate access.
+
 ## Logical Stream IDs
 
 The Rust process uses one atomic `AtomicU32` counter to allocate logical stream IDs. Allocation increments the `u32` sequence, wraps after `u32::MAX`, and skips `0`, so the first ID is `1` and no data stream is assigned the control-frame SID.

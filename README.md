@@ -118,6 +118,14 @@ See [URI Format](./docs/uri_scheme.md) for escaping, IPv6, and more examples.
 
 The server's `--print-args` and `--print-url` options need outbound access to a public-IP service.
 
+### Client IDs and Panel Access
+
+`--client-id UUID` (or the `client_id` URI parameter) identifies a client to the optional panel integration. The UUID is sent in the authentication padding after the password digest; it does not replace password authentication.
+
+When server panel synchronization is enabled, the server requires the UUID to match an enabled client on the configured panel node. It checks authorization when the client authenticates and again when each logical stream is opened. Clients without an ID, or with an ID that is missing or disabled on the panel, are denied. TCP and UOT traffic is accounted to that client ID for panel synchronization.
+
+Without server panel synchronization, the client ID is optional and is not used for access control. Configure all three server options `--panel-webapi-url`, `--panel-webapi-token`, and `--panel-node-id` to enable synchronization.
+
 ## Examples
 
 ### Basic Setup
