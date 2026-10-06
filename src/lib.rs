@@ -8,6 +8,8 @@ pub mod client_app;
 mod core;
 #[cfg(feature = "ffi")]
 pub mod ffi;
+#[cfg(feature = "client")]
+mod log_callback;
 #[cfg(feature = "server")]
 mod panel_sync;
 #[cfg(feature = "relay")]
@@ -36,6 +38,8 @@ pub use core::{
 };
 #[cfg(all(feature = "core", feature = "async"))]
 pub use core::{read_auth, read_auth_with_client_id, write_auth, write_auth_with_client_id};
+#[cfg(feature = "client")]
+pub use log_callback::LogLevel;
 #[cfg(feature = "server")]
 pub use panel_sync::{PanelSyncClient, PanelSyncConfig, TrafficAudit, TrafficAuditPtr};
 #[cfg(feature = "runtime")]

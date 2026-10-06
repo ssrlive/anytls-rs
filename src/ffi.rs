@@ -1,4 +1,4 @@
-use crate::{ClientArgs, TrafficStatus, client_app, traffic_status};
+use crate::{ClientArgs, LogLevel, TrafficStatus, client_app, log_callback, traffic_status};
 use clap::Parser;
 use method_name::method_name_unstable;
 use std::{
@@ -11,6 +11,32 @@ use std::{
 use tokio_util::sync::CancellationToken;
 
 static CLIENT_TOKEN: Mutex<Option<CancellationToken>> = Mutex::new(None);
+
+/// Register a callback for AnyTLS log messages.
+///
+/// If `set_logger` is true, the callback logger is installed immediately and
+/// the maximum log level is set to Trace. Otherwise, the callback is installed
+/// when an FFI client starts, using that client's configured log level.
+/// Registering a callback before starting the FFI client is required for log
+/// delivery. The callback receives records from all log targets except
+/// `rustls`, `tungstenite`, and `tokio_tungstenite`, including their submodules.
+/// Calls may be concurrent across threads. Logs emitted recursively by the
+/// callback on the same thread are discarded.
+/// The process-wide logger cannot be replaced; if the host already installed
+/// one, this callback will not receive log messages.
+///
+/// # Safety
+///
+/// The callback and context must remain valid until they are replaced and any
+/// in-flight callback returns. The callback must be safe to invoke concurrently.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn anytls_set_log_callback(
+    set_logger: bool,
+    callback: Option<unsafe extern "C" fn(LogLevel, *const c_char, *mut c_void)>,
+    ctx: *mut c_void,
+) {
+    log_callback::set_callback(set_logger, callback, ctx);
+}
 
 /// Register a callback for cumulative client traffic totals.
 ///
@@ -79,6 +105,7 @@ pub unsafe extern "C" fn anytls_client_run(
             }
             *running = Some(token.clone());
         }
+        log_callback::prepare_ffi_client(args.log);
 
         let on_listening = callback.map(|callback| {
             Box::new(move |addr: SocketAddr| unsafe { callback(c_int::from(addr.port()), ctx) }) as Box<dyn FnOnce(SocketAddr)>

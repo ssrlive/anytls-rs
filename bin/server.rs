@@ -66,7 +66,9 @@ async fn main() -> std::io::Result<()> {
 async fn run_server(cancel_token: CancellationToken) -> std::io::Result<()> {
     let args = ServerArgs::parse();
     let log_level = args.log.to_string().to_ascii_lowercase();
-    env_logger::Builder::from_env(env_logger::Env::default().default_filter_or(log_level)).init();
+    if let Err(e) = env_logger::Builder::from_env(env_logger::Env::default().default_filter_or(log_level)).try_init() {
+        eprintln!("Failed to initialize logger: {e}");
+    }
     if args.print_args {
         println!("\n{}\n", print_args(&args, args.listen.port()).await?);
         return Ok(());

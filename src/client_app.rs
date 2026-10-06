@@ -40,7 +40,9 @@ pub(crate) async fn run_client_with_args(
     let mn = method_name_unstable!();
     use std::io::{Error, ErrorKind::InvalidInput};
     let default_log_filter = args.log.as_str().to_ascii_lowercase();
-    let _ = env_logger::Builder::from_env(env_logger::Env::default().default_filter_or(&default_log_filter)).try_init();
+    if let Err(e) = env_logger::Builder::from_env(env_logger::Env::default().default_filter_or(&default_log_filter)).try_init() {
+        eprintln!("Failed to initialize logger: {e}");
+    }
     if args.print_url {
         println!("{}", args.format_url()?);
         return Ok(());
