@@ -43,6 +43,16 @@ pub struct PanelSyncClient {
     config: PanelSyncConfig,
     client: reqwest::Client,
     reported_traffic: HashMap<Uuid, (u64, u64)>,
+    reporter_id: Uuid,
+    next_report_sequence: u64,
+    pending_traffic: Option<PendingTrafficReport>,
+}
+
+#[derive(Debug, Clone)]
+struct PendingTrafficReport {
+    sequence: u64,
+    data: Vec<serde_json::Value>,
+    traffic_snapshot: HashMap<Uuid, (u64, u64)>,
 }
 
 impl PanelSyncClient {
@@ -55,6 +65,9 @@ impl PanelSyncClient {
             config,
             client,
             reported_traffic: HashMap::new(),
+            reporter_id: Uuid::new_v4(),
+            next_report_sequence: 1,
+            pending_traffic: None,
         }
     }
 
@@ -111,45 +124,63 @@ impl PanelSyncClient {
     }
 
     async fn report_traffic_once(&mut self, traffic_audit: &TrafficAuditPtr) -> std::io::Result<()> {
-        let snapshot = {
-            let audit = traffic_audit.lock().await;
-            audit
-                .client_ids()
-                .into_iter()
-                .map(|id| (id, audit.traffic(&id)))
-                .collect::<Vec<_>>()
-        };
-        let mut payload = Vec::new();
-        let mut current_traffic = HashMap::new();
-        for (client_id, (upstream, downstream)) in snapshot {
-            let previous = self.reported_traffic.get(&client_id).copied().unwrap_or_default();
-            let delta_upstream = upstream.saturating_sub(previous.0);
-            let delta_downstream = downstream.saturating_sub(previous.1);
-            if delta_upstream == 0 && delta_downstream == 0 {
-                continue;
+        if self.pending_traffic.is_none() {
+            let snapshot = {
+                let audit = traffic_audit.lock().await;
+                audit
+                    .client_ids()
+                    .into_iter()
+                    .map(|id| (id, audit.traffic(&id)))
+                    .collect::<Vec<_>>()
+            };
+            let mut data = Vec::new();
+            let mut traffic_snapshot = HashMap::new();
+            for (client_id, (upstream, downstream)) in snapshot {
+                let previous = self.reported_traffic.get(&client_id).copied().unwrap_or_default();
+                let delta_upstream = upstream.saturating_sub(previous.0);
+                let delta_downstream = downstream.saturating_sub(previous.1);
+                if delta_upstream == 0 && delta_downstream == 0 {
+                    continue;
+                }
+                data.push(serde_json::json!({
+                    "client_id": client_id,
+                    "u": delta_upstream,
+                    "d": delta_downstream,
+                }));
+                traffic_snapshot.insert(client_id, (upstream, downstream));
             }
-            payload.push(serde_json::json!({
-                "client_id": client_id,
-                "u": delta_upstream,
-                "d": delta_downstream,
-            }));
-            current_traffic.insert(client_id, (upstream, downstream));
+            if data.is_empty() {
+                return Ok(());
+            }
+
+            let sequence = self.next_report_sequence;
+            self.next_report_sequence = sequence
+                .checked_add(1)
+                .ok_or_else(|| std::io::Error::other("panel traffic report sequence exhausted"))?;
+            self.pending_traffic = Some(PendingTrafficReport {
+                sequence,
+                data,
+                traffic_snapshot,
+            });
         }
-        if payload.is_empty() {
-            return Ok(());
-        }
+        let pending = self.pending_traffic.as_ref().expect("pending report was created").clone();
 
         let url = self.endpoint("users/traffic")?;
         let response = self
             .client
             .post(url)
-            .json(&serde_json::json!({ "data": payload }))
+            .json(&serde_json::json!({
+                "reporter_id": self.reporter_id,
+                "sequence": pending.sequence,
+                "data": pending.data,
+            }))
             .send()
             .await
             .map_err(std::io::Error::other)?;
         let result: serde_json::Value = self.parse_payload(response).await?;
         log::trace!("{} -- panel traffic report response: {result:?}", method_name_unstable!());
-        self.reported_traffic.extend(current_traffic);
+        self.reported_traffic.extend(pending.traffic_snapshot);
+        self.pending_traffic = None;
         Ok(())
     }
 
@@ -259,6 +290,55 @@ mod tests {
         }
         client.report_traffic_once(&audit).await.unwrap();
         assert_eq!(client.reported_traffic.get(&client_id), Some(&(11, 22)));
+        panel_server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn retries_the_same_traffic_report_after_a_lost_response() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let panel_server = tokio::spawn(async move {
+            let (mut first_stream, _) = listener.accept().await.unwrap();
+            let first_request = read_request(&mut first_stream).await;
+            let first_body_start = first_request.windows(4).position(|window| window == b"\r\n\r\n").unwrap() + 4;
+            let first_payload: serde_json::Value = serde_json::from_slice(&first_request[first_body_start..]).unwrap();
+            first_stream
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 100\r\nConnection: close\r\n\r\n{")
+                .await
+                .unwrap();
+            drop(first_stream);
+
+            let (mut retry_stream, _) = listener.accept().await.unwrap();
+            let retry_request = read_request(&mut retry_stream).await;
+            let retry_body_start = retry_request.windows(4).position(|window| window == b"\r\n\r\n").unwrap() + 4;
+            let retry_payload: serde_json::Value = serde_json::from_slice(&retry_request[retry_body_start..]).unwrap();
+            assert_eq!(retry_payload, first_payload);
+            assert_eq!(retry_payload["sequence"], 1);
+            assert_eq!(retry_payload["data"][0]["u"], 11);
+            assert_eq!(retry_payload["data"][0]["d"], 22);
+            respond(&mut retry_stream, r#"{"ret":1,"data":true}"#).await;
+        });
+
+        let mut client = PanelSyncClient::new(PanelSyncConfig {
+            webapi_url: Url::parse(&format!("http://{address}/panel/")).unwrap(),
+            webapi_token: "test-token".to_string(),
+            node_id: 7,
+            update_interval_secs: 10,
+        });
+        let client_id = Uuid::parse_str("f2d46ca2-8d6d-4c5c-ae77-80c902ce68d7").unwrap();
+        let audit = Arc::new(tokio::sync::Mutex::new(TrafficAudit::new()));
+        {
+            let mut audit = audit.lock().await;
+            audit.sync_client(client_id, true);
+            audit.add_upstream(&client_id, 11);
+            audit.add_downstream(&client_id, 22);
+        }
+
+        assert!(client.report_traffic_once(&audit).await.is_err());
+        assert!(client.reported_traffic.is_empty());
+        client.report_traffic_once(&audit).await.unwrap();
+        assert_eq!(client.reported_traffic.get(&client_id), Some(&(11, 22)));
+        assert!(client.pending_traffic.is_none());
         panel_server.await.unwrap();
     }
 
