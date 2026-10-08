@@ -1,5 +1,4 @@
-use crate::{ClientArgs, LogLevel, TrafficStatus, client_app, log_callback, traffic_status};
-use clap::Parser;
+use crate::{LogLevel, TrafficStatus, client_app, log_callback, traffic_status};
 use method_name::method_name_unstable;
 use std::{
     ffi::{CStr, c_char, c_int, c_void},
@@ -60,15 +59,8 @@ pub unsafe extern "C" fn anytls_set_traffic_status_callback(
     traffic_status::set_callback(send_interval_secs, callback, ctx);
 }
 
-fn client_args(command_line: &str) -> std::io::Result<ClientArgs> {
-    let arguments = shlex::split(command_line).ok_or_else(|| Error::new(ErrorKind::InvalidInput, "invalid command-line quoting"))?;
-    ClientArgs::try_parse_from(arguments)
-        .map_err(|error| Error::new(ErrorKind::InvalidInput, error.to_string()))?
-        .resolve()
-}
-
 fn generate_url(command_line: &str) -> std::io::Result<String> {
-    client_args(command_line)?.format_url()
+    crate::ClientArgs::from_cli_string(command_line)?.format_url()
 }
 
 /// Run the client using a shell-style, complete client command line.
@@ -95,7 +87,7 @@ pub unsafe extern "C" fn anytls_client_run(
         let command_line = unsafe { CStr::from_ptr(command_line) }
             .to_str()
             .map_err(|error| Error::new(ErrorKind::InvalidInput, error))?;
-        let args = client_args(command_line)?;
+        let args = crate::ClientArgs::from_cli_string(command_line)?;
         let runtime = tokio::runtime::Builder::new_multi_thread().enable_all().build()?;
         let token = CancellationToken::new();
         {
@@ -110,7 +102,7 @@ pub unsafe extern "C" fn anytls_client_run(
         let on_listening = callback.map(|callback| {
             Box::new(move |addr: SocketAddr| unsafe { callback(c_int::from(addr.port()), ctx) }) as Box<dyn FnOnce(SocketAddr)>
         });
-        let result = runtime.block_on(client_app::run_client_with_args(token, args, on_listening));
+        let result = runtime.block_on(client_app::run_client(token, args, on_listening));
         let mut running = CLIENT_TOKEN.lock().unwrap_or_else(|error| error.into_inner());
         *running = None;
         result
@@ -181,12 +173,13 @@ pub extern "C" fn anytls_client_stop() -> c_int {
 
 #[cfg(test)]
 mod tests {
-    use super::{client_args, generate_url};
+    use super::generate_url;
+    use crate::ClientArgs;
     use std::ffi::{CStr, CString};
 
     #[test]
     fn ffi_client_parses_complete_cli_command_line() {
-        let args = client_args("anytls-client --url 'anytls://secret@example.com' --listen mixed://127.0.0.1:0").unwrap();
+        let args = ClientArgs::from_cli_string("anytls-client --url 'anytls://secret@example.com' --listen mixed://127.0.0.1:0").unwrap();
         let listen_addr = args.listen.addr.unwrap();
         assert_eq!(listen_addr.to_string(), "127.0.0.1:0");
         assert_eq!(args.password.as_deref(), Some("secret"));
@@ -194,7 +187,7 @@ mod tests {
 
     #[test]
     fn ffi_client_rejects_unclosed_cli_quotes() {
-        assert!(client_args("anytls-client --url 'anytls://secret@example.com").is_err());
+        assert!(ClientArgs::from_cli_string("anytls-client --url 'anytls://secret@example.com").is_err());
     }
 
     #[test]

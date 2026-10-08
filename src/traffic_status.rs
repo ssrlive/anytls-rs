@@ -1,3 +1,4 @@
+#[cfg(feature = "ffi")]
 use std::{
     ffi::c_void,
     sync::{LazyLock, Mutex},
@@ -13,26 +14,31 @@ pub struct TrafficStatus {
     pub rx: u64,
 }
 
+#[cfg(feature = "ffi")]
 #[derive(Clone, Copy)]
 struct TrafficStatusCallback {
     callback: unsafe extern "C" fn(*const TrafficStatus, *mut c_void),
     ctx: *mut c_void,
 }
 
+#[cfg(feature = "ffi")]
 unsafe impl Send for TrafficStatusCallback {}
 
+#[cfg(feature = "ffi")]
 impl TrafficStatusCallback {
     unsafe fn call(self, status: &TrafficStatus) {
         unsafe { (self.callback)(status, self.ctx) };
     }
 }
 
+#[cfg(feature = "ffi")]
 #[derive(Debug)]
 struct TrafficTracker {
     status: TrafficStatus,
     last_reported: Instant,
 }
 
+#[cfg(feature = "ffi")]
 impl TrafficTracker {
     fn update(&mut self, tx: usize, rx: usize, interval_secs: u32, now: Instant) -> Option<TrafficStatus> {
         self.status.tx = self.status.tx.saturating_add(tx as u64);
@@ -46,8 +52,11 @@ impl TrafficTracker {
     }
 }
 
+#[cfg(feature = "ffi")]
 static CALLBACK: Mutex<Option<TrafficStatusCallback>> = Mutex::new(None);
+#[cfg(feature = "ffi")]
 static SEND_INTERVAL_SECS: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(1);
+#[cfg(feature = "ffi")]
 static TRACKER: LazyLock<Mutex<TrafficTracker>> = LazyLock::new(|| {
     Mutex::new(TrafficTracker {
         status: TrafficStatus::default(),
@@ -55,6 +64,7 @@ static TRACKER: LazyLock<Mutex<TrafficTracker>> = LazyLock::new(|| {
     })
 });
 
+#[cfg(feature = "ffi")]
 pub(crate) fn set_callback(
     send_interval_secs: u32,
     callback: Option<unsafe extern "C" fn(*const TrafficStatus, *mut c_void)>,
@@ -72,6 +82,7 @@ pub(crate) fn set_callback(
     }
 }
 
+#[cfg(feature = "ffi")]
 pub(crate) fn record(tx: usize, rx: usize) {
     if tx == 0 && rx == 0 {
         return;
@@ -95,7 +106,7 @@ pub(crate) fn record(tx: usize, rx: usize) {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "ffi"))]
 mod tests {
     use super::{TrafficStatus, TrafficTracker};
     use std::time::{Duration, Instant};

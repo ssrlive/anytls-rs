@@ -24,7 +24,7 @@ required-features = ["client", "relay", "ctrlc2"]
 
 [features]
 default = ["client", "server", "relay", "ctrlc2", "ffi"]
-ffi = ["client", "relay", "dep:shlex"]
+ffi = ["client", "relay"]
 core = ["dep:md-5", "dep:rand", "dep:sha2", "dep:uuid"]
 async = ["core", "dep:tokio", "tokio/io-util"]
 runtime = ["async", "dep:log", "dep:tokio-util", "tokio/sync", "tokio/time"]
@@ -36,6 +36,7 @@ client = [
     "dep:clap",
     "dep:env_logger",
     "dep:percent-encoding",
+    "dep:shlex",
     "dep:rustls",
     "dep:rustls-native-certs",
     "dep:rustls-pemfile",

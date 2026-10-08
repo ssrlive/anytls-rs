@@ -2,7 +2,6 @@ use crate::{
     BoxTransport, Client, ClientArgs, DEFAULT_SCHEME, Dialer, PaddingFactory, Stream, StreamIo, UotMode, UotRequest, relay, traffic_status,
     uot_encode_packet, uot_get_packet_from_stream, uot_sentinel_destination, write_auth_with_client_id,
 };
-use clap::Parser;
 use method_name::method_name_unstable;
 use rustls::{
     ClientConfig,
@@ -27,12 +26,8 @@ use tokio_rustls::TlsConnector;
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
-pub async fn run_client(cancel_token: CancellationToken) -> std::io::Result<()> {
-    let args = ClientArgs::parse().resolve()?;
-    run_client_with_args(cancel_token, args, None).await
-}
-
-pub(crate) async fn run_client_with_args(
+/// Run the AnyTLS client from resolved arguments with a caller-managed cancellation token.
+pub async fn run_client(
     cancel_token: CancellationToken,
     args: ClientArgs,
     on_listening: Option<Box<dyn FnOnce(SocketAddr)>>,

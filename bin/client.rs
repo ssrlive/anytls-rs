@@ -9,7 +9,8 @@ async fn main() -> std::io::Result<()> {
         true
     })?;
 
-    let client = anytls::client_app::run_client(cancel_token);
+    let args = anytls::ClientArgs::from_cli()?;
+    let client = anytls::run_client(cancel_token, args, None);
     tokio::pin!(client);
     let res = tokio::select! {
         result = &mut client => result,

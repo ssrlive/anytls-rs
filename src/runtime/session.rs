@@ -937,7 +937,7 @@ impl Stream {
         self.session_id
     }
 
-    #[cfg(test)]
+    #[cfg(all(test, feature = "client"))]
     pub(crate) fn session(&self) -> Option<Arc<Session>> {
         self.session.upgrade()
     }
@@ -1072,6 +1072,7 @@ pub(crate) mod tests {
             self.blocked.store(true, std::sync::atomic::Ordering::SeqCst);
         }
 
+        #[cfg(feature = "client")]
         pub(crate) fn release(&self) {
             self.blocked.store(false, std::sync::atomic::Ordering::SeqCst);
             if let Some(waker) = self.waker.lock().unwrap().take() {

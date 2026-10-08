@@ -15,6 +15,7 @@ pub struct ClientArgs {
 
     /// Local proxy listen address in the format scheme://host:port, scheme can be mixed, socks5, http, etc.
     #[arg(short = 'l', long, value_name = "PROXY", default_value = "mixed://127.0.0.1:1080")]
+    #[serde(default)]
     pub listen: ProxyParameters,
 
     /// Server address
@@ -63,7 +64,7 @@ pub struct ClientArgs {
     pub print_url: bool,
 
     /// The Fragment part of the AnyTLS URI (optional)
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(alias = "display_name", skip_serializing_if = "Option::is_none")]
     #[arg(long, value_name = "String")]
     pub fragment: Option<String>,
 
@@ -74,7 +75,24 @@ pub struct ClientArgs {
 }
 
 impl ClientArgs {
-    pub fn resolve(mut self) -> std::io::Result<Self> {
+    pub fn from_cli() -> std::io::Result<Self> {
+        Self::parse().resolve()
+    }
+
+    pub fn from_cli_string(command_line: &str) -> std::io::Result<ClientArgs> {
+        use std::io::{Error, ErrorKind::InvalidInput};
+        let arguments = shlex::split(command_line).ok_or_else(|| Error::new(InvalidInput, "invalid command-line quoting"))?;
+        Self::from_cli_args(&arguments.iter().map(|s| s.as_str()).collect::<Vec<&str>>())
+    }
+
+    pub fn from_cli_args(arguments: &[&str]) -> std::io::Result<ClientArgs> {
+        use std::io::{Error, ErrorKind::InvalidInput};
+        ClientArgs::try_parse_from(arguments)
+            .map_err(|error| Error::new(InvalidInput, error))?
+            .resolve()
+    }
+
+    fn resolve(mut self) -> std::io::Result<Self> {
         if let Some(raw_url) = self.url.clone() {
             let parsed = parse_client_url(&raw_url)?;
             self.server = self.server.or(parsed.server);
@@ -304,19 +322,16 @@ fn parse_ipv6_zone_url(raw_url: &str) -> std::io::Result<ClientArgs> {
 #[cfg(test)]
 mod tests {
     use super::{ClientArgs, parse_client_url};
-    use clap::Parser;
 
     #[test]
     fn parses_client_url_fields_and_resolves_cli_overrides() {
-        let args = ClientArgs::try_parse_from([
+        let args = ClientArgs::from_cli_args(&[
             "anytls-client",
             "--url",
             "anytls://p%40ss%3Aword@example.com:8443/?sni=edge.example&insecure=1&client_id=f2d46ca2-8d6d-4c5c-ae77-80c902ce68d7#node%201",
             "--sni",
             "override.example",
         ])
-        .unwrap()
-        .resolve()
         .unwrap();
         assert_eq!(args.server.as_ref().unwrap().to_string(), "example.com:8443");
         assert_eq!(args.password.as_deref(), Some("p@ss:word"));
@@ -343,33 +358,34 @@ mod tests {
 
     #[test]
     fn requires_server_from_url_or_cli() {
+        use clap::Parser;
         let args = ClientArgs::try_parse_from(["anytls-client"]).unwrap();
         assert_eq!(args.resolve().unwrap_err().kind(), std::io::ErrorKind::InvalidInput);
     }
 
     #[test]
     fn parses_insecure_flag_with_optional_boolean_value() {
-        let args = ClientArgs::try_parse_from(["anytls-client", "--server", "127.0.0.1:443", "--password", "secret"]).unwrap();
+        let args = ClientArgs::from_cli_args(&["anytls-client", "--server", "127.0.0.1:443", "--password", "secret"]).unwrap();
         assert_eq!(args.insecure, None);
 
         let args =
-            ClientArgs::try_parse_from(["anytls-client", "--server", "127.0.0.1:443", "--password", "secret", "--insecure"]).unwrap();
+            ClientArgs::from_cli_args(&["anytls-client", "--server", "127.0.0.1:443", "--password", "secret", "--insecure"]).unwrap();
         assert_eq!(args.insecure, Some(true));
 
-        let args = ClientArgs::try_parse_from(["anytls-client", "--server", "127.0.0.1:443", "--insecure", "false"]).unwrap();
+        let args = ClientArgs::from_cli_args(&["anytls-client", "--server", "127.0.0.1:443", "--insecure", "false"]).unwrap();
         assert_eq!(args.insecure, Some(false));
     }
 
     #[test]
     fn parses_url_and_print_url_flags() {
-        let args = ClientArgs::try_parse_from(["anytls-client", "-u", "anytls://secret@example.com", "--print-url"]).unwrap();
+        let args = ClientArgs::from_cli_args(&["anytls-client", "-u", "anytls://secret@example.com", "--print-url"]).unwrap();
         assert_eq!(args.url.as_deref(), Some("anytls://secret@example.com"));
         assert!(args.print_url);
     }
 
     #[test]
     fn explicit_cli_values_override_url_values() {
-        let args = ClientArgs::try_parse_from([
+        let args = ClientArgs::from_cli_args(&[
             "anytls-client",
             "--url",
             "anytls://url-pass@example.com/?sni=url.example&insecure=1",
@@ -382,8 +398,6 @@ mod tests {
             "--insecure",
             "false",
         ])
-        .unwrap()
-        .resolve()
         .unwrap();
         assert_eq!(args.server.as_ref().unwrap().to_string(), "127.0.0.1:9443");
         assert_eq!(args.password.as_deref(), Some("cli-pass"));
@@ -393,7 +407,7 @@ mod tests {
 
     #[test]
     fn parses_optional_client_uuid() {
-        let args = ClientArgs::try_parse_from([
+        let args = ClientArgs::from_cli_args(&[
             "anytls-client",
             "--server",
             "127.0.0.1:443",

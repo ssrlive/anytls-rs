@@ -3,12 +3,12 @@ mod cli;
 #[cfg(feature = "client")]
 mod client;
 #[cfg(all(feature = "client", feature = "relay"))]
-pub mod client_app;
+mod client_app;
 #[cfg(feature = "core")]
 mod core;
 #[cfg(feature = "ffi")]
 pub mod ffi;
-#[cfg(feature = "client")]
+#[cfg(feature = "ffi")]
 mod log_callback;
 #[cfg(feature = "server")]
 mod panel_sync;
@@ -24,13 +24,15 @@ mod uot;
 mod url_util;
 
 #[cfg(feature = "uot")]
-pub use ::socks5_impl::protocol::Address;
+pub use ::socks5_impl::protocol::{Address, ProxyParameters};
 #[cfg(feature = "client")]
 pub use cli::ClientArgs;
 #[cfg(feature = "server")]
 pub use cli::ServerArgs;
 #[cfg(feature = "client")]
 pub use client::{Client, Dialer};
+#[cfg(all(feature = "client", feature = "relay"))]
+pub use client_app::run_client;
 #[cfg(feature = "core")]
 pub use core::{
     AUTH_HEADER_SIZE, CHECK_MARK, Command, DEFAULT_SCHEME, Frame, HEADER_OVERHEAD_SIZE, MAX_FRAME_DATA_SIZE, PASSWORD_DIGEST_SIZE,
@@ -38,12 +40,14 @@ pub use core::{
 };
 #[cfg(all(feature = "core", feature = "async"))]
 pub use core::{read_auth, read_auth_with_client_id, write_auth, write_auth_with_client_id};
-#[cfg(feature = "client")]
+#[cfg(feature = "ffi")]
 pub use log_callback::LogLevel;
 #[cfg(feature = "server")]
 pub use panel_sync::{PanelSyncClient, PanelSyncConfig, TrafficAudit, TrafficAuditPtr};
 #[cfg(feature = "runtime")]
 pub use runtime::{AsyncReadWrite, BoxTransport, DEFAULT_MAX_SESSION_AGE, Session, Stream, StreamIo, is_peer_disconnect};
+#[cfg(feature = "runtime")]
+pub use tokio_util::sync::CancellationToken;
 #[cfg(feature = "client")]
 pub use traffic_status::TrafficStatus;
 #[cfg(feature = "uot")]
