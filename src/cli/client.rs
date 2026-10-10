@@ -93,14 +93,39 @@ impl ClientArgs {
     }
 
     fn resolve(mut self) -> std::io::Result<Self> {
-        if let Some(raw_url) = self.url.clone() {
-            let parsed = parse_client_url(&raw_url)?;
+        let origin = self.clone();
+        if let Some(raw_url) = &self.url {
+            let parsed = parse_client_url(raw_url)?;
             self.server = self.server.or(parsed.server);
             self.password = self.password.or(parsed.password);
             self.sni = self.sni.or(parsed.sni);
             self.client_id = self.client_id.or(parsed.client_id);
             self.insecure = self.insecure.or(parsed.insecure);
             self.fragment = parsed.fragment;
+        }
+
+        if origin.password.is_some() {
+            self.password = origin.password;
+        }
+
+        if origin.server.is_some() {
+            self.server = origin.server;
+        }
+
+        if origin.sni.is_some() {
+            self.sni = origin.sni;
+        }
+
+        if origin.client_id.is_some() {
+            self.client_id = origin.client_id;
+        }
+
+        if origin.insecure.is_some() {
+            self.insecure = origin.insecure;
+        }
+
+        if origin.fragment.is_some() {
+            self.fragment = origin.fragment;
         }
 
         use std::io::{Error, ErrorKind::InvalidInput};
@@ -244,10 +269,8 @@ fn build_client_args(server: Address, password: String, query: &str, fragment: O
     for (key, value) in url::form_urlencoded::parse(query.as_bytes()) {
         match key.as_ref() {
             "password" => {
-                return Err(Error::new(
-                    InvalidInput,
-                    "Password must be provided in the URI auth field, not in query parameters",
-                ));
+                let msg = "Password must be provided in the URI auth field, not in query parameters";
+                return Err(Error::new(InvalidInput, msg));
             }
             "sni" => args.sni = Some(value.into_owned()),
             "insecure" => match value.as_ref() {
@@ -403,6 +426,21 @@ mod tests {
         assert_eq!(args.password.as_deref(), Some("cli-pass"));
         assert_eq!(args.sni.as_deref(), Some("cli.example"));
         assert_eq!(args.insecure, Some(false));
+    }
+
+    #[test]
+    fn explicit_cli_fragment_overrides_url_fragment() {
+        let args = ClientArgs::from_cli_args(&[
+            "anytls-client",
+            "--url",
+            "anytls://secret@example.com#url-fragment",
+            "--fragment",
+            "cli fragment",
+        ])
+        .unwrap();
+
+        assert_eq!(args.fragment.as_deref(), Some("cli fragment"));
+        assert_eq!(args.format_url().unwrap(), "anytls://secret@example.com#cli%20fragment");
     }
 
     #[test]
