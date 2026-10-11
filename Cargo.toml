@@ -1,6 +1,6 @@
 [package]
 name = "anytls"
-version = "0.4.7"
+version = "0.4.9"
 edition = "2024"
 authors = ["@ssrlive"]
 description = "A proxy protocol that attempts to mitigate the TLS in TLS fingerprinting problem"
@@ -99,7 +99,9 @@ ctrlc2 = { version = "4.0.0", optional = true, default-features = false, feature
 env_logger = { version = "0.11.11", optional = true }
 log = { version = "0.4.34", features = ["serde"], optional = true }
 md-5 = { version = "0.11.0", optional = true }
-method_name = { version = "0.3.4", features = ["unstable"] }
+method_name = { version = "0.3.4", default-features = false, features = [
+    "unstable",
+] }
 notify = { version = "8.2.0", optional = true }
 percent-encoding = { version = "2.3.2", optional = true }
 rand = { version = "0.10.3", optional = true }
