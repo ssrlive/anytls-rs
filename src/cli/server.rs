@@ -105,10 +105,10 @@ impl ServerArgs {
 
         match (&self.panel_webapi_url, &self.panel_webapi_token, self.panel_node_id) {
             (Some(webapi_url), Some(webapi_token), Some(node_id)) => Ok(Some(PanelSyncConfig {
-                webapi_url: webapi_url.clone(),
-                webapi_token: webapi_token.clone(),
-                node_id,
-                update_interval_secs: self.panel_update_interval_secs.unwrap_or(10).max(5),
+                webapi_url: Some(webapi_url.clone()),
+                webapi_token: Some(webapi_token.clone()),
+                node_id: Some(node_id),
+                update_interval_secs: Some(self.panel_update_interval_secs.unwrap_or(10).max(5)),
             })),
             _ => Err(Error::new(
                 InvalidInput,
@@ -141,7 +141,7 @@ mod tests {
             "2",
         ])
         .unwrap();
-        assert_eq!(args.panel_sync_config().unwrap().unwrap().update_interval_secs, 5);
+        assert_eq!(args.panel_sync_config().unwrap().unwrap().update_interval_secs, Some(5));
 
         let incomplete = ServerArgs::try_parse_from([
             "anytls-server",

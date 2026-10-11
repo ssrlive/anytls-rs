@@ -1,17 +1,40 @@
 use super::traffic_audit::TrafficAuditPtr;
 use method_name::method_name_unstable;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use tokio_util::sync::CancellationToken;
 use url::Url;
 use uuid::Uuid;
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PanelSyncConfig {
-    pub webapi_url: Url,
-    pub webapi_token: String,
-    pub node_id: usize,
-    pub update_interval_secs: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub webapi_url: Option<Url>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub webapi_token: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub node_id: Option<usize>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub update_interval_secs: Option<u64>,
+}
+
+impl PanelSyncConfig {
+    pub fn is_configured(&self) -> bool {
+        self.webapi_url.is_some() && self.webapi_token.is_some() && self.node_id.is_some()
+    }
+
+    fn validate(&self) -> std::io::Result<()> {
+        if self.webapi_url.is_none() {
+            return Err(std::io::Error::other("panel sync webapi_url not set"));
+        }
+        if self.webapi_token.is_none() {
+            return Err(std::io::Error::other("panel sync webapi_token not set"));
+        }
+        if self.node_id.is_none() {
+            return Err(std::io::Error::other("panel sync node_id not set"));
+        }
+        Ok(())
+    }
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -72,9 +95,13 @@ impl PanelSyncClient {
     }
 
     pub async fn run(mut self, traffic_audit: TrafficAuditPtr, cancel_token: CancellationToken) {
-        let interval_secs = self.config.update_interval_secs.max(5);
-        let mut interval = tokio::time::interval(std::time::Duration::from_secs(interval_secs));
         let mn = method_name_unstable!();
+        if let Err(error) = self.config.validate() {
+            log::warn!("{mn} -- panel sync task stopped: {error}");
+            return;
+        }
+        let interval_secs = self.config.update_interval_secs.unwrap_or(60).max(5);
+        let mut interval = tokio::time::interval(std::time::Duration::from_secs(interval_secs));
         loop {
             tokio::select! {
                 _ = cancel_token.cancelled() => break,
@@ -185,13 +212,26 @@ impl PanelSyncClient {
     }
 
     fn endpoint(&self, action: &str) -> std::io::Result<Url> {
-        let mut url = self.config.webapi_url.clone();
+        let mut url = self
+            .config
+            .webapi_url
+            .clone()
+            .ok_or_else(|| std::io::Error::other("panel sync webapi_url not set"))?;
+        let webapi_token = self
+            .config
+            .webapi_token
+            .as_deref()
+            .ok_or_else(|| std::io::Error::other("panel sync webapi_token not set"))?;
+        let node_id = self
+            .config
+            .node_id
+            .ok_or_else(|| std::io::Error::other("panel sync node_id not set"))?;
         let path = format!("{}/mod_mu/{action}", url.path().trim_end_matches('/'));
         url.set_path(&path);
         url.set_fragment(None);
         url.query_pairs_mut()
-            .append_pair("key", &self.config.webapi_token)
-            .append_pair("node_id", &self.config.node_id.to_string());
+            .append_pair("key", webapi_token)
+            .append_pair("node_id", &node_id.to_string());
         Ok(url)
     }
 
@@ -235,16 +275,28 @@ mod tests {
     #[test]
     fn builds_panel_users_url_with_configured_port_and_query() {
         let client = PanelSyncClient::new(PanelSyncConfig {
-            webapi_url: Url::parse("https://example.com:5432").unwrap(),
-            webapi_token: "test-token".to_string(),
-            node_id: 7,
-            update_interval_secs: 10,
+            webapi_url: Some(Url::parse("https://example.com:5432").unwrap()),
+            webapi_token: Some("test-token".to_string()),
+            node_id: Some(7),
+            ..PanelSyncConfig::default()
         });
 
         assert_eq!(
             client.endpoint("users").unwrap().as_str(),
             "https://example.com:5432/mod_mu/users?key=test-token&node_id=7"
         );
+    }
+
+    #[test]
+    fn panel_sync_config_round_trips_with_canonical_interval_field() {
+        let config: PanelSyncConfig =
+            serde_json::from_str(r#"{"webapi_url":"https://panel.example/","webapi_token":"token","node_id":7,"update_interval_secs":10}"#)
+                .unwrap();
+        assert_eq!(config.update_interval_secs, Some(10));
+
+        let serialized = serde_json::to_value(config).unwrap();
+        assert_eq!(serialized["update_interval_secs"], 10);
+        assert!(serialized.get("api_update_time").is_none());
     }
 
     #[tokio::test]
@@ -273,10 +325,10 @@ mod tests {
         });
 
         let client = PanelSyncClient::new(PanelSyncConfig {
-            webapi_url: Url::parse(&format!("http://{address}/panel/")).unwrap(),
-            webapi_token: "test-token".to_string(),
-            node_id: 7,
-            update_interval_secs: 10,
+            webapi_url: Some(Url::parse(&format!("http://{address}/panel/")).unwrap()),
+            webapi_token: Some("test-token".to_string()),
+            node_id: Some(7),
+            ..PanelSyncConfig::default()
         });
         let client_id = Uuid::parse_str("f2d46ca2-8d6d-4c5c-ae77-80c902ce68d7").unwrap();
         let audit = Arc::new(tokio::sync::Mutex::new(TrafficAudit::new()));
@@ -320,10 +372,10 @@ mod tests {
         });
 
         let mut client = PanelSyncClient::new(PanelSyncConfig {
-            webapi_url: Url::parse(&format!("http://{address}/panel/")).unwrap(),
-            webapi_token: "test-token".to_string(),
-            node_id: 7,
-            update_interval_secs: 10,
+            webapi_url: Some(Url::parse(&format!("http://{address}/panel/")).unwrap()),
+            webapi_token: Some("test-token".to_string()),
+            node_id: Some(7),
+            ..PanelSyncConfig::default()
         });
         let client_id = Uuid::parse_str("f2d46ca2-8d6d-4c5c-ae77-80c902ce68d7").unwrap();
         let audit = Arc::new(tokio::sync::Mutex::new(TrafficAudit::new()));
@@ -345,10 +397,10 @@ mod tests {
     #[tokio::test]
     async fn panel_sync_loop_stops_when_cancelled() {
         let client = PanelSyncClient::new(PanelSyncConfig {
-            webapi_url: Url::parse("http://127.0.0.1:1/").unwrap(),
-            webapi_token: "test-token".to_string(),
-            node_id: 7,
-            update_interval_secs: 60,
+            webapi_url: Some(Url::parse("http://127.0.0.1:1/").unwrap()),
+            webapi_token: Some("test-token".to_string()),
+            node_id: Some(7),
+            ..PanelSyncConfig::default()
         });
         let audit = Arc::new(tokio::sync::Mutex::new(TrafficAudit::new()));
         let cancel_token = CancellationToken::new();
