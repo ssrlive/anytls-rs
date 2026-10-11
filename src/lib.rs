@@ -10,7 +10,7 @@ mod core;
 pub mod ffi;
 #[cfg(feature = "ffi")]
 mod log_callback;
-#[cfg(feature = "server")]
+#[cfg(feature = "panel-sync")]
 mod panel_sync;
 #[cfg(feature = "relay")]
 pub mod relay;
@@ -42,11 +42,11 @@ pub use core::{
 pub use core::{read_auth, read_auth_with_client_id, write_auth, write_auth_with_client_id};
 #[cfg(feature = "ffi")]
 pub use log_callback::LogLevel;
-#[cfg(feature = "server")]
+#[cfg(feature = "panel-sync")]
 pub use panel_sync::{PanelSyncClient, PanelSyncConfig, TrafficAudit, TrafficAuditPtr};
 #[cfg(feature = "runtime")]
 pub use runtime::{AsyncReadWrite, BoxTransport, DEFAULT_MAX_SESSION_AGE, Session, Stream, StreamIo, is_peer_disconnect};
-#[cfg(feature = "runtime")]
+#[cfg(any(feature = "runtime", feature = "panel-sync"))]
 pub use tokio_util::sync::CancellationToken;
 #[cfg(feature = "client")]
 pub use traffic_status::TrafficStatus;

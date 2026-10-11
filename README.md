@@ -215,15 +215,16 @@ cargo test
 The default feature set builds both command-line applications: `client` and `server`.
 Features can be disabled and selected explicitly for library consumers:
 
-| Feature   | Enables                                                                    |
-| --------- | -------------------------------------------------------------------------- |
-| `core`    | Synchronous protocol primitives: frames, padding, hashes, and string maps  |
-| `async`   | Async authentication and frame I/O (depends on `core` and Tokio `io-util`) |
-| `runtime` | `async` plus session transport and asynchronous stream I/O                 |
-| `uot`     | UDP-over-TCP protocol v2 helpers (depends on `async`)                      |
-| `client`  | Client library and client CLI argument type                                |
-| `server`  | Server CLI, panel synchronization, and `anytls-server` binary              |
-| `ffi`     | C ABI client entry points                                                  |
+| Feature      | Enables                                                                    |
+| ------------ | -------------------------------------------------------------------------- |
+| `core`       | Synchronous protocol primitives: frames, padding, hashes, and string maps  |
+| `async`      | Async authentication and frame I/O (depends on `core` and Tokio `io-util`) |
+| `runtime`    | `async` plus session transport and asynchronous stream I/O                 |
+| `uot`        | UDP-over-TCP protocol v2 helpers (depends on `async`)                      |
+| `client`     | Client library and client CLI argument type                                |
+| `panel-sync` | Panel API client, traffic audit state, and cancellation token              |
+| `server`     | Server CLI and `anytls-server` binary                                      |
+| `ffi`        | C ABI client entry points                                                  |
 
 For example, depend on the library without its default applications and select only the protocol core:
 
@@ -233,6 +234,18 @@ anytls = { version = "0.1", default-features = false, features = ["core"] }
 
 Most implementation modules are private; selected Rust APIs are re-exported from the crate root.
 The `ffi` feature exposes the C ABI in `anytls::ffi`.
+
+Other libraries can use panel synchronization without enabling the client or server features. To enable panel synchronization on the server, select both `server` and `panel-sync`:
+
+```toml
+anytls = { version = "0.4", default-features = false, features = ["panel-sync"] }
+```
+
+```toml
+anytls = { version = "0.4", default-features = false, features = ["server", "panel-sync"] }
+```
+
+This exposes `PanelSyncClient`, `PanelSyncConfig`, `TrafficAudit`, `TrafficAuditPtr`, and `CancellationToken` from the `anytls` crate root.
 
 To generate the C header, install `cbindgen` and run:
 

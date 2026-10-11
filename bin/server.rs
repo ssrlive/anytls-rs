@@ -1,9 +1,12 @@
 use anytls::{
-    AUTH_HEADER_SIZE, BoxTransport, DEFAULT_MAX_SESSION_AGE, DEFAULT_SCHEME, PASSWORD_DIGEST_SIZE, PaddingFactory, PanelSyncClient,
-    ServerArgs, Session, Stream, StreamIo, TrafficAudit, TrafficAuditPtr, UotMode, extract_client_id_from_padding, is_peer_disconnect,
-    password_digest, print_args, print_url, relay, uot_encode_packet, uot_get_packet_from_stream, uot_get_request_from_stream,
-    uot_is_sentinel_destination,
+    AUTH_HEADER_SIZE, BoxTransport, DEFAULT_MAX_SESSION_AGE, DEFAULT_SCHEME, PASSWORD_DIGEST_SIZE, PaddingFactory, ServerArgs, Session,
+    Stream, StreamIo, UotMode, extract_client_id_from_padding, is_peer_disconnect, password_digest, print_args, print_url, relay,
+    uot_encode_packet, uot_get_packet_from_stream, uot_get_request_from_stream, uot_is_sentinel_destination,
 };
+#[cfg(feature = "panel-sync")]
+use anytls::{PanelSyncClient, TrafficAudit, TrafficAuditPtr};
+#[cfg(not(feature = "panel-sync"))]
+type TrafficAuditPtr = Arc<()>;
 use clap::Parser;
 use method_name::method_name_unstable;
 use notify::{Event, RecommendedWatcher, RecursiveMode, Watcher};
@@ -26,7 +29,9 @@ use std::{
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadBuf};
 use tokio::net::{TcpListener, TcpStream, UdpSocket};
 use tokio::sync::{mpsc, watch};
-use tokio::task::{JoinHandle, JoinSet};
+#[cfg(feature = "panel-sync")]
+use tokio::task::JoinHandle;
+use tokio::task::JoinSet;
 use tokio::time::Duration;
 use tokio_rustls::TlsAcceptor;
 use tokio_rustls::client::TlsConnector;
@@ -76,7 +81,10 @@ async fn run_server(cancel_token: CancellationToken) -> std::io::Result<()> {
     if args.print_url {
         let port = args.listen.port();
         let password = args.password.as_deref().unwrap_or_default();
+        #[cfg(feature = "panel-sync")]
         let enable = args.panel_sync_enabled();
+        #[cfg(not(feature = "panel-sync"))]
+        let enable = false;
         println!("{}", print_url(port, password, args.sni.as_deref(), enable).await?);
         return Ok(());
     }
@@ -95,10 +103,19 @@ async fn run_server(cancel_token: CancellationToken) -> std::io::Result<()> {
         probe_sni_allowlist: Arc::new(probe_sni_allowlist),
     };
     let (tls_state_tx, tls_state_rx) = watch::channel(tls_state);
+    #[cfg(feature = "panel-sync")]
     let panel_config = args.panel_sync_config()?;
+    #[cfg(feature = "panel-sync")]
     let panel_sync_enabled = panel_config.is_some();
+    #[cfg(not(feature = "panel-sync"))]
+    let panel_sync_enabled = false;
+    #[cfg(feature = "panel-sync")]
     let traffic_audit: TrafficAuditPtr = Arc::new(tokio::sync::Mutex::new(TrafficAudit::new()));
+    #[cfg(not(feature = "panel-sync"))]
+    let traffic_audit: TrafficAuditPtr = Arc::new(());
+    #[cfg(feature = "panel-sync")]
     let mut panel_task: Option<JoinHandle<()>> = None;
+    #[cfg(feature = "panel-sync")]
     if let Some(config) = panel_config {
         let mut panel_client = PanelSyncClient::new(config);
         panel_client.sync_initial(&traffic_audit).await?;
@@ -195,6 +212,7 @@ async fn run_server(cancel_token: CancellationToken) -> std::io::Result<()> {
         tls_reload_task.abort();
         let _ = tls_reload_task.await;
     }
+    #[cfg(feature = "panel-sync")]
     if let Some(mut panel_task) = panel_task
         && tokio::time::timeout(Duration::from_secs(5), &mut panel_task).await.is_err()
     {
@@ -229,6 +247,8 @@ async fn handle_connection(
     forward_target: Option<Url>,
     cancel_token: CancellationToken,
 ) -> std::io::Result<()> {
+    #[cfg(not(feature = "panel-sync"))]
+    let _ = (&traffic_audit, panel_sync_enabled);
     let mut tls = tokio::select! {
         _ = cancel_token.cancelled() => return Ok(()),
         result = tls_state.acceptor.accept(tcp) => result?,
@@ -281,6 +301,7 @@ async fn handle_connection(
         result = async { tls.read_exact(&mut padding_data).await.map(|_| ()) } => result?,
     }
     let client_id = extract_client_id_from_padding(&padding_data);
+    #[cfg(feature = "panel-sync")]
     if panel_sync_enabled {
         let approved = match client_id {
             Some(client_id) => traffic_audit.lock().await.is_enabled(&client_id),
@@ -357,12 +378,17 @@ async fn relay_stream(
     client_id: Option<Uuid>,
     panel_sync_enabled: bool,
 ) -> std::io::Result<()> {
-    use std::io::{Error, ErrorKind::PermissionDenied, ErrorKind::TimedOut};
+    #[cfg(feature = "panel-sync")]
+    use std::io::ErrorKind::PermissionDenied;
+    use std::io::{Error, ErrorKind::TimedOut};
+    #[cfg(not(feature = "panel-sync"))]
+    let _ = (&traffic_audit, panel_sync_enabled);
     let session_id = stream.session_id();
     let stream_id = stream.id();
     let started = std::time::Instant::now();
     let mut stream_io = StreamIo::new(stream);
     let destination = read_target(&mut stream_io).await?;
+    #[cfg(feature = "panel-sync")]
     if panel_sync_enabled {
         let enabled = match client_id {
             Some(client_id) => traffic_audit.lock().await.is_enabled(&client_id),
@@ -400,6 +426,7 @@ async fn relay_stream(
     let relay_result = relay::copy_bidirectional(&mut outbound, &mut stream_io).await;
     let upstream = upstream_bytes.load(Ordering::Relaxed);
     let downstream = downstream_bytes.load(Ordering::Relaxed);
+    #[cfg(feature = "panel-sync")]
     if let Some(client_id) = client_id {
         let mut audit = traffic_audit.lock().await;
         audit.add_upstream(&client_id, upstream);
@@ -459,6 +486,8 @@ impl<T: AsyncWrite + Unpin> AsyncWrite for CountedIo<T> {
 }
 
 async fn relay_uot_datagrams(mut stream_io: StreamIo, traffic_audit: TrafficAuditPtr, client_id: Option<Uuid>) -> std::io::Result<()> {
+    #[cfg(not(feature = "panel-sync"))]
+    let _ = (&traffic_audit, client_id);
     let stream = stream_io.stream();
     let request = uot_get_request_from_stream(&mut stream_io).await?;
     let socket = UdpSocket::bind("0.0.0.0:0").await?;
@@ -497,6 +526,7 @@ async fn relay_uot_datagrams(mut stream_io: StreamIo, traffic_audit: TrafficAudi
                         socket.send(&payload).await?;
                     }
                 }
+                #[cfg(feature = "panel-sync")]
                 if let Some(client_id) = client_id {
                     traffic_audit.lock().await.add_upstream(&client_id, payload.len() as u64);
                 }
@@ -509,6 +539,7 @@ async fn relay_uot_datagrams(mut stream_io: StreamIo, traffic_audit: TrafficAudi
                     UotMode::Connected => uot_encode_packet(UotMode::Connected, None, &outbound_buf[..size])?,
                 };
                 write_stream_all(&stream, &frame).await?;
+                #[cfg(feature = "panel-sync")]
                 if let Some(client_id) = client_id {
                     traffic_audit.lock().await.add_downstream(&client_id, size as u64);
                 }

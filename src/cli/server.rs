@@ -1,3 +1,4 @@
+#[cfg(feature = "panel-sync")]
 use crate::panel_sync::PanelSyncConfig;
 use clap::Parser;
 use std::{net::SocketAddr, path::PathBuf};
@@ -45,21 +46,25 @@ pub struct ServerArgs {
     pub key: Option<PathBuf>,
 
     /// Panel webapi base url for sync
+    #[cfg(feature = "panel-sync")]
     #[arg(long, value_name = "URL")]
     #[serde(skip_serializing_if = "Option::is_none")]
     pub panel_webapi_url: Option<Url>,
 
     /// Panel webapi token
+    #[cfg(feature = "panel-sync")]
     #[arg(long, value_name = "TOKEN")]
     #[serde(skip_serializing_if = "Option::is_none")]
     pub panel_webapi_token: Option<String>,
 
     /// Panel node id
+    #[cfg(feature = "panel-sync")]
     #[serde(skip_serializing_if = "Option::is_none")]
     #[arg(long, value_name = "ID")]
     pub panel_node_id: Option<usize>,
 
     /// Panel API update interval seconds
+    #[cfg(feature = "panel-sync")]
     #[serde(skip_serializing_if = "Option::is_none")]
     #[arg(long, value_name = "SECS")]
     pub panel_update_interval_secs: Option<u64>,
@@ -85,10 +90,12 @@ fn default_log_level() -> log::LevelFilter {
 }
 
 impl ServerArgs {
+    #[cfg(feature = "panel-sync")]
     pub fn panel_sync_enabled(&self) -> bool {
         self.panel_webapi_url.is_some() && self.panel_webapi_token.is_some() && self.panel_node_id.is_some()
     }
 
+    #[cfg(feature = "panel-sync")]
     pub fn panel_sync_config(&self) -> std::io::Result<Option<PanelSyncConfig>> {
         use std::io::{Error, ErrorKind::InvalidInput};
         let has_required_value = self.panel_webapi_url.is_some() || self.panel_webapi_token.is_some() || self.panel_node_id.is_some();
@@ -117,6 +124,7 @@ mod tests {
     use clap::Parser;
     use std::path::Path;
 
+    #[cfg(feature = "panel-sync")]
     #[test]
     fn panel_sync_requires_all_connection_parameters_and_clamps_interval() {
         let args = ServerArgs::try_parse_from([
