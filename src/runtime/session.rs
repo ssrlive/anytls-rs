@@ -17,7 +17,10 @@ use crate::{CHECK_MARK, Command, Frame, HEADER_OVERHEAD_SIZE, PaddingFactory, fr
 
 const WRITE_TIMEOUT: Duration = Duration::from_secs(15);
 const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(15);
+const HEARTBEAT_QUEUE_TIMEOUT: Duration = Duration::from_secs(15);
 const HEARTBEAT_TIMEOUT: Duration = Duration::from_secs(10);
+const INBOUND_PUSH_QUEUE_BYTES: usize = 1024 * 1024;
+const INBOUND_PUSH_QUEUE_MESSAGES: usize = 64;
 pub const DEFAULT_MAX_SESSION_AGE: Duration = Duration::from_secs(60 * 60);
 
 static NEXT_STREAM_ID: AtomicU32 = AtomicU32::new(0);
@@ -38,13 +41,30 @@ pub fn is_peer_disconnect(error: &std::io::Error) -> bool {
 struct WriteRequest {
     bytes: Vec<u8>,
     disable_buffering_after: bool,
-    result_sender: Option<oneshot::Sender<std::io::Result<()>>>,
+    enqueue_wait: Duration,
+    queue_depth_at_enqueue: usize,
+    enqueued_at: std::time::Instant,
+    heartbeat_session_id: Option<usize>,
+    result_sender: Option<oneshot::Sender<WriteCompletion>>,
+}
+
+struct WriteTimings {
+    enqueue_wait: Duration,
+    queue_depth_at_enqueue: usize,
+    queue_wait: Duration,
+    write_duration: Duration,
+}
+
+struct WriteCompletion {
+    result: std::io::Result<()>,
+    timings: WriteTimings,
 }
 
 /// Represents an status of a logical stream within a session.
 pub(crate) struct StreamState {
     pub(crate) writer: Arc<Mutex<tokio::io::DuplexStream>>,
-    pub(crate) push_sender: mpsc::UnboundedSender<Option<Vec<u8>>>,
+    push_sender: mpsc::Sender<PushMessage>,
+    push_slots: Arc<tokio::sync::Semaphore>,
     /// Indicates whether the local side has sent a FIN for this stream.
     pub(crate) local_fin: bool,
     /// Indicates whether the remote side has sent a FIN for this stream.
@@ -55,9 +75,15 @@ pub(crate) struct StreamState {
     pub(crate) close_token: CancellationToken,
 }
 
+enum PushMessage {
+    Data(Vec<u8>, tokio::sync::OwnedSemaphorePermit),
+    Fin,
+}
+
 impl StreamState {
     pub(crate) fn new(writer: tokio::io::DuplexStream, stream_id: u32, session: Weak<Session>) -> Self {
-        let (push_sender, push_receiver) = mpsc::unbounded_channel::<Option<Vec<u8>>>();
+        let push_slots = Arc::new(tokio::sync::Semaphore::new(INBOUND_PUSH_QUEUE_BYTES));
+        let (push_sender, push_receiver) = mpsc::channel(INBOUND_PUSH_QUEUE_MESSAGES + 1);
         let writer = Arc::new(Mutex::new(writer));
         let task_writer = Arc::clone(&writer);
         let close_token = CancellationToken::new();
@@ -74,6 +100,7 @@ impl StreamState {
         Self {
             writer,
             push_sender,
+            push_slots,
             local_fin: false,
             remote_fin: false,
             read_closed: false,
@@ -86,7 +113,7 @@ impl StreamState {
         session_id: usize,
         session: Weak<Session>,
         task_close_token: CancellationToken,
-        mut push_receiver: mpsc::UnboundedReceiver<Option<Vec<u8>>>,
+        mut push_receiver: mpsc::Receiver<PushMessage>,
         task_writer: Arc<Mutex<tokio::io::DuplexStream>>,
     ) {
         let result = loop {
@@ -95,14 +122,20 @@ impl StreamState {
                 _ = task_close_token.cancelled() => break Ok(()),
             };
             let Some(message) = message else {
+                if task_close_token.is_cancelled() {
+                    break Ok(());
+                }
                 break Err(std::io::Error::new(std::io::ErrorKind::BrokenPipe, "push_receiver closed"));
             };
-            let Some(data) = message else {
-                let _ = task_writer.lock().await.shutdown().await;
-                if let Some(session) = session.upgrade() {
-                    session.on_stream_read_closed(stream_id).await;
+            let (data, _permit) = match message {
+                PushMessage::Data(data, permit) => (data, permit),
+                PushMessage::Fin => {
+                    let _ = task_writer.lock().await.shutdown().await;
+                    if let Some(session) = session.upgrade() {
+                        session.on_stream_read_closed(stream_id).await;
+                    }
+                    break Ok(());
                 }
-                break Ok(());
             };
             let result = tokio::select! {
                 result = async { task_writer.lock().await.write_all(&data).await } => result,
@@ -239,6 +272,8 @@ impl Session {
             let Some(request) = request else {
                 break;
             };
+            let queue_wait = request.enqueued_at.elapsed();
+            let write_started = std::time::Instant::now();
             let result = tokio::select! {
                 biased;
                 _ = writer_close_token.cancelled() => break,
@@ -253,9 +288,37 @@ impl Session {
                     Ok(())
                 }) => result.unwrap_or_else(|_| Err(std::io::Error::new(std::io::ErrorKind::TimedOut, "AnyTLS transport write timed out"))),
             };
-            let failed = result.is_err();
+            let completion = WriteCompletion {
+                result,
+                timings: WriteTimings {
+                    enqueue_wait: request.enqueue_wait,
+                    queue_depth_at_enqueue: request.queue_depth_at_enqueue,
+                    queue_wait,
+                    write_duration: write_started.elapsed(),
+                },
+            };
+            let failed = completion.result.is_err();
+            if let Some(session_id) = request.heartbeat_session_id {
+                if let Some(error) = completion.result.as_ref().err() {
+                    log::warn!(
+                        "Session {session_id} heartbeat writer failed: enqueue_wait={:?} queue_depth={} queue_wait={:?} transport_write={:?} error={error}",
+                        completion.timings.enqueue_wait,
+                        completion.timings.queue_depth_at_enqueue,
+                        completion.timings.queue_wait,
+                        completion.timings.write_duration,
+                    );
+                } else {
+                    log::debug!(
+                        "Session {session_id} heartbeat writer: enqueue_wait={:?} queue_depth={} queue_wait={:?} transport_write={:?} result=written",
+                        completion.timings.enqueue_wait,
+                        completion.timings.queue_depth_at_enqueue,
+                        completion.timings.queue_wait,
+                        completion.timings.write_duration,
+                    );
+                }
+            }
             if let Some(result_sender) = request.result_sender {
-                let _ = result_sender.send(result);
+                let _ = result_sender.send(completion);
             }
             if failed {
                 writer_closed.store(true, std::sync::atomic::Ordering::Release);
@@ -351,19 +414,47 @@ impl Session {
             let response = session.heart_response.notified();
             tokio::pin!(response);
             response.as_mut().enable();
-            let probe = async {
-                session.write_control(Frame::new(Command::HeartRequest, 0)).await?;
-                response.await;
-                Ok::<(), std::io::Error>(())
+            let dispatch_started = std::time::Instant::now();
+            let timings = tokio::select! {
+                _ = close_token.cancelled() => break,
+                result = session.write_heartbeat() => match result {
+                    Ok(timings) => timings,
+                    Err(error) => {
+                        log::warn!("{mn} -- Session {session_id} heartbeat dispatch/write failed after {:?}: {error}", dispatch_started.elapsed());
+                        let _ = session.shutdown().await;
+                        break;
+                    }
+                },
             };
+            log::debug!(
+                "{mn} -- Session {session_id} heartbeat written: enqueue_wait={:?} queue_depth={} queue_wait={:?} transport_write={:?}; awaiting response",
+                timings.enqueue_wait,
+                timings.queue_depth_at_enqueue,
+                timings.queue_wait,
+                timings.write_duration,
+            );
+            let response_started = std::time::Instant::now();
             let result = tokio::select! {
                 _ = close_token.cancelled() => break,
-                result = tokio::time::timeout(HEARTBEAT_TIMEOUT, probe) => result,
+                result = tokio::time::timeout(HEARTBEAT_TIMEOUT, response.as_mut()) => result,
             };
-            if !matches!(result, Ok(Ok(()))) {
-                log::warn!("{mn} -- Session {session_id} heartbeat failed or timed out; closing stalled transport");
-                let _ = session.shutdown().await;
-                break;
+            match result {
+                Ok(()) => log::trace!(
+                    "{mn} -- Session {session_id} heartbeat response received after {:?}",
+                    response_started.elapsed()
+                ),
+                Err(_) => {
+                    log::warn!(
+                        "{mn} -- Session {session_id} heartbeat response timed out after {:?}: enqueue_wait={:?} queue_depth={} queue_wait={:?} transport_write={:?}; closing stalled transport",
+                        response_started.elapsed(),
+                        timings.enqueue_wait,
+                        timings.queue_depth_at_enqueue,
+                        timings.queue_wait,
+                        timings.write_duration,
+                    );
+                    let _ = session.shutdown().await;
+                    break;
+                }
             }
         }
     }
@@ -524,12 +615,26 @@ impl Session {
         self.enqueue_frame(frame, false).await
     }
 
+    async fn write_heartbeat(&self) -> std::io::Result<WriteTimings> {
+        self.enqueue_encoded_with_mode(
+            Frame::new(Command::HeartRequest, 0).encode()?,
+            false,
+            Some(self.id()),
+            Some(HEARTBEAT_QUEUE_TIMEOUT),
+        )
+        .await
+    }
+
     fn queue_control(&self, frame: Frame) -> std::io::Result<()> {
         use std::io::{Error, ErrorKind};
         self.write_sender
             .try_send(WriteRequest {
                 bytes: frame.encode()?,
                 disable_buffering_after: false,
+                enqueue_wait: Duration::ZERO,
+                queue_depth_at_enqueue: 0,
+                enqueued_at: std::time::Instant::now(),
+                heartbeat_session_id: None,
                 result_sender: None,
             })
             .map_err(|error| match error {
@@ -539,28 +644,78 @@ impl Session {
     }
 
     async fn enqueue_frame(&self, frame: Frame, disable_buffering_after: bool) -> std::io::Result<()> {
-        self.enqueue_encoded_with_mode(frame.encode()?, disable_buffering_after).await
+        self.enqueue_encoded_with_mode(frame.encode()?, disable_buffering_after, None, None)
+            .await
+            .map(|_| ())
     }
 
     async fn enqueue_bytes(&self, bytes: Vec<u8>, disable_buffering_after: bool) -> std::io::Result<()> {
-        self.enqueue_encoded_with_mode(bytes, disable_buffering_after).await
+        self.enqueue_encoded_with_mode(bytes, disable_buffering_after, None, None)
+            .await
+            .map(|_| ())
     }
 
-    async fn enqueue_encoded_with_mode(&self, bytes: Vec<u8>, disable_buffering_after: bool) -> std::io::Result<()> {
-        use std::io::{Error, ErrorKind::BrokenPipe};
+    async fn enqueue_encoded_with_mode(
+        &self,
+        bytes: Vec<u8>,
+        disable_buffering_after: bool,
+        heartbeat_session_id: Option<usize>,
+        queue_timeout: Option<Duration>,
+    ) -> std::io::Result<WriteTimings> {
+        use std::io::{Error, ErrorKind};
         let session_id = self.id();
+        let enqueue_started = std::time::Instant::now();
+        let permit = if let Some(queue_timeout) = queue_timeout {
+            tokio::select! {
+                result = tokio::time::timeout(queue_timeout, self.write_sender.reserve()) => match result {
+                    Ok(Ok(permit)) => permit,
+                    Ok(Err(_)) => return Err(Error::new(ErrorKind::BrokenPipe, "writer task closed")),
+                    Err(_) => {
+                        if let Some(session_id) = heartbeat_session_id {
+                            let queue_depth = self
+                                .write_sender
+                                .max_capacity()
+                                .saturating_sub(self.write_sender.capacity());
+                            log::warn!(
+                                "Session {session_id} heartbeat queue admission timed out: enqueue_wait={:?} queue_depth={queue_depth}",
+                                enqueue_started.elapsed(),
+                            );
+                        }
+                        return Err(Error::new(ErrorKind::TimedOut, "AnyTLS heartbeat write queue admission timed out"));
+                    }
+                },
+                _ = self.close_token.cancelled() => return Err(Error::new(ErrorKind::BrokenPipe, format!("session {session_id} closed in enqueue_encoded_with_mode"))),
+            }
+        } else {
+            tokio::select! {
+                result = self.write_sender.reserve() => result.map_err(|_| Error::new(ErrorKind::BrokenPipe, "writer task closed"))?,
+                _ = self.close_token.cancelled() => return Err(Error::new(ErrorKind::BrokenPipe, format!("session {session_id} closed in enqueue_encoded_with_mode"))),
+            }
+        };
+        let enqueue_wait = enqueue_started.elapsed();
+        let queue_depth_at_enqueue = self
+            .write_sender
+            .max_capacity()
+            .saturating_sub(self.write_sender.capacity())
+            .saturating_sub(1);
         let (result_sender, result_receiver) = oneshot::channel();
+        permit.send(WriteRequest {
+            bytes,
+            disable_buffering_after,
+            enqueue_wait,
+            queue_depth_at_enqueue,
+            enqueued_at: std::time::Instant::now(),
+            heartbeat_session_id,
+            result_sender: Some(result_sender),
+        });
         tokio::select! {
-            result = self.write_sender.send(WriteRequest {
-                bytes,
-                disable_buffering_after,
-                result_sender: Some(result_sender),
-            }) => result.map_err(|_| Error::new(BrokenPipe, "writer task closed"))?,
-            _ = self.close_token.cancelled() => return Err(Error::new(BrokenPipe, format!("session {session_id} closed in enqueue_encoded_with_mode"))),
-        }
-        tokio::select! {
-            result = result_receiver => result.map_err(|_| Error::new(BrokenPipe, "writer task closed"))?,
-            _ = self.close_token.cancelled() => Err(Error::new(BrokenPipe, format!("session {session_id} closed in enqueue_encoded_with_mode (result_receiver)"))),
+            result = result_receiver => {
+                let completion = result.map_err(|_| Error::new(ErrorKind::BrokenPipe, "writer task closed"))?;
+                let timings = completion.timings;
+                completion.result?;
+                Ok(timings)
+            },
+            _ = self.close_token.cancelled() => Err(Error::new(ErrorKind::BrokenPipe, format!("session {session_id} closed in enqueue_encoded_with_mode (result_receiver)"))),
         }
     }
 
@@ -600,14 +755,28 @@ impl Session {
             }
             match frame.command {
                 Command::Push => {
-                    let push_sender = self.streams.lock().await.get(&stream_id).map(|entry| entry.push_sender.clone());
-                    if let Some(push_sender) = push_sender
-                        && let Err(e) = push_sender.send(Some(frame.data))
-                    {
-                        log::debug!("{mn} -- Session {session_id} stream {stream_id} push worker closed, closing stream: {e}");
-                        if !self.is_closed() {
-                            self.queue_control(Frame::new(Command::Fin, stream_id))?;
-                            self.remove_stream_by_id(stream_id).await;
+                    let stream = self
+                        .streams
+                        .lock()
+                        .await
+                        .get(&stream_id)
+                        .map(|entry| (entry.push_sender.clone(), Arc::clone(&entry.push_slots)));
+                    if let Some((push_sender, push_slots)) = stream {
+                        match push_slots.try_acquire_many_owned(frame.data.len() as u32) {
+                            Ok(permit) => {
+                                if let Err(error) = push_sender.try_send(PushMessage::Data(frame.data, permit)) {
+                                    log::debug!("{mn} -- Session {session_id} stream {stream_id} push worker closed: {error}");
+                                    if !self.is_closed() {
+                                        self.queue_control(Frame::new(Command::Fin, stream_id))?;
+                                        self.remove_stream_by_id(stream_id).await;
+                                    }
+                                }
+                            }
+                            Err(_) => {
+                                log::warn!("{mn} -- Session {session_id} stream {stream_id} inbound PUSH limit reached; closing stream");
+                                self.queue_control(Frame::new(Command::Fin, stream_id))?;
+                                self.remove_stream_by_id(stream_id).await;
+                            }
                         }
                     }
                 }
@@ -690,10 +859,29 @@ impl Session {
                 Some(_) | None => None,
             }
         };
-        if let Some(push_sender) = push_sender
-            && push_sender.send(None).is_err()
-        {
-            self.on_stream_read_closed(stream_id).await;
+        if let Some(push_sender) = push_sender {
+            match push_sender.try_send(PushMessage::Fin) {
+                Ok(()) => {}
+                Err(mpsc::error::TrySendError::Closed(_)) => self.on_stream_read_closed(stream_id).await,
+                Err(mpsc::error::TrySendError::Full(message)) => {
+                    let close_token = self.streams.lock().await.get(&stream_id).map(|stream| stream.close_token.clone());
+                    let session = Arc::downgrade(self);
+                    tokio::spawn(async move {
+                        if let Some(close_token) = close_token {
+                            tokio::select! {
+                                result = push_sender.send(message) => {
+                                    if result.is_err()
+                                        && let Some(session) = session.upgrade()
+                                    {
+                                        session.on_stream_read_closed(stream_id).await;
+                                    }
+                                }
+                                _ = close_token.cancelled() => {}
+                            }
+                        }
+                    });
+                }
+            }
         }
         Ok(())
     }
@@ -1220,6 +1408,36 @@ pub(crate) mod tests {
     }
 
     #[tokio::test(start_paused = true)]
+    async fn heartbeat_response_timeout_starts_after_frame_is_written() {
+        let (transport, mut peer, gate) = gated_transport();
+        let padding = Arc::new(RwLock::new(PaddingFactory::new(b"stop=0").unwrap()));
+        let session = Session::new_client(1, transport, padding, 1, DEFAULT_MAX_SESSION_AGE);
+        session.run().await.unwrap();
+        let _stream = session.open_stream().await.unwrap();
+        assert_eq!(Frame::read_from(&mut peer).await.unwrap().command, Command::Settings);
+        assert_eq!(Frame::read_from(&mut peer).await.unwrap().command, Command::Syn);
+        session.peer_version.store(2, std::sync::atomic::Ordering::Release);
+
+        gate.block();
+        tokio::time::advance(HEARTBEAT_INTERVAL).await;
+        gate.wait_pending().await;
+        tokio::time::advance(HEARTBEAT_TIMEOUT).await;
+        assert!(!session.is_closed(), "a queued heartbeat is not an unanswered heartbeat");
+
+        gate.release();
+        let request = Frame::read_from(&mut peer).await.unwrap();
+        assert_eq!(request.command, Command::HeartRequest);
+        peer.write_all(&Frame::new(Command::HeartResponse, 0).encode().unwrap())
+            .await
+            .unwrap();
+        for _turn in 0..10 {
+            tokio::task::yield_now().await;
+        }
+        assert!(!session.is_closed());
+        session.shutdown().await.unwrap();
+    }
+
+    #[tokio::test(start_paused = true)]
     async fn v1_session_does_not_send_proactive_heartbeats() {
         let (local, mut peer) = tokio::io::duplex(128 * 1024);
         let padding = Arc::new(RwLock::new(PaddingFactory::new(b"stop=0").unwrap()));
@@ -1416,6 +1634,46 @@ pub(crate) mod tests {
         drop(client_stream);
         let _ = client.shutdown().await;
         let _ = server.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn slow_inbound_stream_is_closed_without_closing_session() {
+        let (transport, mut peer, _gate) = gated_transport();
+        let padding = Arc::new(RwLock::new(PaddingFactory::new(b"stop=0").unwrap()));
+        let session = Session::new_client(1, transport, padding, 1, DEFAULT_MAX_SESSION_AGE);
+        session.run().await.unwrap();
+        let stream = session.open_stream().await.unwrap();
+        assert_eq!(Frame::read_from(&mut peer).await.unwrap().command, Command::Settings);
+        assert_eq!(Frame::read_from(&mut peer).await.unwrap().command, Command::Syn);
+
+        let payload = vec![0x5a; crate::MAX_FRAME_DATA_SIZE];
+        for _ in 0..18 {
+            let mut push = Frame::new(Command::Push, stream.id());
+            push.data.clone_from(&payload);
+            peer.write_all(&push.encode().unwrap()).await.unwrap();
+        }
+        peer.write_all(&Frame::new(Command::HeartRequest, 0).encode().unwrap())
+            .await
+            .unwrap();
+
+        let mut received_fin = false;
+        loop {
+            let frame = tokio::time::timeout(Duration::from_secs(1), Frame::read_from(&mut peer))
+                .await
+                .expect("session should keep processing control frames")
+                .unwrap();
+            if frame.command == Command::Fin && frame.stream_id == stream.id() {
+                received_fin = true;
+            }
+            if frame.command == Command::HeartResponse {
+                break;
+            }
+        }
+
+        assert!(received_fin, "overloaded stream should be closed with FIN");
+        assert!(!session.is_closed(), "one slow stream should not close the session");
+        assert!(!session.streams.lock().await.contains_key(&stream.id()));
+        session.shutdown().await.unwrap();
     }
 
     #[tokio::test]
