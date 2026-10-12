@@ -1505,6 +1505,87 @@ pub(crate) mod tests {
         server.shutdown().await.unwrap();
     }
 
+    #[cfg(all(feature = "client", feature = "server"))]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn real_tls_bidirectional_load_does_not_lose_heartbeat_responses() {
+        use rustls::pki_types::{PrivatePkcs8KeyDer, ServerName};
+        use tokio::net::{TcpListener, TcpStream};
+        use tokio::task::JoinSet;
+
+        tokio::time::timeout(Duration::from_secs(30), async {
+            let certified = rcgen::generate_simple_self_signed(vec!["localhost".to_owned()]).unwrap();
+            let certificate = certified.cert.der().clone();
+            let key = PrivatePkcs8KeyDer::from(certified.signing_key.serialize_der());
+            let server_config = rustls::ServerConfig::builder()
+                .with_no_client_auth()
+                .with_single_cert(vec![certificate.clone()], key.into())
+                .unwrap();
+            let mut roots = rustls::RootCertStore::empty();
+            roots.add(certificate).unwrap();
+            let client_config = rustls::ClientConfig::builder().with_root_certificates(roots).with_no_client_auth();
+            let acceptor = tokio_rustls::TlsAcceptor::from(Arc::new(server_config));
+            let connector = tokio_rustls::TlsConnector::from(Arc::new(client_config));
+            let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let address = listener.local_addr().unwrap();
+            let (client_io, server_io) = tokio::join!(
+                async {
+                    let tcp = TcpStream::connect(address).await.unwrap();
+                    connector.connect(ServerName::try_from("localhost").unwrap(), tcp).await.unwrap()
+                },
+                async {
+                    let (tcp, _) = listener.accept().await.unwrap();
+                    acceptor.accept(tcp).await.unwrap()
+                }
+            );
+            let client = Session::new_client(1, Box::new(client_io), padding(), 10, DEFAULT_MAX_SESSION_AGE);
+            let server = Session::new_server(2, Box::new(server_io), padding(), 10, DEFAULT_MAX_SESSION_AGE);
+            client.run().await.unwrap();
+            server.run().await.unwrap();
+
+            let mut transfers = JoinSet::new();
+            for _stream_index in 0..10 {
+                let local = Arc::new(client.open_stream().await.unwrap());
+                let remote = Arc::new(server.accept_stream().await.unwrap());
+                for endpoint in [local, remote] {
+                    let writer = Arc::clone(&endpoint);
+                    transfers.spawn(async move {
+                        let data = vec![0xa5; 16 * 1024];
+                        for _chunk in 0..256 {
+                            assert_eq!(writer.write(&data).await.unwrap(), data.len());
+                            tokio::task::yield_now().await;
+                        }
+                    });
+                    transfers.spawn(async move {
+                        let mut remaining = 4 * 1024 * 1024;
+                        let mut data = vec![0; 16 * 1024];
+                        while remaining > 0 {
+                            let size = endpoint.read(&mut data).await.unwrap();
+                            assert!(size > 0 && size <= remaining);
+                            assert!(data[..size].iter().all(|byte| *byte == 0xa5));
+                            remaining -= size;
+                        }
+                    });
+                }
+            }
+            for _probe in 0..128 {
+                let response = client.heart_response.notified();
+                tokio::pin!(response);
+                response.as_mut().enable();
+                client.write_heartbeat().await.unwrap();
+                tokio::time::timeout(HEARTBEAT_TIMEOUT, response).await.unwrap();
+            }
+            while let Some(result) = transfers.join_next().await {
+                result.unwrap();
+            }
+            assert!(!client.is_closed());
+            assert!(!server.is_closed());
+            client.shutdown().await.unwrap();
+            server.shutdown().await.unwrap();
+        })
+        .await
+        .expect("real TLS traffic and heartbeat probes should complete without a stall");
+    }
+
     #[test]
     fn classifies_peer_disconnect_errors() {
         use std::io::ErrorKind;
