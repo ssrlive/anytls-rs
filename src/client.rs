@@ -82,10 +82,8 @@ impl Client {
         let (session, stream) = match self.reserve_pooled_stream().await? {
             Some(reserved) => reserved,
             None => {
+                let _creation = self.creation.lock().await;
                 let deadline = tokio::time::Instant::now() + SESSION_CONNECT_TIMEOUT;
-                let _creation = tokio::time::timeout_at(deadline, self.creation.lock())
-                    .await
-                    .map_err(|_| std::io::Error::new(std::io::ErrorKind::TimedOut, "waiting for AnyTLS session creation timed out"))?;
                 match self.reserve_pooled_stream().await? {
                     Some(reserved) => reserved,
                     None => {
@@ -424,6 +422,71 @@ mod tests {
             assert_eq!(error.kind(), std::io::ErrorKind::TimedOut);
         }
         assert_eq!(dial_count.load(Ordering::Relaxed), 2);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn queued_session_creation_gets_a_fresh_dial_timeout() {
+        let dial_count = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let first_dial_started = Arc::new(tokio::sync::Notify::new());
+        let servers = Arc::new(Mutex::new(Vec::new()));
+        let dialer: Dialer = {
+            let dial_count = Arc::clone(&dial_count);
+            let first_dial_started = Arc::clone(&first_dial_started);
+            let servers = Arc::clone(&servers);
+            Arc::new(move || {
+                let sequence = dial_count.fetch_add(1, Ordering::Relaxed);
+                let first_dial_started = Arc::clone(&first_dial_started);
+                let servers = Arc::clone(&servers);
+                Box::pin(async move {
+                    if sequence == 0 {
+                        first_dial_started.notify_one();
+                        return std::future::pending().await;
+                    }
+                    let (client_io, server_io) = tokio::io::duplex(128 * 1024);
+                    let server = Session::new_server(
+                        sequence,
+                        Box::new(server_io),
+                        Arc::new(RwLock::new(PaddingFactory::new(DEFAULT_SCHEME).unwrap())),
+                        1,
+                        DEFAULT_MAX_SESSION_AGE,
+                    );
+                    server.run().await?;
+                    servers.lock().await.push(server);
+                    Ok(Box::new(client_io) as BoxTransport)
+                })
+            })
+        };
+        let client = Client::new(
+            dialer,
+            Arc::new(RwLock::new(PaddingFactory::new(DEFAULT_SCHEME).unwrap())),
+            Duration::from_secs(30),
+            1,
+            Duration::from_secs(3600),
+        );
+
+        let first = tokio::spawn({
+            let client = Arc::clone(&client);
+            async move { client.create_stream().await }
+        });
+        first_dial_started.notified().await;
+        let queued = tokio::spawn({
+            let client = Arc::clone(&client);
+            async move { client.create_stream().await }
+        });
+        tokio::task::yield_now().await;
+
+        tokio::time::advance(SESSION_CONNECT_TIMEOUT).await;
+        match first.await.unwrap() {
+            Err(error) => assert_eq!(error.kind(), std::io::ErrorKind::TimedOut),
+            Ok(_) => panic!("stalled dial should time out"),
+        }
+        let stream = queued.await.unwrap().expect("queued dial should receive a fresh timeout window");
+
+        client.shutdown().await.unwrap();
+        for server in servers.lock().await.drain(..) {
+            server.shutdown().await.unwrap();
+        }
+        drop(stream);
     }
 
     #[tokio::test]

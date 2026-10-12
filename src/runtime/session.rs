@@ -45,6 +45,7 @@ struct WriteRequest {
     queue_depth_at_enqueue: usize,
     enqueued_at: std::time::Instant,
     heartbeat_session_id: Option<usize>,
+    heartbeat_response_session_id: Option<usize>,
     result_sender: Option<oneshot::Sender<WriteCompletion>>,
 }
 
@@ -314,6 +315,25 @@ impl Session {
                         completion.timings.queue_depth_at_enqueue,
                         completion.timings.queue_wait,
                         completion.timings.write_duration,
+                    );
+                }
+            }
+            if let Some(session_id) = request.heartbeat_response_session_id {
+                if let Some(error) = completion.result.as_ref().err() {
+                    log::warn!(
+                        "Session {session_id} HeartResponse write failed: queue_depth={} queue_wait={:?} transport_write={:?} total_since_enqueue={:?} error={error}",
+                        completion.timings.queue_depth_at_enqueue,
+                        completion.timings.queue_wait,
+                        completion.timings.write_duration,
+                        request.enqueued_at.elapsed(),
+                    );
+                } else {
+                    log::trace!(
+                        "Session {session_id} HeartResponse written: queue_depth={} queue_wait={:?} transport_write={:?} total_since_enqueue={:?}",
+                        completion.timings.queue_depth_at_enqueue,
+                        completion.timings.queue_wait,
+                        completion.timings.write_duration,
+                        request.enqueued_at.elapsed(),
                     );
                 }
             }
@@ -627,14 +647,18 @@ impl Session {
 
     fn queue_control(&self, frame: Frame) -> std::io::Result<()> {
         use std::io::{Error, ErrorKind};
+        let heartbeat_response_session_id = (frame.command == Command::HeartResponse).then_some(self.id());
+        let queue_depth_at_enqueue = self.write_sender.max_capacity().saturating_sub(self.write_sender.capacity());
+        let enqueued_at = std::time::Instant::now();
         self.write_sender
             .try_send(WriteRequest {
                 bytes: frame.encode()?,
                 disable_buffering_after: false,
                 enqueue_wait: Duration::ZERO,
-                queue_depth_at_enqueue: 0,
-                enqueued_at: std::time::Instant::now(),
+                queue_depth_at_enqueue,
+                enqueued_at,
                 heartbeat_session_id: None,
+                heartbeat_response_session_id,
                 result_sender: None,
             })
             .map_err(|error| match error {
@@ -706,6 +730,7 @@ impl Session {
             queue_depth_at_enqueue,
             enqueued_at: std::time::Instant::now(),
             heartbeat_session_id,
+            heartbeat_response_session_id: None,
             result_sender: Some(result_sender),
         });
         tokio::select! {
@@ -794,7 +819,10 @@ impl Session {
                 }
                 Command::HeartRequest => {
                     log::trace!("{mn} -- Session {session_id}: Received HeartRequest");
-                    self.queue_control(Frame::new(Command::HeartResponse, stream_id))?;
+                    if let Err(error) = self.queue_control(Frame::new(Command::HeartResponse, stream_id)) {
+                        log::warn!("{mn} -- Session {session_id} failed to enqueue HeartResponse: {error}");
+                        return Err(error);
+                    }
                 }
                 Command::HeartResponse => {
                     log::trace!("{mn} -- Session {session_id}: Received HeartResponse");
