@@ -41,6 +41,8 @@ pub fn is_peer_disconnect(error: &std::io::Error) -> bool {
 struct WriteRequest {
     bytes: Vec<u8>,
     disable_buffering_after: bool,
+    local_session_id: usize,
+    peer_session_id: Option<usize>,
     enqueue_wait: Duration,
     queue_depth_at_enqueue: usize,
     enqueued_at: std::time::Instant,
@@ -147,10 +149,11 @@ impl StreamState {
             }
         };
         let mn = method_name_unstable!();
+        let peer_session_id = session.upgrade().and_then(|session| session.peer_session_id());
         if let Err(e) = result {
-            log::warn!("{mn} -- Session {session_id} stream {stream_id} task encountered an error: {e}");
+            log::warn!("{mn} -- Session {session_id} peer={peer_session_id:?} stream {stream_id} task encountered an error: {e}");
         } else {
-            log::trace!("{mn} -- Session {session_id} stream {stream_id} task completed successfully");
+            log::trace!("{mn} -- Session {session_id} peer={peer_session_id:?} stream {stream_id} task completed successfully");
         }
     }
 }
@@ -166,6 +169,7 @@ pub struct Session {
     /// Indicates whether the session has been closed.
     closed: Arc<std::sync::atomic::AtomicBool>,
     is_client: bool,
+    peer_session_id: std::sync::RwLock<Option<usize>>,
     peer_version: std::sync::atomic::AtomicU8,
     received_settings: std::sync::atomic::AtomicBool,
     padding: Arc<RwLock<PaddingFactory>>,
@@ -209,7 +213,8 @@ impl Session {
         incoming: Option<(mpsc::Sender<Stream>, mpsc::Receiver<Stream>)>,
     ) -> Self {
         let side = if is_client { "client" } else { "server" };
-        log::trace!("{} -- Creating {side} session {session_id}", method_name_unstable!());
+        let mn = method_name_unstable!();
+        log::trace!("{mn} -- Session {session_id} peer=None creating {side} session");
         let (reader, writer) = tokio::io::split(transport);
         let incoming_sender = incoming.as_ref().map(|(sender, _)| sender.clone());
         let close_token = CancellationToken::new();
@@ -221,7 +226,7 @@ impl Session {
         let writer_padding = Arc::clone(&padding);
         let closed = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let writer_closed = Arc::clone(&closed);
-        tokio::spawn(Self::background_task_for_session(
+        tokio::spawn(Self::background_task(
             writer,
             is_client,
             writer_packet_counter,
@@ -241,6 +246,7 @@ impl Session {
             streams: Mutex::new(HashMap::new()),
             closed,
             is_client,
+            peer_session_id: std::sync::RwLock::new(None),
             peer_version: std::sync::atomic::AtomicU8::new(0),
             received_settings: std::sync::atomic::AtomicBool::new(false),
             padding,
@@ -254,7 +260,7 @@ impl Session {
     }
 
     #[allow(clippy::too_many_arguments)]
-    async fn background_task_for_session(
+    async fn background_task(
         writer: tokio::io::WriteHalf<BoxTransport>,
         buffering: bool,
         writer_packet_counter: Arc<std::sync::atomic::AtomicU32>,
@@ -307,10 +313,13 @@ impl Session {
                 },
             };
             let failed = completion.result.is_err();
+            let mn = method_name_unstable!();
             if let Some(session_id) = request.heartbeat_session_id {
                 if let Some(error) = completion.result.as_ref().err() {
                     log::warn!(
-                        "Session {session_id} heartbeat writer failed: enqueue_wait={:?} queue_depth={} queue_wait={:?} transport_write={:?} error={error}",
+                        "{mn} -- Session {} peer={:?} Session {session_id} heartbeat writer failed: enqueue_wait={:?} queue_depth={} queue_wait={:?} transport_write={:?} error={error}",
+                        request.local_session_id,
+                        request.peer_session_id,
                         completion.timings.enqueue_wait,
                         completion.timings.queue_depth_at_enqueue,
                         completion.timings.queue_wait,
@@ -318,7 +327,9 @@ impl Session {
                     );
                 } else {
                     log::debug!(
-                        "Session {session_id} heartbeat writer: enqueue_wait={:?} queue_depth={} queue_wait={:?} transport_write={:?} result=written",
+                        "{mn} -- Session {} peer={:?} Session {session_id} heartbeat writer: enqueue_wait={:?} queue_depth={} queue_wait={:?} transport_write={:?} result=written",
+                        request.local_session_id,
+                        request.peer_session_id,
                         completion.timings.enqueue_wait,
                         completion.timings.queue_depth_at_enqueue,
                         completion.timings.queue_wait,
@@ -329,7 +340,9 @@ impl Session {
             if let Some(session_id) = request.heartbeat_response_session_id {
                 if let Some(error) = completion.result.as_ref().err() {
                     log::warn!(
-                        "Session {session_id} HeartResponse write failed: queue_depth={} queue_wait={:?} transport_write={:?} total_since_enqueue={:?} error={error}",
+                        "{mn} -- Session {} peer={:?} Session {session_id} HeartResponse write failed: queue_depth={} queue_wait={:?} transport_write={:?} total_since_enqueue={:?} error={error}",
+                        request.local_session_id,
+                        request.peer_session_id,
                         completion.timings.queue_depth_at_enqueue,
                         completion.timings.queue_wait,
                         completion.timings.write_duration,
@@ -337,7 +350,9 @@ impl Session {
                     );
                 } else {
                     log::trace!(
-                        "Session {session_id} HeartResponse written: queue_depth={} queue_wait={:?} transport_write={:?} total_since_enqueue={:?}",
+                        "{mn} -- Session {} peer={:?} Session {session_id} HeartResponse written: queue_depth={} queue_wait={:?} transport_write={:?} total_since_enqueue={:?}",
+                        request.local_session_id,
+                        request.peer_session_id,
                         completion.timings.queue_depth_at_enqueue,
                         completion.timings.queue_wait,
                         completion.timings.write_duration,
@@ -358,6 +373,14 @@ impl Session {
 
     pub fn id(&self) -> usize {
         self.session_id
+    }
+
+    pub fn peer_session_id(&self) -> Option<usize> {
+        *self.peer_session_id.read().unwrap_or_else(|error| error.into_inner())
+    }
+
+    fn set_peer_session_id(&self, session_id: usize) {
+        *self.peer_session_id.write().unwrap_or_else(|error| error.into_inner()) = Some(session_id);
     }
 
     pub fn is_expired(&self) -> bool {
@@ -385,6 +408,7 @@ impl Session {
             settings.insert("v".to_owned(), "2".to_owned());
             settings.insert("client".to_owned(), crate::PROGRAM_VERSION_NAME.to_owned());
             settings.insert("padding-md5".to_owned(), padding.md5.clone());
+            settings.insert("session".to_owned(), self.id().to_string());
             drop(padding);
             let mut frame = Frame::new(Command::Settings, 0);
             frame.data = to_bytes(&settings);
@@ -411,12 +435,13 @@ impl Session {
     async fn do_main_loop_task(session: Arc<Session>, session_id: usize) {
         let mn = method_name_unstable!();
         let result = Arc::clone(&session).receive_loop().await;
+        let peer_session_id = session.peer_session_id();
         match result {
-            Ok(()) => log::debug!("{mn} -- Session {session_id} receive loop stopped",),
-            Err(error) => log::warn!("{mn} -- Session {session_id} receive loop failed: {error}"),
+            Ok(()) => log::debug!("{mn} -- Session {session_id} peer={peer_session_id:?} receive loop stopped",),
+            Err(error) => log::warn!("{mn} -- Session {session_id} peer={peer_session_id:?} receive loop failed: {error}"),
         }
         let _ = session.shutdown().await;
-        log::debug!("{mn} -- Session {session_id} shut down");
+        log::debug!("{mn} -- Session {session_id} peer={peer_session_id:?} shut down");
     }
 
     async fn do_heartbeat_task(session: Weak<Session>, session_id: usize, close_token: CancellationToken) {
@@ -432,12 +457,13 @@ impl Session {
             let Some(session) = session.upgrade() else {
                 break;
             };
+            let peer_session_id = session.peer_session_id();
             if session.peer_version.load(std::sync::atomic::Ordering::Acquire) < 2 {
                 continue;
             }
 
             let len = session.streams.lock().await.len();
-            log::trace!("{mn} -- Session {session_id} sending heartbeat, total {len} streams");
+            log::trace!("{mn} -- Session {session_id} peer={peer_session_id:?} sending heartbeat, total {len} streams");
 
             let response = session.heart_response.notified();
             tokio::pin!(response);
@@ -448,14 +474,14 @@ impl Session {
                 result = session.write_heartbeat() => match result {
                     Ok(timings) => timings,
                     Err(error) => {
-                        log::warn!("{mn} -- Session {session_id} heartbeat dispatch/write failed after {:?}: {error}", dispatch_started.elapsed());
+                        log::warn!("{mn} -- Session {session_id} peer={peer_session_id:?} heartbeat dispatch/write failed after {:?}: {error}", dispatch_started.elapsed());
                         let _ = session.shutdown().await;
                         break;
                     }
                 },
             };
             log::debug!(
-                "{mn} -- Session {session_id} heartbeat written: enqueue_wait={:?} queue_depth={} queue_wait={:?} transport_write={:?}; awaiting response",
+                "{mn} -- Session {session_id} peer={peer_session_id:?} heartbeat written: enqueue_wait={:?} queue_depth={} queue_wait={:?} transport_write={:?}; awaiting response",
                 timings.enqueue_wait,
                 timings.queue_depth_at_enqueue,
                 timings.queue_wait,
@@ -468,12 +494,12 @@ impl Session {
             };
             match result {
                 Ok(()) => log::trace!(
-                    "{mn} -- Session {session_id} heartbeat response received after {:?}",
+                    "{mn} -- Session {session_id} peer={peer_session_id:?} heartbeat response received after {:?}",
                     response_started.elapsed()
                 ),
                 Err(_) => {
                     log::warn!(
-                        "{mn} -- Session {session_id} heartbeat response timed out after {:?}: enqueue_wait={:?} queue_depth={} queue_wait={:?} transport_write={:?}; closing stalled transport",
+                        "{mn} -- Session {session_id} peer={peer_session_id:?} heartbeat response timed out after {:?}: enqueue_wait={:?} queue_depth={} queue_wait={:?} transport_write={:?}; closing stalled transport",
                         response_started.elapsed(),
                         timings.enqueue_wait,
                         timings.queue_depth_at_enqueue,
@@ -496,7 +522,8 @@ impl Session {
             && session.is_idle().await
         {
             let mn = method_name_unstable!();
-            log::debug!("{mn} -- Session {session_id} reached its maximum age while idle; closing");
+            let psid = session.peer_session_id();
+            log::debug!("{mn} -- Session {session_id} peer={psid:?} reached maximum age while idle; closing");
             let _ = session.shutdown().await;
         }
     }
@@ -551,7 +578,8 @@ impl Session {
             streams.insert(id, StreamState::new(remote, id, Arc::downgrade(self)));
             let mn = method_name_unstable!();
             let l = streams.len();
-            log::debug!("{mn} -- session {session_id} reserved stream {id}, total streams: {l}",);
+            let psid = self.peer_session_id();
+            log::debug!("{mn} -- Session {session_id} peer={psid:?} reserved stream {id}, total streams: {l}");
         }
         Ok(Stream::new(id, Arc::downgrade(self), local))
     }
@@ -663,6 +691,8 @@ impl Session {
             .try_send(WriteRequest {
                 bytes: frame.encode()?,
                 disable_buffering_after: false,
+                local_session_id: self.id(),
+                peer_session_id: self.peer_session_id(),
                 enqueue_wait: Duration::ZERO,
                 queue_depth_at_enqueue,
                 enqueued_at,
@@ -710,8 +740,10 @@ impl Session {
                                 .control_sender
                                 .max_capacity()
                                 .saturating_sub(self.control_sender.capacity());
+                            let mn = method_name_unstable!();
                             log::warn!(
-                                "Session {session_id} heartbeat queue admission timed out: enqueue_wait={:?} queue_depth={queue_depth}",
+                                "{mn} -- Session {session_id} peer={:?} heartbeat queue admission timed out: enqueue_wait={:?} queue_depth={queue_depth}",
+                                self.peer_session_id(),
                                 enqueue_started.elapsed(),
                             );
                         }
@@ -732,6 +764,8 @@ impl Session {
         permit.send(WriteRequest {
             bytes,
             disable_buffering_after,
+            local_session_id: self.id(),
+            peer_session_id: self.peer_session_id(),
             enqueue_wait,
             queue_depth_at_enqueue,
             enqueued_at: std::time::Instant::now(),
@@ -765,14 +799,15 @@ impl Session {
                 } => result,
                 _ = self.close_token.cancelled() => break Ok(()),
             };
+            let psid = self.peer_session_id();
             let frame = match result {
                 Ok(Some(frame)) => frame,
                 Ok(None) => {
-                    log::debug!("{mn} -- Session {session_id} peer closed transport");
+                    log::debug!("{mn} -- Session {session_id} peer={psid:?} peer closed transport");
                     break Ok(());
                 }
                 Err(error) if is_peer_disconnect(&error) => {
-                    log::debug!("{mn} -- Session {session_id} transport reset: {error}");
+                    log::debug!("{mn} -- Session {session_id} peer={psid:?} transport reset: {error}");
                     break Ok(());
                 }
                 Err(error) => break Err(error),
@@ -793,10 +828,13 @@ impl Session {
                         .get(&stream_id)
                         .map(|entry| (entry.push_sender.clone(), Arc::clone(&entry.push_slots)));
                     if let Some((push_sender, push_slots)) = stream {
+                        let psid = self.peer_session_id();
                         match push_slots.try_acquire_many_owned(frame.data.len() as u32) {
                             Ok(permit) => {
                                 if let Err(error) = push_sender.try_send(PushMessage::Data(frame.data, permit)) {
-                                    log::debug!("{mn} -- Session {session_id} stream {stream_id} push worker closed: {error}");
+                                    log::debug!(
+                                        "{mn} -- Session {session_id} peer={psid:?} stream {stream_id} push worker closed: {error}"
+                                    );
                                     if !self.is_closed() {
                                         self.queue_control(Frame::new(Command::Fin, stream_id))?;
                                         self.remove_stream_by_id(stream_id).await;
@@ -804,7 +842,9 @@ impl Session {
                                 }
                             }
                             Err(_) => {
-                                log::warn!("{mn} -- Session {session_id} stream {stream_id} inbound PUSH limit reached; closing stream");
+                                log::warn!(
+                                    "{mn} -- Session {session_id} peer={psid:?} stream {stream_id} inbound PUSH limit reached; closing stream"
+                                );
                                 self.queue_control(Frame::new(Command::Fin, stream_id))?;
                                 self.remove_stream_by_id(stream_id).await;
                             }
@@ -819,19 +859,24 @@ impl Session {
                     if !frame.data.is_empty() {
                         self.remove_stream_by_id(stream_id).await;
                         let i = String::from_utf8_lossy(&frame.data);
-                        log::warn!("{mn} -- Session {session_id} stream {stream_id} received SynAck with unexpected data: {i}");
+                        let peer = self.peer_session_id();
+                        log::warn!(
+                            "{mn} -- Session {session_id} peer={peer:?} stream {stream_id} received SynAck with unexpected data: {i}",
+                        );
                     }
                     // TODO: Handle additional SynAck logic if necessary
                 }
                 Command::HeartRequest => {
-                    log::trace!("{mn} -- Session {session_id}: Received HeartRequest");
+                    let peer = self.peer_session_id();
+                    log::trace!("{mn} -- Session {session_id} peer={peer:?} received HeartRequest");
                     if let Err(error) = self.queue_control(Frame::new(Command::HeartResponse, stream_id)) {
-                        log::warn!("{mn} -- Session {session_id} failed to enqueue HeartResponse: {error}");
+                        log::warn!("{mn} -- Session {session_id} peer={peer:?} failed to enqueue HeartResponse: {error}");
                         return Err(error);
                     }
                 }
                 Command::HeartResponse => {
-                    log::trace!("{mn} -- Session {session_id}: Received HeartResponse");
+                    let peer = self.peer_session_id();
+                    log::trace!("{mn} -- Session {session_id} peer={peer:?} received HeartResponse");
                     self.heart_response.notify_waiters();
                 }
                 Command::ServerSettings => {
@@ -840,6 +885,11 @@ impl Session {
                         && let Some(version) = map.get("v").and_then(|value| value.parse().ok())
                     {
                         self.peer_version.store(version, std::sync::atomic::Ordering::Release);
+                    }
+                    if self.is_client
+                        && let Some(session_id) = map.get("session").and_then(|value| value.parse().ok())
+                    {
+                        self.set_peer_session_id(session_id);
                     }
                 }
                 Command::UpdatePaddingScheme => {
@@ -851,7 +901,8 @@ impl Session {
                 }
                 Command::Alert => {
                     let info = String::from_utf8_lossy(&frame.data);
-                    log::warn!("{mn} -- Session {session_id} received alert: {info}",);
+                    let peer = self.peer_session_id();
+                    log::warn!("{mn} -- Session {session_id} peer={peer:?} received alert: {info}");
                     break Ok(());
                 }
             }
@@ -864,6 +915,13 @@ impl Session {
         }
         self.received_settings.store(true, std::sync::atomic::Ordering::Release);
         let map = from_bytes(data);
+        if let Some(session_id) = map.get("session").and_then(|value| value.parse().ok()) {
+            self.set_peer_session_id(session_id);
+        }
+        let psid = self.peer_session_id();
+        let mn = method_name_unstable!();
+        let session_id = self.id();
+        log::debug!("{mn} -- Session {session_id} peer={psid:?} received cmdSettings");
         let update_scheme = {
             let padding = self.padding.read().await;
             (map.get("padding-md5") != Some(&padding.md5)).then(|| padding.raw_scheme().to_vec())
@@ -875,9 +933,12 @@ impl Session {
         }
         if map.get("v").and_then(|value| value.parse::<u8>().ok()).unwrap_or(0) >= 2 {
             self.peer_version.store(2, std::sync::atomic::Ordering::Release);
-            let mut settings = Frame::new(Command::ServerSettings, 0);
-            settings.data = b"v=2".to_vec();
-            self.queue_control(settings)?;
+            let mut server_settings = HashMap::new();
+            server_settings.insert("v".to_owned(), "2".to_owned());
+            server_settings.insert("session".to_owned(), self.id().to_string());
+            let mut frame = Frame::new(Command::ServerSettings, 0);
+            frame.data = to_bytes(&server_settings);
+            self.queue_control(frame)?;
         }
         Ok(())
     }
@@ -953,7 +1014,8 @@ impl Session {
         };
         if should_send_fin && let Err(error) = self.enqueue_fin(stream_id).await {
             let mn = method_name_unstable!();
-            log::warn!("{mn} -- Session {session_id}: Failed to send FIN for stream {stream_id}: {error}");
+            let psid = self.peer_session_id();
+            log::warn!("{mn} -- Session {session_id} peer={psid:?} failed to send FIN for stream {stream_id}: {error}");
         }
         self.remove_stream_by_id(stream_id).await;
     }
@@ -963,20 +1025,21 @@ impl Session {
     async fn remove_stream_by_id(self: &Arc<Self>, stream_id: u32) {
         let mn = method_name_unstable!();
         let session_id = self.id();
+        let psid = self.peer_session_id();
         let became_idle = {
             let mut streams = self.streams.lock().await;
             if let Some(entry) = streams.remove(&stream_id) {
                 drop(entry.writer);
                 entry.close_token.cancel();
                 let l = streams.len();
-                log::trace!("{mn} -- Stream {stream_id} removed in session {session_id}, remaining streams: {l}");
+                log::trace!("{mn} -- Session {session_id} peer={psid:?} removed stream {stream_id}, remaining streams: {l}");
             }
             streams.is_empty()
         };
 
         if became_idle {
             if self.is_expired() {
-                log::debug!("{mn} -- Expired session {session_id} drained; shutting it down");
+                log::debug!("{mn} -- Session {session_id} peer={psid:?} expired session drained; shutting it down");
                 let _ = self.shutdown().await;
                 return;
             }
@@ -984,9 +1047,9 @@ impl Session {
             if let Some(sender) = sender
                 && let Err(e) = sender.send(Arc::clone(self))
             {
-                log::warn!("{mn} -- Failed to send session {session_id} to idle sessions pool: {e}");
+                log::warn!("{mn} -- Session {session_id} peer={psid:?} failed to send session to idle pool: {e}");
             }
-            log::trace!("{mn} -- Session {session_id} became idle.");
+            log::trace!("{mn} -- Session {session_id} peer={psid:?} session became idle",);
         }
     }
 
@@ -1016,7 +1079,9 @@ impl Session {
                 streams.insert(stream_id, StreamState::new(remote, stream_id, Arc::downgrade(self)));
                 let mn = method_name_unstable!();
                 let l = streams.len();
-                log::debug!("{mn} -- session {} accepted new stream {stream_id}, total streams: {l}", self.id(),);
+                let id = self.id();
+                let psid = self.peer_session_id();
+                log::debug!("{mn} -- Session {id} peer={psid:?} accepted new stream {stream_id}, total streams: {l}");
             }
             rejection
         };
@@ -1134,8 +1199,10 @@ impl Stream {
     fn new(id: u32, session: Weak<Session>, io: tokio::io::DuplexStream) -> Self {
         let mn = method_name_unstable!();
         let (reader, writer) = tokio::io::split(io);
-        let session_id = session.upgrade().map(|s| s.id()).unwrap_or_default();
-        log::trace!("{mn} -- Creating stream {id} in session {session_id}");
+        let session_ref = session.upgrade();
+        let session_id = session_ref.as_ref().map(|session| session.id()).unwrap_or_default();
+        let peer_session_id = session_ref.as_ref().and_then(|session| session.peer_session_id());
+        log::trace!("{mn} -- Session {session_id} peer={peer_session_id:?} creating stream {id}");
         Self {
             id,
             session,
@@ -1172,7 +1239,10 @@ impl Stream {
         use std::io::{Error, ErrorKind::BrokenPipe};
         if self.closed {
             let mn = method_name_unstable!();
-            log::debug!("{mn} -- Stream {} is closed, can't write data", self.id);
+            let session_id = self.session_id;
+            let psid = self.session.upgrade().and_then(|session| session.peer_session_id());
+            let sid = self.id;
+            log::debug!("{mn} -- Session {session_id} peer={psid:?} stream {sid} is closed, can't write data");
             return Err(Error::new(BrokenPipe, format!("stream {} closed, can't write data", self.id)));
         }
         let session = self
@@ -1239,22 +1309,23 @@ impl Drop for Stream {
         let id = self.id;
         let session_id = self.session_id;
         let mn = method_name_unstable!();
+        let psid = self.session.upgrade().as_ref().and_then(|session| session.peer_session_id());
 
-        log::trace!("{mn} -- Dropping stream {id} of session {session_id}...");
+        log::trace!("{mn} -- Session {session_id} peer={psid:?} dropping stream {id}");
         if self.closed {
-            log::debug!("{mn} -- Stream {id} of session {session_id} already closed, skipping drop it.");
+            log::debug!("{mn} -- Session {session_id} peer={psid:?} stream {id} already closed, skipping drop");
             return;
         }
         self.closed = true;
 
         let Some(session) = self.session.upgrade() else {
-            log::debug!("{mn} -- Stream {id}: Session {session_id} already closed but stream lifecycle not complete yet, skipping drop.");
+            log::debug!("{mn} -- Session {session_id} peer={psid:?} already closed but stream {id} lifecycle is incomplete, skipping drop");
             return;
         };
         if let Ok(handle) = tokio::runtime::Handle::try_current() {
             handle.spawn(async move {
                 session.helper_drop_stream_by_id(id).await;
-                log::debug!("{mn} -- Dropped stream {id} of session {session_id} successfully.");
+                log::debug!("{mn} -- Session {session_id} peer={psid:?} dropped stream {id} successfully");
             });
         }
     }
@@ -1711,8 +1782,8 @@ pub(crate) mod tests {
     #[tokio::test]
     async fn exchanges_settings_syn_data_and_synack() {
         let (client_io, server_io) = tokio::io::duplex(128 * 1024);
-        let client = Session::new_client(1, Box::new(client_io), padding(), 2, DEFAULT_MAX_SESSION_AGE);
-        let server = Session::new_server(1, Box::new(server_io), padding(), 2, DEFAULT_MAX_SESSION_AGE);
+        let client = Session::new_client(11, Box::new(client_io), padding(), 2, DEFAULT_MAX_SESSION_AGE);
+        let server = Session::new_server(22, Box::new(server_io), padding(), 2, DEFAULT_MAX_SESSION_AGE);
         client.run().await.unwrap();
         server.run().await.unwrap();
 
@@ -1722,6 +1793,14 @@ pub(crate) mod tests {
         client_stream.write(b"hello").await.unwrap();
         let server_stream = server.accept_stream().await.unwrap();
         assert_eq!(server_stream.id(), client_stream.id());
+        assert_eq!(server.peer_session_id(), Some(11));
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while client.peer_session_id() != Some(22) {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("client should learn server session ID from ServerSettings");
         let mut received = [0u8; 5];
         server_stream.read(&mut received).await.unwrap();
         assert_eq!(&received, b"hello");
@@ -1735,6 +1814,26 @@ pub(crate) mod tests {
         client_stream.close().await.unwrap();
         let _ = server.shutdown().await;
         let _ = client.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn server_settings_returns_local_session_id_to_legacy_client() {
+        let (transport, mut peer, _gate) = gated_transport();
+        let server = Session::new_server(22, transport, padding(), 1, DEFAULT_MAX_SESSION_AGE);
+        let mut legacy_settings = HashMap::new();
+        legacy_settings.insert("v".to_owned(), "2".to_owned());
+        legacy_settings.insert("client".to_owned(), "legacy".to_owned());
+        legacy_settings.insert("padding-md5".to_owned(), padding().read().await.md5.clone());
+
+        server.on_receive_settings(&to_bytes(&legacy_settings)).await.unwrap();
+
+        assert_eq!(server.peer_session_id(), None);
+        let response = Frame::read_from(&mut peer).await.unwrap();
+        assert_eq!(response.command, Command::ServerSettings);
+        let settings = from_bytes(&response.data);
+        assert_eq!(settings.get("v").map(String::as_str), Some("2"));
+        assert_eq!(settings.get("session").map(String::as_str), Some("22"));
+        server.shutdown().await.unwrap();
     }
 
     #[tokio::test]

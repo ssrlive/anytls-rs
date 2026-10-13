@@ -330,27 +330,28 @@ async fn handle_connection(
                 let stream = match result {
                     Ok(stream) => stream,
                     Err(error) if error.kind() == std::io::ErrorKind::BrokenPipe => {
-                        log::info!("{mn} -- session {session_id} closed by peer");
+                        log::info!("{mn} -- Session {session_id} peer={:?} closed by peer", session.peer_session_id());
                         break Ok(());
                     }
                     Err(error) => break Err(error),
                 };
                 let traffic_audit = Arc::clone(&traffic_audit);
+                let peer_session_id = session.peer_session_id();
                 stream_tasks.spawn(async move {
                     let stream_id = stream.id();
                     if let Err(error) = relay_stream(stream, traffic_audit, client_id, panel_sync_enabled).await {
                         let mn = method_name_unstable!();
                         if is_peer_disconnect(&error) {
-                            log::debug!("{mn} -- session {session_id} stream {stream_id} peer disconnected: {error}");
+                            log::debug!("{mn} -- Session {session_id} peer={peer_session_id:?} stream {stream_id} peer disconnected: {error}");
                         } else {
-                            log::warn!("{mn} -- session {session_id} stream {stream_id} relay failed: {error}");
+                            log::warn!("{mn} -- Session {session_id} peer={peer_session_id:?} stream {stream_id} relay failed: {error}");
                         }
                     }
                 });
             }
             Some(result) = stream_tasks.join_next(), if !stream_tasks.is_empty() => {
                 if let Err(error) = result {
-                    log::warn!("{mn} -- session {session_id} stream task failed: {error}");
+                    log::warn!("{mn} -- Session {session_id} stream task failed: {error}");
                 }
             }
         }
@@ -360,7 +361,7 @@ async fn handle_connection(
     let drain = async {
         while let Some(result) = stream_tasks.join_next().await {
             if let Err(error) = result {
-                log::warn!("{mn} -- session {session_id} stream task failed during shutdown: {error}");
+                log::warn!("{mn} -- Session {session_id} stream task failed during shutdown: {error}");
             }
         }
     };

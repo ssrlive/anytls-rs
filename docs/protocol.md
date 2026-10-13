@@ -93,6 +93,7 @@ cmdSYNACK 若不带有 data，则表示代理 stream 握手成功。若带有 da
 v=2
 client=anytls/0.0.1
 padding-md5=(md5)
+session=11
 ```
 
 > 采用 UTF-8 编码，key 与 value 之间用 `=` 连接，两者均为 string 类型。不同项目之间用 `\n` 分割。
@@ -100,6 +101,7 @@ padding-md5=(md5)
 - `v` 是客户端实现的协议版本号 （目前为 `2`）
 - `client` 是客户端软件名称与版本号（第三方实现请填写真实的软件名称与版本号）
 - `padding-md5` 是客户端当前 `paddingScheme` 的 md5 （小写 hex 编码）
+- `session` 是客户端本地分配的会话 ID，用于日志关联，不是跨连接或跨进程的全局 ID。该字段是可选诊断扩展，接收端必须允许字段缺失或无法解析；支持此扩展的服务器会在 `cmdServerSettings` 中返回自己的会话 ID。
 
 关于 `client` 字段的设计，请看这篇[文档](./client-name.md)。
 
@@ -109,9 +111,13 @@ padding-md5=(md5)
 
 ```
 v=2
+session=22
 ```
 
 - `v` 是服务器实现的协议版本号 （目前为 `2`）
+- `session` 是服务器本地分配的会话 ID，用于日志关联。
+
+`session` 字段是可选的诊断扩展。接收端必须允许字段缺失或无法解析，以兼容未携带该字段的旧版本。日志可以分别记录 `local_session` 和 `peer_session`；若对端未提供 ID，则 `peer_session` 未知。
 
 #### cmdAlert
 

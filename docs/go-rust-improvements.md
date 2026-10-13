@@ -8,9 +8,9 @@ This document records the behavior that the Rust implementation preserves from t
 
 ## Session Identity
 
-Each client allocates a unique Session ID with an atomic `AtomicUsize` counter. IDs start at `0` and advance toward `usize::MAX`.
+Each client allocates a local Session ID with an atomic `AtomicUsize` counter. IDs start at `0` and advance toward `usize::MAX`.
 
-The Session ID is an implementation-level identity used by the client session pool. It is not serialized into the AnyTLS wire protocol.
+Rust includes its local Session ID in `cmdSettings` and returns its local ID in `cmdServerSettings`. The IDs let each endpoint correlate logs using `local_session` and `peer_session`; they are not global identities and do not identify a session across reconnects. The fields are optional for compatibility with older peers.
 
 The Go implementation uses an atomic `uint64` sequence and starts at `1`. The Rust implementation intentionally starts at `0` to follow the repository requirement that Session IDs grow from `0` through `usize::MAX`.
 

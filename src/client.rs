@@ -169,8 +169,9 @@ impl Client {
                 if !session.is_closed() && session.is_idle().await {
                     let mn = method_name_unstable!();
                     let session_id = session.id();
+                    let peer_session_id = session.peer_session_id();
                     if session.is_expired() {
-                        log::info!("{mn} -- closing expired idle session {session_id}");
+                        log::info!("{mn} -- closing expired idle session {session_id} peer={peer_session_id:?}");
                         let _ = session.shutdown().await;
                         continue;
                     }
@@ -178,10 +179,11 @@ impl Client {
                     if !idle.iter().any(|item| item.session.id() == session.id()) {
                         if idle.len() < MAX_IDLE_SESSIONS {
                             idle.push(IdleSession::new(session));
-                            log::trace!("{mn} -- added idle session {session_id}, total idle: {}", idle.len());
+                            let len = idle.len();
+                            log::trace!("{mn} -- added idle session {session_id} peer={peer_session_id:?}, total idle: {len}");
                         } else {
                             drop(idle);
-                            log::trace!("{mn} -- closing excess idle session {session_id}");
+                            log::trace!("{mn} -- closing excess idle session {session_id} peer={peer_session_id:?}");
                             let _ = session.shutdown().await;
                         }
                     }
