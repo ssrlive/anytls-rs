@@ -160,7 +160,8 @@ pub struct Session {
     created_at: std::time::Instant,
     max_age: Duration,
     max_streams: usize,
-    write_sender: mpsc::Sender<WriteRequest>,
+    control_sender: mpsc::Sender<WriteRequest>,
+    data_sender: mpsc::Sender<WriteRequest>,
     streams: Mutex<HashMap<u32, StreamState>>,
     /// Indicates whether the session has been closed.
     closed: Arc<std::sync::atomic::AtomicBool>,
@@ -215,7 +216,8 @@ impl Session {
         let writer_close_token = close_token.clone();
         let packet_counter = Arc::new(std::sync::atomic::AtomicU32::new(0));
         let writer_packet_counter = Arc::clone(&packet_counter);
-        let (write_sender, write_receiver) = mpsc::channel::<WriteRequest>(64);
+        let (control_sender, control_receiver) = mpsc::channel::<WriteRequest>(64);
+        let (data_sender, data_receiver) = mpsc::channel::<WriteRequest>(64);
         let writer_padding = Arc::clone(&padding);
         let closed = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let writer_closed = Arc::clone(&closed);
@@ -223,7 +225,8 @@ impl Session {
             writer,
             is_client,
             writer_packet_counter,
-            write_receiver,
+            control_receiver,
+            data_receiver,
             writer_close_token,
             writer_closed,
             writer_padding,
@@ -233,7 +236,8 @@ impl Session {
             created_at: std::time::Instant::now(),
             max_age,
             max_streams: max_streams.max(1),
-            write_sender,
+            control_sender,
+            data_sender,
             streams: Mutex::new(HashMap::new()),
             closed,
             is_client,
@@ -249,11 +253,13 @@ impl Session {
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
     async fn background_task_for_session(
         writer: tokio::io::WriteHalf<BoxTransport>,
         buffering: bool,
         writer_packet_counter: Arc<std::sync::atomic::AtomicU32>,
-        mut write_receiver: mpsc::Receiver<WriteRequest>,
+        mut control_receiver: mpsc::Receiver<WriteRequest>,
+        mut data_receiver: mpsc::Receiver<WriteRequest>,
         writer_close_token: CancellationToken,
         writer_closed: Arc<std::sync::atomic::AtomicBool>,
         writer_padding: Arc<RwLock<PaddingFactory>>,
@@ -267,7 +273,9 @@ impl Session {
         };
         loop {
             let request = tokio::select! {
-                request = write_receiver.recv() => request,
+                biased;
+                request = control_receiver.recv() => request,
+                request = data_receiver.recv() => request,
                 _ = writer_close_token.cancelled() => None,
             };
             let Some(request) = request else {
@@ -637,6 +645,7 @@ impl Session {
 
     async fn write_heartbeat(&self) -> std::io::Result<WriteTimings> {
         self.enqueue_encoded_with_mode(
+            &self.control_sender,
             Frame::new(Command::HeartRequest, 0).encode()?,
             false,
             Some(self.id()),
@@ -648,9 +657,9 @@ impl Session {
     fn queue_control(&self, frame: Frame) -> std::io::Result<()> {
         use std::io::{Error, ErrorKind};
         let heartbeat_response_session_id = (frame.command == Command::HeartResponse).then_some(self.id());
-        let queue_depth_at_enqueue = self.write_sender.max_capacity().saturating_sub(self.write_sender.capacity());
+        let queue_depth_at_enqueue = self.control_sender.max_capacity().saturating_sub(self.control_sender.capacity());
         let enqueued_at = std::time::Instant::now();
-        self.write_sender
+        self.control_sender
             .try_send(WriteRequest {
                 bytes: frame.encode()?,
                 disable_buffering_after: false,
@@ -668,19 +677,20 @@ impl Session {
     }
 
     async fn enqueue_frame(&self, frame: Frame, disable_buffering_after: bool) -> std::io::Result<()> {
-        self.enqueue_encoded_with_mode(frame.encode()?, disable_buffering_after, None, None)
+        self.enqueue_encoded_with_mode(&self.control_sender, frame.encode()?, disable_buffering_after, None, None)
             .await
             .map(|_| ())
     }
 
     async fn enqueue_bytes(&self, bytes: Vec<u8>, disable_buffering_after: bool) -> std::io::Result<()> {
-        self.enqueue_encoded_with_mode(bytes, disable_buffering_after, None, None)
+        self.enqueue_encoded_with_mode(&self.data_sender, bytes, disable_buffering_after, None, None)
             .await
             .map(|_| ())
     }
 
     async fn enqueue_encoded_with_mode(
         &self,
+        sender: &mpsc::Sender<WriteRequest>,
         bytes: Vec<u8>,
         disable_buffering_after: bool,
         heartbeat_session_id: Option<usize>,
@@ -691,15 +701,15 @@ impl Session {
         let enqueue_started = std::time::Instant::now();
         let permit = if let Some(queue_timeout) = queue_timeout {
             tokio::select! {
-                result = tokio::time::timeout(queue_timeout, self.write_sender.reserve()) => match result {
+                result = tokio::time::timeout(queue_timeout, sender.reserve()) => match result {
                     Ok(Ok(permit)) => permit,
                     Ok(Err(_)) => return Err(Error::new(ErrorKind::BrokenPipe, "writer task closed")),
                     Err(_) => {
                         if let Some(session_id) = heartbeat_session_id {
                             let queue_depth = self
-                                .write_sender
+                                .control_sender
                                 .max_capacity()
-                                .saturating_sub(self.write_sender.capacity());
+                                .saturating_sub(self.control_sender.capacity());
                             log::warn!(
                                 "Session {session_id} heartbeat queue admission timed out: enqueue_wait={:?} queue_depth={queue_depth}",
                                 enqueue_started.elapsed(),
@@ -712,16 +722,12 @@ impl Session {
             }
         } else {
             tokio::select! {
-                result = self.write_sender.reserve() => result.map_err(|_| Error::new(ErrorKind::BrokenPipe, "writer task closed"))?,
+                result = sender.reserve() => result.map_err(|_| Error::new(ErrorKind::BrokenPipe, "writer task closed"))?,
                 _ = self.close_token.cancelled() => return Err(Error::new(ErrorKind::BrokenPipe, format!("session {session_id} closed in enqueue_encoded_with_mode"))),
             }
         };
         let enqueue_wait = enqueue_started.elapsed();
-        let queue_depth_at_enqueue = self
-            .write_sender
-            .max_capacity()
-            .saturating_sub(self.write_sender.capacity())
-            .saturating_sub(1);
+        let queue_depth_at_enqueue = sender.max_capacity().saturating_sub(sender.capacity()).saturating_sub(1);
         let (result_sender, result_receiver) = oneshot::channel();
         permit.send(WriteRequest {
             bytes,
@@ -1356,6 +1362,50 @@ pub(crate) mod tests {
             peer,
             gate,
         )
+    }
+
+    #[tokio::test]
+    async fn control_frames_overtake_queued_data_frames() {
+        let (transport, mut peer, gate) = gated_transport();
+        let session = Session::new_client(
+            1,
+            transport,
+            Arc::new(RwLock::new(PaddingFactory::new(b"stop=0").unwrap())),
+            1,
+            DEFAULT_MAX_SESSION_AGE,
+        );
+        session.run().await.unwrap();
+        session.enqueue_frame(Frame::new(Command::Syn, 1), true).await.unwrap();
+        assert_eq!(Frame::read_from(&mut peer).await.unwrap().command, Command::Settings);
+        assert_eq!(Frame::read_from(&mut peer).await.unwrap().command, Command::Syn);
+
+        let mut first_data = Frame::new(Command::Push, 1);
+        first_data.data = b"first".to_vec();
+        gate.block();
+        let first_session = Arc::clone(&session);
+        let first_write = tokio::spawn(async move { first_session.enqueue_bytes(first_data.encode().unwrap(), false).await });
+        gate.wait_pending().await;
+
+        let mut second_data = Frame::new(Command::Push, 1);
+        second_data.data = b"second".to_vec();
+        let second_session = Arc::clone(&session);
+        let second_write = tokio::spawn(async move { second_session.enqueue_bytes(second_data.encode().unwrap(), false).await });
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while session.data_sender.capacity() != 63 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("second data frame should be queued behind the blocked write");
+        session.queue_control(Frame::new(Command::HeartRequest, 0)).unwrap();
+
+        gate.release();
+        assert_eq!(Frame::read_from(&mut peer).await.unwrap().data, b"first");
+        assert_eq!(Frame::read_from(&mut peer).await.unwrap().command, Command::HeartRequest);
+        assert_eq!(Frame::read_from(&mut peer).await.unwrap().data, b"second");
+        first_write.await.unwrap().unwrap();
+        second_write.await.unwrap().unwrap();
+        session.shutdown().await.unwrap();
     }
 
     #[tokio::test]
