@@ -32,34 +32,20 @@ impl IdleSession {
 pub struct Client {
     dialer: Dialer,
     padding: Arc<RwLock<PaddingFactory>>,
-    allocation: Mutex<()>,
-    creation: Mutex<()>,
     idle_pool: Mutex<Vec<IdleSession>>,
-    sessions: Mutex<Vec<std::sync::Weak<Session>>>,
-    shutting_down: std::sync::atomic::AtomicBool,
+    close_token: tokio_util::sync::CancellationToken,
     next_sequence: std::sync::atomic::AtomicUsize,
-    max_streams_per_session: usize,
     max_session_age: Duration,
 }
 
 impl Client {
-    pub fn new(
-        dialer: Dialer,
-        padding: Arc<RwLock<PaddingFactory>>,
-        idle_timeout: Duration,
-        max_streams_per_session: usize,
-        max_session_age: Duration,
-    ) -> Arc<Self> {
+    pub fn new(dialer: Dialer, padding: Arc<RwLock<PaddingFactory>>, idle_timeout: Duration, max_session_age: Duration) -> Arc<Self> {
         let client = Arc::new(Self {
             dialer,
             padding,
-            allocation: Mutex::new(()),
-            creation: Mutex::new(()),
             idle_pool: Mutex::new(Vec::new()),
-            sessions: Mutex::new(Vec::new()),
-            shutting_down: std::sync::atomic::AtomicBool::new(false),
+            close_token: tokio_util::sync::CancellationToken::new(),
             next_sequence: std::sync::atomic::AtomicUsize::new(0),
-            max_streams_per_session: max_streams_per_session.max(1),
             max_session_age,
         });
         let cleanup_client = Arc::downgrade(&client);
@@ -82,25 +68,15 @@ impl Client {
         let (session, stream) = match self.reserve_pooled_stream().await? {
             Some(reserved) => reserved,
             None => {
-                let _creation = self.creation.lock().await;
-                let deadline = tokio::time::Instant::now() + SESSION_CONNECT_TIMEOUT;
-                match self.reserve_pooled_stream().await? {
-                    Some(reserved) => reserved,
-                    None => {
-                        let session = tokio::time::timeout_at(deadline, self.create_session())
-                            .await
-                            .map_err(|_| std::io::Error::new(std::io::ErrorKind::TimedOut, "AnyTLS session connection timed out"))??;
-                        let _allocation = self.allocation.lock().await;
-                        if self.shutting_down.load(std::sync::atomic::Ordering::Acquire) {
-                            drop(_allocation);
-                            let _ = session.shutdown().await;
-                            return Err(self.shutting_down_error());
-                        }
-                        let stream = session.reserve_stream().await?;
-                        self.sessions.lock().await.push(Arc::downgrade(&session));
-                        (session, stream)
+                let session = tokio::select! {
+                    _ = self.close_token.cancelled() => return Err(self.shutting_down_error()),
+                    result = tokio::time::timeout(SESSION_CONNECT_TIMEOUT, self.create_session()) => {
+                        result.map_err(|_| std::io::Error::new(std::io::ErrorKind::TimedOut, "AnyTLS session connection timed out"))??
                     }
-                }
+                };
+                self.ensure_running()?;
+                let stream = session.reserve_stream().await?;
+                (session, stream)
             }
         };
         match session.open_reserved_stream(stream).await {
@@ -113,7 +89,7 @@ impl Client {
     }
 
     fn ensure_running(&self) -> std::io::Result<()> {
-        if self.shutting_down.load(std::sync::atomic::Ordering::Acquire) {
+        if self.close_token.is_cancelled() {
             Err(self.shutting_down_error())
         } else {
             Ok(())
@@ -125,35 +101,35 @@ impl Client {
     }
 
     async fn reserve_pooled_stream(&self) -> std::io::Result<Option<(Arc<Session>, Stream)>> {
-        let _allocation = self.allocation.lock().await;
         self.ensure_running()?;
-        loop {
-            let session = match self.take_idle().await {
-                Some(session) => Some(session),
-                None => self.take_session_with_capacity().await,
-            };
-            let Some(session) = session else {
-                return Ok(None);
-            };
-            match session.reserve_stream().await {
-                Ok(stream) => return Ok(Some((session, stream))),
-                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => continue,
-                Err(error) if error.kind() == std::io::ErrorKind::BrokenPipe => continue,
-                Err(error) => return Err(error),
-            }
+        let Some(session) = self.take_idle().await else {
+            return Ok(None);
+        };
+        use std::io::ErrorKind::{BrokenPipe, TimedOut, WouldBlock};
+        match session.reserve_stream().await {
+            Ok(stream) => Ok(Some((session, stream))),
+            Err(error) if matches!(error.kind(), WouldBlock | BrokenPipe | TimedOut) => Ok(None),
+            Err(error) => Err(error),
         }
     }
 
     async fn create_session(self: &Arc<Self>) -> std::io::Result<Arc<Session>> {
         let transport = (self.dialer)().await?;
         let sequence = self.next_sequence.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        let session = Session::new_client(
-            sequence,
-            transport,
-            Arc::clone(&self.padding),
-            self.max_streams_per_session,
-            self.max_session_age,
-        );
+        let session = Session::new_client(sequence, transport, Arc::clone(&self.padding), self.max_session_age);
+        let client_close = self.close_token.clone();
+        let session_close = session.close_signal();
+        let session_ref = Arc::downgrade(&session);
+        tokio::spawn(async move {
+            tokio::select! {
+                _ = client_close.cancelled() => {
+                    if let Some(session) = session_ref.upgrade() {
+                        let _ = session.shutdown().await;
+                    }
+                }
+                _ = session_close.cancelled() => {}
+            }
+        });
         let (sender, mut receiver) = mpsc::unbounded_channel();
         session.set_idle_sender(sender).await;
         let client = Arc::downgrade(self);
@@ -162,8 +138,8 @@ impl Client {
                 let Some(client) = client.upgrade() else {
                     break;
                 };
-                let _allocation = client.allocation.lock().await;
-                if client.shutting_down.load(std::sync::atomic::Ordering::Acquire) {
+                if client.close_token.is_cancelled() {
+                    let _ = session.shutdown().await;
                     break;
                 }
                 if !session.is_closed() && session.is_idle().await {
@@ -206,39 +182,11 @@ impl Client {
         None
     }
 
-    async fn take_session_with_capacity(&self) -> Option<Arc<Session>> {
-        let sessions = {
-            let mut registered = self.sessions.lock().await;
-            registered.retain(|session| session.strong_count() > 0);
-            registered.iter().filter_map(std::sync::Weak::upgrade).collect::<Vec<_>>()
-        };
-        let mut candidates = Vec::new();
-        for session in sessions {
-            if !session.is_closed() && !session.is_expired() && session.has_stream_capacity().await {
-                candidates.push(session);
-            }
-        }
-        candidates.into_iter().min_by_key(|session| session.id())
-    }
-
     pub async fn shutdown(&self) -> std::io::Result<()> {
-        self.shutting_down.store(true, std::sync::atomic::Ordering::Release);
-        let _allocation = self.allocation.lock().await;
-        let mut sessions = {
-            let mut registered = self.sessions.lock().await;
-            registered.retain(|session| session.strong_count() > 0);
-            registered.iter().filter_map(std::sync::Weak::upgrade).collect::<Vec<_>>()
-        };
+        self.close_token.cancel();
         let idle_sessions = self.idle_pool.lock().await.drain(..).map(|idle| idle.session).collect::<Vec<_>>();
-        for session in idle_sessions {
-            if !sessions.iter().any(|registered| Arc::ptr_eq(registered, &session)) {
-                sessions.push(session);
-            }
-        }
-        drop(_allocation);
-
         let mut first_error = None;
-        for session in sessions {
+        for session in idle_sessions {
             if let Err(error) = session.shutdown().await
                 && first_error.is_none()
             {
@@ -252,7 +200,6 @@ impl Client {
     }
 
     async fn cleanup(&self, timeout: Duration) {
-        self.sessions.lock().await.retain(|session| session.strong_count() > 0);
         let expiration = Instant::now().checked_sub(timeout).unwrap_or_else(Instant::now);
         let mut idle = self.idle_pool.lock().await;
         let mut retained = Vec::with_capacity(idle.len());
@@ -278,7 +225,7 @@ mod tests {
     use std::sync::atomic::Ordering;
 
     #[tokio::test]
-    async fn blocked_syn_does_not_block_allocation_on_healthy_session() {
+    async fn blocked_syn_does_not_block_independent_session_creation() {
         let gates = Arc::new(std::sync::Mutex::new(Vec::new()));
         let servers = Arc::new(Mutex::new(Vec::new()));
         let dial_count = Arc::new(std::sync::atomic::AtomicUsize::new(0));
@@ -293,7 +240,6 @@ mod tests {
                     dial_count.fetch_add(1, Ordering::Relaxed),
                     Box::new(peer),
                     Arc::new(RwLock::new(PaddingFactory::new(DEFAULT_SCHEME).unwrap())),
-                    2,
                     DEFAULT_MAX_SESSION_AGE,
                 );
                 let servers = Arc::clone(&servers);
@@ -308,15 +254,15 @@ mod tests {
             dialer,
             Arc::new(RwLock::new(PaddingFactory::new(DEFAULT_SCHEME).unwrap())),
             Duration::from_secs(30),
-            2,
             Duration::from_secs(3600),
         );
         let mut first = client.create_stream().await.unwrap();
         let second = client.create_stream().await.unwrap();
         let healthy = client.create_stream().await.unwrap();
-        assert_eq!(first.session_id(), second.session_id());
+        assert_ne!(first.session_id(), second.session_id());
         assert_ne!(second.session_id(), healthy.session_id());
         first.close().await.unwrap();
+        tokio::task::yield_now().await;
         let gate = Arc::clone(&gates.lock().unwrap()[0]);
         gate.block();
         let blocked = tokio::spawn({
@@ -326,13 +272,13 @@ mod tests {
         gate.wait_pending().await;
         let later = tokio::time::timeout(Duration::from_secs(1), client.create_stream())
             .await
-            .expect("blocked SYN must not hold global allocation")
+            .expect("blocked SYN must not prevent an independent Session")
             .unwrap();
-        assert_eq!(later.session_id(), healthy.session_id());
-        assert_eq!(dial_count.load(Ordering::Relaxed), 2);
+        assert_ne!(later.session_id(), healthy.session_id());
+        assert_eq!(dial_count.load(Ordering::Relaxed), 4);
         gate.release();
         let recovered = blocked.await.unwrap().unwrap();
-        assert_eq!(recovered.session_id(), second.session_id());
+        assert_eq!(recovered.session_id(), first.session_id());
         for server in servers.lock().await.drain(..) {
             server.shutdown().await.unwrap();
         }
@@ -365,7 +311,6 @@ mod tests {
                         sequence,
                         Box::new(peer),
                         Arc::new(RwLock::new(PaddingFactory::new(DEFAULT_SCHEME).unwrap())),
-                        1,
                         DEFAULT_MAX_SESSION_AGE,
                     );
                     server.run().await?;
@@ -378,7 +323,6 @@ mod tests {
             dialer,
             Arc::new(RwLock::new(PaddingFactory::new(DEFAULT_SCHEME).unwrap())),
             Duration::from_secs(30),
-            1,
             Duration::from_secs(3600),
         );
         let mut first = client.create_stream().await.unwrap();
@@ -389,6 +333,7 @@ mod tests {
         });
         tokio::time::timeout(Duration::from_secs(1), dial_started.notified()).await.unwrap();
         first.close().await.unwrap();
+        tokio::task::yield_now().await;
         let reused = tokio::time::timeout(Duration::from_secs(1), client.create_stream())
             .await
             .unwrap()
@@ -403,7 +348,7 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
-    async fn stalled_dial_times_out_and_releases_creation_lock() {
+    async fn stalled_dials_timeout_independently() {
         let dial_count = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let dialer: Dialer = {
             let dial_count = Arc::clone(&dial_count);
@@ -416,7 +361,6 @@ mod tests {
             dialer,
             Arc::new(RwLock::new(PaddingFactory::new(DEFAULT_SCHEME).unwrap())),
             Duration::from_secs(30),
-            1,
             Duration::from_secs(3600),
         );
         for _attempt in 0..2 {
@@ -427,7 +371,7 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
-    async fn queued_session_creation_gets_a_fresh_dial_timeout() {
+    async fn concurrent_dial_proceeds_while_another_stalls() {
         let dial_count = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let first_dial_started = Arc::new(tokio::sync::Notify::new());
         let servers = Arc::new(Mutex::new(Vec::new()));
@@ -449,7 +393,6 @@ mod tests {
                         sequence,
                         Box::new(server_io),
                         Arc::new(RwLock::new(PaddingFactory::new(DEFAULT_SCHEME).unwrap())),
-                        1,
                         DEFAULT_MAX_SESSION_AGE,
                     );
                     server.run().await?;
@@ -462,7 +405,6 @@ mod tests {
             dialer,
             Arc::new(RwLock::new(PaddingFactory::new(DEFAULT_SCHEME).unwrap())),
             Duration::from_secs(30),
-            1,
             Duration::from_secs(3600),
         );
 
@@ -471,20 +413,19 @@ mod tests {
             async move { client.create_stream().await }
         });
         first_dial_started.notified().await;
-        let queued = tokio::spawn({
+        let concurrent = tokio::spawn({
             let client = Arc::clone(&client);
             async move { client.create_stream().await }
         });
-        tokio::task::yield_now().await;
-
-        tokio::time::advance(SESSION_CONNECT_TIMEOUT).await;
-        match first.await.unwrap() {
-            Err(error) => assert_eq!(error.kind(), std::io::ErrorKind::TimedOut),
-            Ok(_) => panic!("stalled dial should time out"),
-        }
-        let stream = queued.await.unwrap().expect("queued dial should receive a fresh timeout window");
+        let stream = tokio::time::timeout(Duration::from_secs(1), concurrent)
+            .await
+            .expect("independent dial should not queue behind the stalled dial")
+            .unwrap()
+            .unwrap();
+        assert!(!first.is_finished());
 
         client.shutdown().await.unwrap();
+        assert!(first.await.unwrap().is_err());
         for server in servers.lock().await.drain(..) {
             server.shutdown().await.unwrap();
         }
@@ -507,7 +448,6 @@ mod tests {
                     1,
                     Box::new(server_io),
                     Arc::new(RwLock::new(PaddingFactory::new(DEFAULT_SCHEME).unwrap())),
-                    2,
                     DEFAULT_MAX_SESSION_AGE,
                 );
                 server.run().await?;
@@ -519,21 +459,20 @@ mod tests {
             dialer,
             Arc::new(RwLock::new(PaddingFactory::new(DEFAULT_SCHEME).unwrap())),
             Duration::from_secs(60),
-            2,
             Duration::from_secs(60 * 60),
         );
 
         let mut first = client.create_stream().await.unwrap();
         let session = first.session().unwrap();
-        let second = session.open_stream().await.unwrap();
-        assert_eq!(session.id(), second.session_id());
-        let mut third = client.create_stream().await.unwrap();
-        assert_ne!(session.id(), third.session_id());
+        let mut second = client.create_stream().await.unwrap();
+        assert_ne!(session.id(), second.session_id());
         assert_eq!(dial_count.load(Ordering::Relaxed), 2);
         first.close().await.unwrap();
         tokio::task::yield_now().await;
-        assert!(client.idle_pool.lock().await.is_empty());
-        let mut second = second;
+        assert_eq!(client.idle_pool.lock().await.len(), 1);
+        let mut third = client.create_stream().await.unwrap();
+        assert_eq!(session.id(), third.session_id());
+        assert_eq!(dial_count.load(Ordering::Relaxed), 2);
         second.close().await.unwrap();
         third.close().await.unwrap();
         tokio::task::yield_now().await;
@@ -556,7 +495,6 @@ mod tests {
                     1,
                     Box::new(server_io),
                     Arc::new(RwLock::new(PaddingFactory::new(DEFAULT_SCHEME).unwrap())),
-                    1,
                     DEFAULT_MAX_SESSION_AGE,
                 );
                 server.run().await?;
@@ -568,13 +506,14 @@ mod tests {
             dialer,
             Arc::new(RwLock::new(PaddingFactory::new(DEFAULT_SCHEME).unwrap())),
             Duration::from_secs(60),
-            1,
             Duration::from_secs(3600),
         );
 
-        let mut stream = client.create_stream().await.unwrap();
-        let session = stream.session().unwrap();
-        stream.close().await.unwrap();
+        let active_stream = client.create_stream().await.unwrap();
+        let active_session = active_stream.session().unwrap();
+        let mut idle_stream = client.create_stream().await.unwrap();
+        let idle_session = idle_stream.session().unwrap();
+        idle_stream.close().await.unwrap();
         tokio::time::timeout(Duration::from_secs(1), async {
             while client.idle_pool.lock().await.is_empty() {
                 tokio::task::yield_now().await;
@@ -585,7 +524,14 @@ mod tests {
 
         client.shutdown().await.unwrap();
 
-        assert!(session.is_closed());
+        assert!(idle_session.is_closed());
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while !active_session.is_closed() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("client cancellation should close active sessions");
         assert!(client.idle_pool.lock().await.is_empty());
         assert_eq!(client.create_stream().await.err().unwrap().kind(), std::io::ErrorKind::BrokenPipe);
         for server in server_sessions.lock().await.drain(..) {
@@ -609,7 +555,6 @@ mod tests {
                     1,
                     Box::new(server_io),
                     Arc::new(RwLock::new(PaddingFactory::new(DEFAULT_SCHEME).unwrap())),
-                    1,
                     DEFAULT_MAX_SESSION_AGE,
                 );
                 server.run().await?;
@@ -621,7 +566,6 @@ mod tests {
             dialer,
             Arc::new(RwLock::new(PaddingFactory::new(DEFAULT_SCHEME).unwrap())),
             Duration::from_secs(60),
-            1,
             Duration::from_millis(30),
         );
 
@@ -653,7 +597,6 @@ mod tests {
                     1,
                     Box::new(server_io),
                     Arc::new(RwLock::new(PaddingFactory::new(DEFAULT_SCHEME).unwrap())),
-                    1,
                     DEFAULT_MAX_SESSION_AGE,
                 );
                 server.run().await?;
@@ -665,7 +608,6 @@ mod tests {
             dialer,
             Arc::new(RwLock::new(PaddingFactory::new(DEFAULT_SCHEME).unwrap())),
             Duration::from_secs(60),
-            1,
             Duration::from_millis(30),
         );
 
@@ -688,7 +630,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn concurrent_stream_creation_reuses_sessions_within_capacity() {
+    async fn concurrent_stream_creation_uses_one_session_per_active_stream() {
         let dial_count = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let server_sessions = Arc::new(Mutex::new(Vec::new()));
         let dial_count_for_dialer = Arc::clone(&dial_count);
@@ -703,7 +645,6 @@ mod tests {
                     dial_count.load(Ordering::Relaxed),
                     Box::new(server_io),
                     Arc::new(RwLock::new(PaddingFactory::new(DEFAULT_SCHEME).unwrap())),
-                    16,
                     DEFAULT_MAX_SESSION_AGE,
                 );
                 server.run().await?;
@@ -715,7 +656,6 @@ mod tests {
             dialer,
             Arc::new(RwLock::new(PaddingFactory::new(DEFAULT_SCHEME).unwrap())),
             Duration::from_secs(60),
-            16,
             Duration::from_secs(60 * 60),
         );
         let mut tasks = tokio::task::JoinSet::new();
@@ -729,7 +669,7 @@ mod tests {
         }
 
         assert_eq!(streams.len(), 100);
-        assert_eq!(dial_count.load(Ordering::Relaxed), 7);
+        assert_eq!(dial_count.load(Ordering::Relaxed), 100);
         drop(streams);
         tokio::time::timeout(Duration::from_secs(1), async {
             loop {
@@ -748,7 +688,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn default_scale_concurrency_fits_in_one_session() {
+    async fn default_scale_concurrency_uses_one_session_per_stream() {
         let dial_count = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let server_sessions = Arc::new(Mutex::new(Vec::new()));
         let dial_count_for_dialer = Arc::clone(&dial_count);
@@ -763,7 +703,6 @@ mod tests {
                     1,
                     Box::new(server_io),
                     Arc::new(RwLock::new(PaddingFactory::new(DEFAULT_SCHEME).unwrap())),
-                    128,
                     DEFAULT_MAX_SESSION_AGE,
                 );
                 server.run().await?;
@@ -775,7 +714,6 @@ mod tests {
             dialer,
             Arc::new(RwLock::new(PaddingFactory::new(DEFAULT_SCHEME).unwrap())),
             Duration::from_secs(30),
-            128,
             Duration::from_secs(60 * 60),
         );
         let mut tasks = tokio::task::JoinSet::new();
@@ -789,7 +727,7 @@ mod tests {
         }
 
         assert_eq!(streams.len(), 100);
-        assert_eq!(dial_count.load(Ordering::Relaxed), 1);
+        assert_eq!(dial_count.load(Ordering::Relaxed), 100);
         drop(streams);
         for server in server_sessions.lock().await.drain(..) {
             let _ = server.shutdown().await;

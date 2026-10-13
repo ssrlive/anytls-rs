@@ -53,11 +53,6 @@ pub struct ClientArgs {
     #[arg(long, value_name = "FILE")]
     pub padding_scheme: Option<PathBuf>,
 
-    /// Maximum logical streams per AnyTLS session, if it is 1 then multiplexing is disabled
-    #[arg(short = 'm', long, value_name = "N", default_value_t = 16)]
-    #[serde(skip)]
-    pub max_streams_per_session: usize,
-
     /// Print the equivalent AnyTLS URI and exit
     #[arg(long)]
     #[serde(skip)]
@@ -197,7 +192,6 @@ impl Default for ClientArgs {
             insecure: None,
             sni: None,
             padding_scheme: None,
-            max_streams_per_session: 16,
             print_url: false,
             fragment: None,
             log: log::LevelFilter::Info,

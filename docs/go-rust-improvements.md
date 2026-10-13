@@ -4,7 +4,7 @@ This document records the behavior that the Rust implementation preserves from t
 
 ## Search Terms
 
-`max_streams_per_session`, `Session ID`, `stream ID`, `SID`, `idle session pool`, `logical stream capacity`, `FIN`, `SYN`, `SYNACK`, `cmdWaste`, `Go compatibility`, `Rust translation`.
+`Session ID`, `stream ID`, `SID`, `single-stream Session`, `idle session pool`, `FIN`, `SYN`, `SYNACK`, `cmdWaste`, `Go compatibility`, `Rust translation`.
 
 ## Session Identity
 
@@ -33,36 +33,20 @@ The allocator is an implementation detail; the wire protocol associates each dat
 
 The Rust implementation rejects a frame whose SID does not match its command class. The Go implementation also uses non-zero SIDs, but does not enforce every SID class at the receive boundary.
 
-## Maximum Streams Per Session
+## Session Stream Policy
 
-The Rust implementation exposes `max_streams_per_session` on `Client`, `Session::new_client`, and `Session::new_server`.
+The Rust implementation permits one active logical data stream per Session. A client creates an independent Session for each concurrently active flow; it does not scan active Sessions for spare stream capacity. A server rejects an additional `SYN` while its Session already has an active stream.
 
-Values smaller than `1` are normalized to `1`. This prevents a Session from being created with no usable logical stream capacity.
+When a stream closes, its Session remains open and can return to the idle pool. A later flow can reuse that Session, so single-stream operation does not imply one new transport connection per flow.
 
-The limit applies to active logical data streams on one Session:
-
-```text
-active_streams < max_streams_per_session
-```
-
-When the limit is reached:
-
-- A direct `Session::open_stream` returns `WouldBlock`; `Client::create_stream` treats this as a capacity race and retries Session selection instead of closing the selected Session.
-- The Client selects another Session with available capacity, if one exists.
-- If no existing Session has capacity, the Client creates a new Session.
-- A server receiving an extra `SYN` sends `SYNACK` with `session stream limit reached`.
-
-`max_streams_per_session = 1` prevents multiple concurrent logical streams from sharing one Session, but it does not disable reuse of an idle Session. After its only stream closes, that Session can still return to the idle pool and serve a later stream.
-
-This is a deliberate improvement over the current Go implementation, which has no explicit per-Session stream limit and can keep allocating `uint32` SIDs until resource exhaustion or SID wraparound.
+The wire protocol's SID format is unchanged. Stream IDs still come from one process-global atomic counter, increment with wraparound, and skip `0`, which remains reserved for control frames.
 
 ## Session Selection
 
 The Rust Client chooses a Session in this order:
 
 1. Reuse the oldest fully idle Session.
-2. Reuse the oldest existing Session with available stream capacity.
-3. Create a new Session.
+2. If no Session is idle, create a new Session for this flow.
 
 The Session ID is used as the ordering key for this selection; the smallest Session ID is selected first.
 
@@ -72,9 +56,7 @@ The Rust Client also applies a configurable maximum Session age through `Client:
 
 ## Stalled Connection Recovery
 
-Session selection and logical-stream reservation remain atomic under the Client allocation lock. SYN transport writes happen after that lock is released, so a stalled Session cannot block allocation on another healthy Session.
-
-A separate creation lock prevents duplicate concurrent Session dials. Waiting for this lock and connecting a new Session share a 15-second deadline. Existing Sessions remain available while a new connection is being established.
+Each flow reserves an idle Session or dials independently; there is no client-wide lock serializing stream allocation or Session creation. A stalled SYN write therefore cannot hold an allocation lock, and a stalled dial does not prevent another request from reusing an idle Session or starting its own dial. Each new dial has a 15-second deadline.
 
 Transport write requests have a 15-second deadline. A timeout closes the whole Session because a partially written frame cannot safely be resumed on that transport. Session shutdown cancels an in-flight write and releases both transport halves, even when a closed Session remains referenced by the pool.
 
@@ -88,26 +70,23 @@ Closing a failed Session interrupts its existing streams. Later requests can est
 
 The Rust Client intentionally has no separate `disable_reuse` option. The Go option combines two unrelated policies: it prevents idle Session reuse and also closes the entire Session when the logical stream closes. Rust keeps these responsibilities separate:
 
-- `max_streams_per_session` controls only the number of concurrent logical streams carried by one Session.
-- The idle pool controls whether an otherwise healthy Session can be reused after its streams close.
-- A value of `max_streams_per_session = 1` prevents concurrent stream sharing, but does not disable reuse of an idle Session.
+- Each Session carries at most one active logical stream.
+- The idle pool controls whether an otherwise healthy Session can be reused after its stream closes.
 
-This is an intentional Rust design difference, not a missing compatibility feature. It avoids forcing a new transport connection merely to limit per-Session concurrency and keeps resource policy independent from stream capacity.
+This is an intentional Rust implementation policy. It avoids multiplex-specific active-session selection and coordination while preserving transport reuse between flows.
 
 ## Idle Session Pool
 
-A Session enters the idle pool only after its active logical stream count becomes zero.
+A Session enters the idle pool after its only active logical stream closes.
 
-Both closure paths perform the capacity check:
+Both closure paths check whether the Session can return to the pool:
 
 - Local `Stream::close` sends `FIN`, removes the stream, and checks whether the Session has no remaining streams.
 - Dropping a `Stream` schedules the same cleanup on the Tokio runtime, removes the stream without waiting for the peer FIN, and then best-effort sends `FIN`.
-- Remote `FIN` closes the local read half after queued data drains. The stream remains available for reverse-direction writes until the local side also sends `FIN`; then it is removed and the idle-pool capacity check runs.
+- Remote `FIN` closes the local read half after queued data drains. The stream remains available for reverse-direction writes until the local side also sends `FIN`; then it is removed and the Session may return to the idle pool.
 - Remote `SYNACK` failure closes the local stream endpoint, removes the stream, and performs the same check.
 
-A Session with one remaining active stream is not placed in the idle pool when another stream closes.
-
-The pool deduplicates Session references, so closing multiple streams cannot enqueue the same Session more than once.
+The idle pool deduplicates Session references, so a Session is not enqueued more than once.
 
 ## FIN Half-Close
 
@@ -127,11 +106,11 @@ The Rust translation preserves these important Go behaviors:
 - `FIN` closes one logical stream direction without closing the whole Session; the stream is released after both FIN directions complete.
 - `SYNACK` is sent at most once per stream handshake.
 - Padding packet counting is tied to transport writes.
-- The Session remains reusable while it is alive and has capacity.
+- A Session is reused only while idle; each active Session carries one data stream.
 
 ## Compatibility Boundary
 
-`max_streams_per_session` is a local resource-management policy. It does not change the AnyTLS frame format or command values. A Rust endpoint with a limit can still communicate with a Go endpoint; the Rust endpoint may reject additional logical streams when its configured capacity is full.
+One-stream-per-Session is a local implementation policy; it does not change the AnyTLS frame format, command values, or global SID allocation. A Rust endpoint can communicate with a Go endpoint, but a Rust server rejects an additional logical stream on a Session that is already active.
 
 The Rust implementation also performs stricter SID validation than Go. Valid Go-produced frames remain compatible, while malformed control/data SID combinations are rejected earlier.
 
@@ -141,8 +120,8 @@ The behavior is covered by Rust tests for:
 
 - Settings, SYN, PSH, and SYNACK exchange.
 - Session reuse.
-- Multiple streams on one Session.
-- Returning a Session to the idle pool only after the last stream closes.
+- Rejection of a second active stream on one Session.
+- Returning a Session to the idle pool after its stream closes.
 - Frame SID and command compatibility.
 
 Recommended checks:

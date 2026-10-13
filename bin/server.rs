@@ -171,7 +171,6 @@ async fn run_server(cancel_token: CancellationToken) -> std::io::Result<()> {
                 let tls_state = tls_state_rx.borrow().clone();
                 let padding = padding.clone();
                 let password = password.clone();
-                let max_streams = args.max_streams_per_session;
                 let traffic_audit = Arc::clone(&traffic_audit);
                 let forward_target = forward_target.clone();
                 let cancel_token = cancel_token.clone();
@@ -183,7 +182,6 @@ async fn run_server(cancel_token: CancellationToken) -> std::io::Result<()> {
                         padding,
                         password,
                         session_id,
-                        max_streams,
                         traffic_audit,
                         panel_sync_enabled,
                         forward_target,
@@ -241,7 +239,6 @@ async fn handle_connection(
     padding: Arc<tokio::sync::RwLock<PaddingFactory>>,
     password: Arc<String>,
     session_id: usize,
-    max_streams: usize,
     traffic_audit: TrafficAuditPtr,
     panel_sync_enabled: bool,
     forward_target: Option<Url>,
@@ -314,13 +311,7 @@ async fn handle_connection(
     }
     log::debug!("{mn} -- session {session_id}: TLS and AnyTLS authentication completed for {client_id:?}");
 
-    let session = Session::new_server(
-        session_id,
-        Box::new(tls) as BoxTransport,
-        padding,
-        max_streams,
-        DEFAULT_MAX_SESSION_AGE,
-    );
+    let session = Session::new_server(session_id, Box::new(tls) as BoxTransport, padding, DEFAULT_MAX_SESSION_AGE);
     session.run().await?;
     let mut stream_tasks = JoinSet::new();
     let session_result = loop {

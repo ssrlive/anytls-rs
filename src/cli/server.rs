@@ -31,10 +31,6 @@ pub struct ServerArgs {
     #[arg(long, value_name = "URL")]
     pub forward: Option<Url>,
 
-    /// Maximum logical streams accepted on one authenticated TLS session
-    #[arg(short = 'm', long, value_name = "N", default_value_t = 1024)]
-    pub max_streams_per_session: usize,
-
     /// TLS certificate PEM file (optional; reloaded automatically when changed)
     #[serde(skip_serializing_if = "Option::is_none")]
     #[arg(long, value_name = "FILE")]

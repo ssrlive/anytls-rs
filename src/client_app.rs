@@ -85,7 +85,6 @@ pub async fn run_client(
         dialer,
         padding,
         std::time::Duration::from_secs(30),
-        args.max_streams_per_session,
         std::time::Duration::from_secs(3600),
     );
     let connector_client = Arc::clone(&client);

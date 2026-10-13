@@ -65,7 +65,6 @@ struct WriteCompletion {
 
 /// Represents an status of a logical stream within a session.
 pub(crate) struct StreamState {
-    pub(crate) writer: Arc<Mutex<tokio::io::DuplexStream>>,
     push_sender: mpsc::Sender<PushMessage>,
     push_slots: Arc<tokio::sync::Semaphore>,
     /// Indicates whether the local side has sent a FIN for this stream.
@@ -87,8 +86,6 @@ impl StreamState {
     pub(crate) fn new(writer: tokio::io::DuplexStream, stream_id: u32, session: Weak<Session>) -> Self {
         let push_slots = Arc::new(tokio::sync::Semaphore::new(INBOUND_PUSH_QUEUE_BYTES));
         let (push_sender, push_receiver) = mpsc::channel(INBOUND_PUSH_QUEUE_MESSAGES + 1);
-        let writer = Arc::new(Mutex::new(writer));
-        let task_writer = Arc::clone(&writer);
         let close_token = CancellationToken::new();
         let task_close_token = close_token.clone();
         let session_id = session.upgrade().map(|s| s.id()).unwrap_or_default();
@@ -98,10 +95,9 @@ impl StreamState {
             session,
             task_close_token,
             push_receiver,
-            task_writer,
+            writer,
         ));
         Self {
-            writer,
             push_sender,
             push_slots,
             local_fin: false,
@@ -117,7 +113,7 @@ impl StreamState {
         session: Weak<Session>,
         task_close_token: CancellationToken,
         mut push_receiver: mpsc::Receiver<PushMessage>,
-        task_writer: Arc<Mutex<tokio::io::DuplexStream>>,
+        mut task_writer: tokio::io::DuplexStream,
     ) {
         let result = loop {
             let message = tokio::select! {
@@ -133,7 +129,7 @@ impl StreamState {
             let (data, _permit) = match message {
                 PushMessage::Data(data, permit) => (data, permit),
                 PushMessage::Fin => {
-                    let _ = task_writer.lock().await.shutdown().await;
+                    let _ = task_writer.shutdown().await;
                     if let Some(session) = session.upgrade() {
                         session.on_stream_read_closed(stream_id).await;
                     }
@@ -141,7 +137,7 @@ impl StreamState {
                 }
             };
             let result = tokio::select! {
-                result = async { task_writer.lock().await.write_all(&data).await } => result,
+                result = task_writer.write_all(&data) => result,
                 _ = task_close_token.cancelled() => break Ok(()),
             };
             if let Err(e) = result {
@@ -162,10 +158,9 @@ pub struct Session {
     session_id: usize,
     created_at: std::time::Instant,
     max_age: Duration,
-    max_streams: usize,
     control_sender: mpsc::Sender<WriteRequest>,
     data_sender: mpsc::Sender<WriteRequest>,
-    streams: Mutex<HashMap<u32, StreamState>>,
+    streams: Mutex<Option<(u32, StreamState)>>,
     /// Indicates whether the session has been closed.
     closed: Arc<std::sync::atomic::AtomicBool>,
     is_client: bool,
@@ -182,25 +177,15 @@ pub struct Session {
 }
 
 impl Session {
-    pub fn new_client(
-        session_id: usize,
-        transport: BoxTransport,
-        padding: Arc<RwLock<PaddingFactory>>,
-        max_streams: usize,
-        max_age: Duration,
-    ) -> Arc<Self> {
-        Arc::new(Self::new(session_id, transport, padding, true, max_streams, max_age, None))
+    pub fn new_client(session_id: usize, transport: BoxTransport, padding: Arc<RwLock<PaddingFactory>>, max_age: Duration) -> Arc<Self> {
+        let cancel_token = CancellationToken::new();
+        Arc::new(Self::new(session_id, transport, padding, true, max_age, cancel_token, None))
     }
 
-    pub fn new_server(
-        session_id: usize,
-        transport: BoxTransport,
-        padding: Arc<RwLock<PaddingFactory>>,
-        max_streams: usize,
-        max_age: Duration,
-    ) -> Arc<Self> {
-        let incoming = Some(mpsc::channel(32));
-        Arc::new(Self::new(session_id, transport, padding, false, max_streams, max_age, incoming))
+    pub fn new_server(session_id: usize, transport: BoxTransport, padding: Arc<RwLock<PaddingFactory>>, max_age: Duration) -> Arc<Self> {
+        let incoming = Some(mpsc::channel(1));
+        let cancel_token = CancellationToken::new();
+        Arc::new(Self::new(session_id, transport, padding, false, max_age, cancel_token, incoming))
     }
 
     fn new(
@@ -208,8 +193,8 @@ impl Session {
         transport: BoxTransport,
         padding: Arc<RwLock<PaddingFactory>>,
         is_client: bool,
-        max_streams: usize,
         max_age: Duration,
+        close_token: CancellationToken,
         incoming: Option<(mpsc::Sender<Stream>, mpsc::Receiver<Stream>)>,
     ) -> Self {
         let side = if is_client { "client" } else { "server" };
@@ -217,7 +202,6 @@ impl Session {
         log::trace!("{mn} -- Session {session_id} peer=None creating {side} session");
         let (reader, writer) = tokio::io::split(transport);
         let incoming_sender = incoming.as_ref().map(|(sender, _)| sender.clone());
-        let close_token = CancellationToken::new();
         let writer_close_token = close_token.clone();
         let packet_counter = Arc::new(std::sync::atomic::AtomicU32::new(0));
         let writer_packet_counter = Arc::clone(&packet_counter);
@@ -240,10 +224,9 @@ impl Session {
             session_id,
             created_at: std::time::Instant::now(),
             max_age,
-            max_streams: max_streams.max(1),
             control_sender,
             data_sender,
-            streams: Mutex::new(HashMap::new()),
+            streams: Mutex::new(None),
             closed,
             is_client,
             peer_session_id: std::sync::RwLock::new(None),
@@ -375,6 +358,10 @@ impl Session {
         self.session_id
     }
 
+    pub(crate) fn close_signal(&self) -> CancellationToken {
+        self.close_token.clone()
+    }
+
     pub fn peer_session_id(&self) -> Option<usize> {
         *self.peer_session_id.read().unwrap_or_else(|error| error.into_inner())
     }
@@ -387,13 +374,8 @@ impl Session {
         !self.max_age.is_zero() && self.created_at.elapsed() >= self.max_age
     }
 
-    #[inline]
-    pub async fn has_stream_capacity(&self) -> bool {
-        self.streams.lock().await.len() < self.max_streams
-    }
-
     pub(crate) async fn is_idle(&self) -> bool {
-        self.streams.lock().await.is_empty()
+        self.streams.lock().await.is_none()
     }
 
     pub async fn set_idle_sender(&self, sender: mpsc::UnboundedSender<Arc<Session>>) {
@@ -415,9 +397,15 @@ impl Session {
             self.write_control(frame).await?;
         }
 
+        let reader = self
+            .reader
+            .lock()
+            .await
+            .take()
+            .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::AlreadyExists, "session reader already taken"))?;
         let session = Arc::clone(self);
         let session_id = self.id();
-        tokio::spawn(Self::do_main_loop_task(session, session_id));
+        tokio::spawn(Self::do_main_loop_task(session, session_id, reader));
         if self.is_client {
             let session = Arc::downgrade(self);
             let close_token = self.close_token.clone();
@@ -432,9 +420,9 @@ impl Session {
         Ok(())
     }
 
-    async fn do_main_loop_task(session: Arc<Session>, session_id: usize) {
+    async fn do_main_loop_task(session: Arc<Session>, session_id: usize, reader: tokio::io::ReadHalf<BoxTransport>) {
         let mn = method_name_unstable!();
-        let result = Arc::clone(&session).receive_loop().await;
+        let result = Arc::clone(&session).receive_loop(reader).await;
         let peer_session_id = session.peer_session_id();
         match result {
             Ok(()) => log::debug!("{mn} -- Session {session_id} peer={peer_session_id:?} receive loop stopped",),
@@ -462,7 +450,7 @@ impl Session {
                 continue;
             }
 
-            let len = session.streams.lock().await.len();
+            let len = usize::from(session.streams.lock().await.is_some());
             log::trace!("{mn} -- Session {session_id} peer={peer_session_id:?} sending heartbeat, total {len} streams");
 
             let response = session.heart_response.notified();
@@ -564,7 +552,7 @@ impl Session {
         let (local, remote) = tokio::io::duplex(64 * 1024);
 
         {
-            let mut streams = self.streams.lock().await;
+            let mut active_stream = self.streams.lock().await;
             // Re-check under the streams lock so we cannot insert after shutdown drained.
             if self.is_closed() {
                 return Err(Error::new(BrokenPipe, format!("session {session_id} closed")));
@@ -572,14 +560,13 @@ impl Session {
             if self.is_expired() {
                 return Err(Error::new(TimedOut, format!("session {session_id} reached its maximum age")));
             }
-            if streams.len() >= self.max_streams {
+            if active_stream.is_some() {
                 return Err(Error::new(WouldBlock, format!("session {session_id} stream limit reached")));
             }
-            streams.insert(id, StreamState::new(remote, id, Arc::downgrade(self)));
+            *active_stream = Some((id, StreamState::new(remote, id, Arc::downgrade(self))));
             let mn = method_name_unstable!();
-            let l = streams.len();
             let psid = self.peer_session_id();
-            log::debug!("{mn} -- Session {session_id} peer={psid:?} reserved stream {id}, total streams: {l}");
+            log::debug!("{mn} -- Session {session_id} peer={psid:?} reserved stream {id}");
         }
         Ok(Stream::new(id, Arc::downgrade(self), local))
     }
@@ -606,7 +593,12 @@ impl Session {
         frame.data.extend_from_slice(data);
         let bytes = frame.encode()?;
 
-        let can_write = self.streams.lock().await.get(&stream_id).is_some_and(|stream| !stream.local_fin);
+        let can_write = self
+            .streams
+            .lock()
+            .await
+            .as_ref()
+            .is_some_and(|(active_id, stream)| *active_id == stream_id && !stream.local_fin);
         if !can_write {
             return Err(Error::new(BrokenPipe, format!("stream {stream_id} closed")));
         }
@@ -617,10 +609,13 @@ impl Session {
     pub(crate) async fn send_fin_by_id(self: &Arc<Self>, stream_id: u32) -> std::io::Result<()> {
         use std::io::{Error, ErrorKind::BrokenPipe};
         let remote_fin = {
-            let mut streams = self.streams.lock().await;
-            let stream = streams
-                .get_mut(&stream_id)
-                .ok_or_else(|| Error::new(BrokenPipe, format!("stream {stream_id} closed")))?;
+            let mut active = self.streams.lock().await;
+            let Some((active_id, stream)) = active.as_mut() else {
+                return Err(Error::new(BrokenPipe, format!("stream {stream_id} closed")));
+            };
+            if *active_id != stream_id {
+                return Err(Error::new(BrokenPipe, format!("stream {stream_id} closed")));
+            }
             if stream.local_fin {
                 return Ok(());
             }
@@ -656,8 +651,7 @@ impl Session {
         self.closed.store(true, std::sync::atomic::Ordering::Release);
         self.close_token.cancel();
         self.reader.lock().await.take();
-        let streams = self.streams.lock().await.drain().map(|(_, entry)| entry).collect::<Vec<_>>();
-        for entry in streams {
+        if let Some((_, entry)) = self.streams.lock().await.take() {
             entry.close_token.cancel();
         }
         Ok(())
@@ -784,19 +778,13 @@ impl Session {
         }
     }
 
-    async fn receive_loop(self: Arc<Self>) -> std::io::Result<()> {
+    async fn receive_loop(self: Arc<Self>, mut reader: tokio::io::ReadHalf<BoxTransport>) -> std::io::Result<()> {
         use std::io::{Error, ErrorKind::InvalidData};
         let session_id = self.id();
         let mn = method_name_unstable!();
         loop {
             let result = tokio::select! {
-                result = async {
-                    let mut reader = self.reader.lock().await;
-                    match reader.as_mut() {
-                        Some(reader) => Frame::read_from_or_eof(reader).await,
-                        None => Ok(None),
-                    }
-                } => result,
+                result = Frame::read_from_or_eof(&mut reader) => result,
                 _ = self.close_token.cancelled() => break Ok(()),
             };
             let psid = self.peer_session_id();
@@ -821,12 +809,9 @@ impl Session {
             }
             match frame.command {
                 Command::Push => {
-                    let stream = self
-                        .streams
-                        .lock()
-                        .await
-                        .get(&stream_id)
-                        .map(|entry| (entry.push_sender.clone(), Arc::clone(&entry.push_slots)));
+                    let stream = self.streams.lock().await.as_ref().and_then(|(active_id, entry)| {
+                        (*active_id == stream_id).then(|| (entry.push_sender.clone(), Arc::clone(&entry.push_slots)))
+                    });
                     if let Some((push_sender, push_slots)) = stream {
                         let psid = self.peer_session_id();
                         match push_slots.try_acquire_many_owned(frame.data.len() as u32) {
@@ -945,9 +930,9 @@ impl Session {
 
     async fn on_receive_fin_cmd(self: &Arc<Self>, stream_id: u32) -> std::io::Result<()> {
         let push_sender = {
-            let mut streams = self.streams.lock().await;
-            match streams.get_mut(&stream_id) {
-                Some(stream) if !stream.remote_fin => {
+            let mut active = self.streams.lock().await;
+            match active.as_mut() {
+                Some((active_id, stream)) if *active_id == stream_id && !stream.remote_fin => {
                     stream.remote_fin = true;
                     Some(stream.push_sender.clone())
                 }
@@ -959,7 +944,12 @@ impl Session {
                 Ok(()) => {}
                 Err(mpsc::error::TrySendError::Closed(_)) => self.on_stream_read_closed(stream_id).await,
                 Err(mpsc::error::TrySendError::Full(message)) => {
-                    let close_token = self.streams.lock().await.get(&stream_id).map(|stream| stream.close_token.clone());
+                    let close_token = self
+                        .streams
+                        .lock()
+                        .await
+                        .as_ref()
+                        .and_then(|(active_id, stream)| (*active_id == stream_id).then(|| stream.close_token.clone()));
                     let session = Arc::downgrade(self);
                     tokio::spawn(async move {
                         if let Some(close_token) = close_token {
@@ -982,7 +972,9 @@ impl Session {
     }
 
     async fn on_stream_read_closed(self: &Arc<Self>, stream_id: u32) {
-        if let Some(stream) = self.streams.lock().await.get_mut(&stream_id) {
+        if let Some((active_id, stream)) = self.streams.lock().await.as_mut()
+            && *active_id == stream_id
+        {
             stream.read_closed = true;
         }
         self.finish_stream_if_closed(stream_id).await;
@@ -993,8 +985,8 @@ impl Session {
             .streams
             .lock()
             .await
-            .get(&stream_id)
-            .is_some_and(|stream| stream.local_fin && stream.remote_fin && stream.read_closed);
+            .as_ref()
+            .is_some_and(|(active_id, stream)| *active_id == stream_id && stream.local_fin && stream.remote_fin && stream.read_closed);
         if should_finish {
             self.remove_stream_by_id(stream_id).await;
         }
@@ -1003,9 +995,9 @@ impl Session {
     async fn helper_drop_stream_by_id(self: &Arc<Self>, stream_id: u32) {
         let session_id = self.id();
         let should_send_fin = {
-            let mut streams = self.streams.lock().await;
-            match streams.get_mut(&stream_id) {
-                Some(stream) if !stream.local_fin => {
+            let mut active = self.streams.lock().await;
+            match active.as_mut() {
+                Some((active_id, stream)) if *active_id == stream_id && !stream.local_fin => {
                     stream.local_fin = true;
                     true
                 }
@@ -1027,14 +1019,17 @@ impl Session {
         let session_id = self.id();
         let psid = self.peer_session_id();
         let became_idle = {
-            let mut streams = self.streams.lock().await;
-            if let Some(entry) = streams.remove(&stream_id) {
-                drop(entry.writer);
+            let mut active = self.streams.lock().await;
+            let removed = if active.as_ref().is_some_and(|(active_id, _)| *active_id == stream_id) {
+                active.take()
+            } else {
+                None
+            };
+            if let Some((_, entry)) = removed {
                 entry.close_token.cancel();
-                let l = streams.len();
-                log::trace!("{mn} -- Session {session_id} peer={psid:?} removed stream {stream_id}, remaining streams: {l}");
+                log::trace!("{mn} -- Session {session_id} peer={psid:?} removed stream {stream_id}");
             }
-            streams.is_empty()
+            active.is_none()
         };
 
         if became_idle {
@@ -1067,21 +1062,20 @@ impl Session {
         let (local, remote) = tokio::io::duplex(64 * 1024);
         let rejection = {
             let mut rejection = None;
-            let mut streams = self.streams.lock().await;
-            if streams.contains_key(&stream_id) {
+            let mut active = self.streams.lock().await;
+            if active.as_ref().is_some_and(|(active_id, _)| *active_id == stream_id) {
                 return Ok(());
             }
             if self.is_expired() {
                 rejection = Some("session reached its maximum age");
-            } else if streams.len() >= self.max_streams {
+            } else if active.is_some() {
                 rejection = Some("session stream limit reached");
             } else {
-                streams.insert(stream_id, StreamState::new(remote, stream_id, Arc::downgrade(self)));
+                *active = Some((stream_id, StreamState::new(remote, stream_id, Arc::downgrade(self))));
                 let mn = method_name_unstable!();
-                let l = streams.len();
                 let id = self.id();
                 let psid = self.peer_session_id();
-                log::debug!("{mn} -- Session {id} peer={psid:?} accepted new stream {stream_id}, total streams: {l}");
+                log::debug!("{mn} -- Session {id} peer={psid:?} accepted stream {stream_id}");
             }
             rejection
         };
@@ -1442,7 +1436,6 @@ pub(crate) mod tests {
             1,
             transport,
             Arc::new(RwLock::new(PaddingFactory::new(b"stop=0").unwrap())),
-            1,
             DEFAULT_MAX_SESSION_AGE,
         );
         session.run().await.unwrap();
@@ -1482,7 +1475,7 @@ pub(crate) mod tests {
     #[tokio::test]
     async fn blocked_heart_response_does_not_block_inbound_data() {
         let (transport, mut peer, gate) = gated_transport();
-        let session = Session::new_client(1, transport, padding(), 1, DEFAULT_MAX_SESSION_AGE);
+        let session = Session::new_client(1, transport, padding(), DEFAULT_MAX_SESSION_AGE);
         session.run().await.unwrap();
         let stream = session.open_stream().await.unwrap();
         gate.block();
@@ -1508,7 +1501,7 @@ pub(crate) mod tests {
     #[tokio::test]
     async fn shutdown_interrupts_blocked_writer_and_releases_transport() {
         let (transport, _peer, gate) = gated_transport();
-        let session = Session::new_client(1, transport, padding(), 1, DEFAULT_MAX_SESSION_AGE);
+        let session = Session::new_client(1, transport, padding(), DEFAULT_MAX_SESSION_AGE);
         session.run().await.unwrap();
         let stream = session.open_stream().await.unwrap();
         gate.block();
@@ -1529,7 +1522,7 @@ pub(crate) mod tests {
     #[tokio::test(start_paused = true)]
     async fn blocked_writer_times_out_and_closes_session() {
         let (transport, _peer, gate) = gated_transport();
-        let session = Session::new_client(1, transport, padding(), 1, DEFAULT_MAX_SESSION_AGE);
+        let session = Session::new_client(1, transport, padding(), DEFAULT_MAX_SESSION_AGE);
         session.run().await.unwrap();
         let stream = session.open_stream().await.unwrap();
         gate.block();
@@ -1544,7 +1537,7 @@ pub(crate) mod tests {
     #[tokio::test(start_paused = true)]
     async fn unanswered_v2_heartbeat_closes_silent_session() {
         let (transport, _peer, _gate) = gated_transport();
-        let session = Session::new_client(1, transport, padding(), 1, DEFAULT_MAX_SESSION_AGE);
+        let session = Session::new_client(1, transport, padding(), DEFAULT_MAX_SESSION_AGE);
         session.run().await.unwrap();
         let _stream = session.open_stream().await.unwrap();
         session.peer_version.store(2, std::sync::atomic::Ordering::Release);
@@ -1560,7 +1553,7 @@ pub(crate) mod tests {
     async fn heartbeat_response_timeout_starts_after_frame_is_written() {
         let (transport, mut peer, gate) = gated_transport();
         let padding = Arc::new(RwLock::new(PaddingFactory::new(b"stop=0").unwrap()));
-        let session = Session::new_client(1, transport, padding, 1, DEFAULT_MAX_SESSION_AGE);
+        let session = Session::new_client(1, transport, padding, DEFAULT_MAX_SESSION_AGE);
         session.run().await.unwrap();
         let _stream = session.open_stream().await.unwrap();
         assert_eq!(Frame::read_from(&mut peer).await.unwrap().command, Command::Settings);
@@ -1590,7 +1583,7 @@ pub(crate) mod tests {
     async fn v1_session_does_not_send_proactive_heartbeats() {
         let (local, mut peer) = tokio::io::duplex(128 * 1024);
         let padding = Arc::new(RwLock::new(PaddingFactory::new(b"stop=0").unwrap()));
-        let session = Session::new_client(1, Box::new(local), padding, 1, DEFAULT_MAX_SESSION_AGE);
+        let session = Session::new_client(1, Box::new(local), padding, DEFAULT_MAX_SESSION_AGE);
         session.run().await.unwrap();
         let _stream = session.open_stream().await.unwrap();
         assert_eq!(Frame::read_from(&mut peer).await.unwrap().command, Command::Settings);
@@ -1608,8 +1601,8 @@ pub(crate) mod tests {
     #[tokio::test(start_paused = true)]
     async fn heartbeats_keep_healthy_v2_session_open() {
         let (local, peer) = tokio::io::duplex(128 * 1024);
-        let client = Session::new_client(1, Box::new(local), padding(), 1, DEFAULT_MAX_SESSION_AGE);
-        let server = Session::new_server(2, Box::new(peer), padding(), 1, DEFAULT_MAX_SESSION_AGE);
+        let client = Session::new_client(1, Box::new(local), padding(), DEFAULT_MAX_SESSION_AGE);
+        let server = Session::new_server(2, Box::new(peer), padding(), DEFAULT_MAX_SESSION_AGE);
         client.run().await.unwrap();
         server.run().await.unwrap();
         let _stream = client.open_stream().await.unwrap();
@@ -1658,35 +1651,33 @@ pub(crate) mod tests {
                     acceptor.accept(tcp).await.unwrap()
                 }
             );
-            let client = Session::new_client(1, Box::new(client_io), padding(), 10, DEFAULT_MAX_SESSION_AGE);
-            let server = Session::new_server(2, Box::new(server_io), padding(), 10, DEFAULT_MAX_SESSION_AGE);
+            let client = Session::new_client(1, Box::new(client_io), padding(), DEFAULT_MAX_SESSION_AGE);
+            let server = Session::new_server(2, Box::new(server_io), padding(), DEFAULT_MAX_SESSION_AGE);
             client.run().await.unwrap();
             server.run().await.unwrap();
 
             let mut transfers = JoinSet::new();
-            for _stream_index in 0..10 {
-                let local = Arc::new(client.open_stream().await.unwrap());
-                let remote = Arc::new(server.accept_stream().await.unwrap());
-                for endpoint in [local, remote] {
-                    let writer = Arc::clone(&endpoint);
-                    transfers.spawn(async move {
-                        let data = vec![0xa5; 16 * 1024];
-                        for _chunk in 0..256 {
-                            assert_eq!(writer.write(&data).await.unwrap(), data.len());
-                            tokio::task::yield_now().await;
-                        }
-                    });
-                    transfers.spawn(async move {
-                        let mut remaining = 4 * 1024 * 1024;
-                        let mut data = vec![0; 16 * 1024];
-                        while remaining > 0 {
-                            let size = endpoint.read(&mut data).await.unwrap();
-                            assert!(size > 0 && size <= remaining);
-                            assert!(data[..size].iter().all(|byte| *byte == 0xa5));
-                            remaining -= size;
-                        }
-                    });
-                }
+            let local = Arc::new(client.open_stream().await.unwrap());
+            let remote = Arc::new(server.accept_stream().await.unwrap());
+            for endpoint in [local, remote] {
+                let writer = Arc::clone(&endpoint);
+                transfers.spawn(async move {
+                    let data = vec![0xa5; 16 * 1024];
+                    for _chunk in 0..256 {
+                        assert_eq!(writer.write(&data).await.unwrap(), data.len());
+                        tokio::task::yield_now().await;
+                    }
+                });
+                transfers.spawn(async move {
+                    let mut remaining = 4 * 1024 * 1024;
+                    let mut data = vec![0; 16 * 1024];
+                    while remaining > 0 {
+                        let size = endpoint.read(&mut data).await.unwrap();
+                        assert!(size > 0 && size <= remaining);
+                        assert!(data[..size].iter().all(|byte| *byte == 0xa5));
+                        remaining -= size;
+                    }
+                });
             }
             for _probe in 0..128 {
                 let response = client.heart_response.notified();
@@ -1726,7 +1717,7 @@ pub(crate) mod tests {
     #[tokio::test]
     async fn peer_eof_shuts_down_session_without_receive_error() {
         let (session_io, peer_io) = tokio::io::duplex(128 * 1024);
-        let session = Session::new_client(1, Box::new(session_io), padding(), 1, DEFAULT_MAX_SESSION_AGE);
+        let session = Session::new_client(1, Box::new(session_io), padding(), DEFAULT_MAX_SESSION_AGE);
         session.run().await.unwrap();
 
         drop(peer_io);
@@ -1743,7 +1734,7 @@ pub(crate) mod tests {
     #[tokio::test]
     async fn direct_session_api_rejects_new_streams_after_max_age_and_drains_existing_streams() {
         let (local, _peer) = tokio::io::duplex(128 * 1024);
-        let session = Session::new_client(1, Box::new(local), padding(), 2, Duration::from_millis(30));
+        let session = Session::new_client(1, Box::new(local), padding(), Duration::from_millis(30));
         session.run().await.unwrap();
         let mut existing = session.open_stream().await.unwrap();
         tokio::time::sleep(Duration::from_millis(40)).await;
@@ -1762,9 +1753,26 @@ pub(crate) mod tests {
     }
 
     #[tokio::test]
+    async fn session_rejects_second_active_stream() {
+        let (local, _peer) = tokio::io::duplex(128 * 1024);
+        let session = Session::new_client(1, Box::new(local), padding(), DEFAULT_MAX_SESSION_AGE);
+        session.run().await.unwrap();
+        let mut stream = session.open_stream().await.unwrap();
+
+        let error = match session.open_stream().await {
+            Ok(_) => panic!("a Session must not multiplex concurrent streams"),
+            Err(error) => error,
+        };
+        assert_eq!(error.kind(), std::io::ErrorKind::WouldBlock);
+
+        stream.close().await.unwrap();
+        session.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
     async fn server_rejects_incoming_stream_after_max_age() {
         let (transport, mut peer, _gate) = gated_transport();
-        let session = Session::new_server(1, transport, padding(), 1, Duration::from_millis(1));
+        let session = Session::new_server(1, transport, padding(), Duration::from_millis(1));
         session.received_settings.store(true, std::sync::atomic::Ordering::Release);
         tokio::time::sleep(Duration::from_millis(5)).await;
 
@@ -1782,8 +1790,8 @@ pub(crate) mod tests {
     #[tokio::test]
     async fn exchanges_settings_syn_data_and_synack() {
         let (client_io, server_io) = tokio::io::duplex(128 * 1024);
-        let client = Session::new_client(11, Box::new(client_io), padding(), 2, DEFAULT_MAX_SESSION_AGE);
-        let server = Session::new_server(22, Box::new(server_io), padding(), 2, DEFAULT_MAX_SESSION_AGE);
+        let client = Session::new_client(11, Box::new(client_io), padding(), DEFAULT_MAX_SESSION_AGE);
+        let server = Session::new_server(22, Box::new(server_io), padding(), DEFAULT_MAX_SESSION_AGE);
         client.run().await.unwrap();
         server.run().await.unwrap();
 
@@ -1819,7 +1827,7 @@ pub(crate) mod tests {
     #[tokio::test]
     async fn server_settings_returns_local_session_id_to_legacy_client() {
         let (transport, mut peer, _gate) = gated_transport();
-        let server = Session::new_server(22, transport, padding(), 1, DEFAULT_MAX_SESSION_AGE);
+        let server = Session::new_server(22, transport, padding(), DEFAULT_MAX_SESSION_AGE);
         let mut legacy_settings = HashMap::new();
         legacy_settings.insert("v".to_owned(), "2".to_owned());
         legacy_settings.insert("client".to_owned(), "legacy".to_owned());
@@ -1839,8 +1847,8 @@ pub(crate) mod tests {
     #[tokio::test]
     async fn flushes_syn_without_waiting_for_stream_data() {
         let (client_io, server_io) = tokio::io::duplex(128 * 1024);
-        let client = Session::new_client(1, Box::new(client_io), padding(), 1, DEFAULT_MAX_SESSION_AGE);
-        let server = Session::new_server(1, Box::new(server_io), padding(), 1, DEFAULT_MAX_SESSION_AGE);
+        let client = Session::new_client(1, Box::new(client_io), padding(), DEFAULT_MAX_SESSION_AGE);
+        let server = Session::new_server(1, Box::new(server_io), padding(), DEFAULT_MAX_SESSION_AGE);
         client.run().await.unwrap();
         server.run().await.unwrap();
 
@@ -1857,8 +1865,8 @@ pub(crate) mod tests {
     #[tokio::test]
     async fn drains_large_push_queue_before_fin_eof() {
         let (client_io, server_io) = tokio::io::duplex(128 * 1024);
-        let client = Session::new_client(1, Box::new(client_io), padding(), 1, DEFAULT_MAX_SESSION_AGE);
-        let server = Session::new_server(1, Box::new(server_io), padding(), 1, DEFAULT_MAX_SESSION_AGE);
+        let client = Session::new_client(1, Box::new(client_io), padding(), DEFAULT_MAX_SESSION_AGE);
+        let server = Session::new_server(1, Box::new(server_io), padding(), DEFAULT_MAX_SESSION_AGE);
         client.run().await.unwrap();
         server.run().await.unwrap();
 
@@ -1898,7 +1906,7 @@ pub(crate) mod tests {
     async fn slow_inbound_stream_is_closed_without_closing_session() {
         let (transport, mut peer, _gate) = gated_transport();
         let padding = Arc::new(RwLock::new(PaddingFactory::new(b"stop=0").unwrap()));
-        let session = Session::new_client(1, transport, padding, 1, DEFAULT_MAX_SESSION_AGE);
+        let session = Session::new_client(1, transport, padding, DEFAULT_MAX_SESSION_AGE);
         session.run().await.unwrap();
         let stream = session.open_stream().await.unwrap();
         assert_eq!(Frame::read_from(&mut peer).await.unwrap().command, Command::Settings);
@@ -1930,15 +1938,22 @@ pub(crate) mod tests {
 
         assert!(received_fin, "overloaded stream should be closed with FIN");
         assert!(!session.is_closed(), "one slow stream should not close the session");
-        assert!(!session.streams.lock().await.contains_key(&stream.id()));
+        assert!(
+            session
+                .streams
+                .lock()
+                .await
+                .as_ref()
+                .is_none_or(|(active_id, _)| *active_id != stream.id())
+        );
         session.shutdown().await.unwrap();
     }
 
     #[tokio::test]
     async fn shutdown_drains_streams_after_session_closed() {
         let (client_io, server_io) = tokio::io::duplex(128 * 1024);
-        let client = Session::new_client(1, Box::new(client_io), padding(), 1, DEFAULT_MAX_SESSION_AGE);
-        let server = Session::new_server(1, Box::new(server_io), padding(), 1, DEFAULT_MAX_SESSION_AGE);
+        let client = Session::new_client(1, Box::new(client_io), padding(), DEFAULT_MAX_SESSION_AGE);
+        let server = Session::new_server(1, Box::new(server_io), padding(), DEFAULT_MAX_SESSION_AGE);
         client.run().await.unwrap();
         server.run().await.unwrap();
 
@@ -1947,7 +1962,7 @@ pub(crate) mod tests {
         client.closed.store(true, std::sync::atomic::Ordering::Release);
         client.shutdown().await.unwrap();
 
-        assert!(client.streams.lock().await.is_empty());
+        assert!(client.streams.lock().await.is_none());
         let mut data = [0u8; 1];
         assert_eq!(
             tokio::time::timeout(Duration::from_secs(1), client_stream.read(&mut data))
@@ -1963,8 +1978,8 @@ pub(crate) mod tests {
     #[tokio::test]
     async fn dropping_stream_releases_session_stream() {
         let (client_io, server_io) = tokio::io::duplex(128 * 1024);
-        let client = Session::new_client(1, Box::new(client_io), padding(), 1, DEFAULT_MAX_SESSION_AGE);
-        let server = Session::new_server(1, Box::new(server_io), padding(), 1, DEFAULT_MAX_SESSION_AGE);
+        let client = Session::new_client(1, Box::new(client_io), padding(), DEFAULT_MAX_SESSION_AGE);
+        let server = Session::new_server(1, Box::new(server_io), padding(), DEFAULT_MAX_SESSION_AGE);
         client.run().await.unwrap();
         server.run().await.unwrap();
 
@@ -1974,7 +1989,7 @@ pub(crate) mod tests {
         drop(client_stream);
 
         tokio::time::timeout(Duration::from_secs(1), async {
-            while !client.streams.lock().await.is_empty() {
+            while client.streams.lock().await.is_some() {
                 tokio::task::yield_now().await;
             }
         })
@@ -1988,8 +2003,8 @@ pub(crate) mod tests {
     #[tokio::test]
     async fn open_stream_fails_after_shutdown() {
         let (client_io, server_io) = tokio::io::duplex(128 * 1024);
-        let client = Session::new_client(1, Box::new(client_io), padding(), 1, DEFAULT_MAX_SESSION_AGE);
-        let server = Session::new_server(1, Box::new(server_io), padding(), 1, DEFAULT_MAX_SESSION_AGE);
+        let client = Session::new_client(1, Box::new(client_io), padding(), DEFAULT_MAX_SESSION_AGE);
+        let server = Session::new_server(1, Box::new(server_io), padding(), DEFAULT_MAX_SESSION_AGE);
         client.run().await.unwrap();
         server.run().await.unwrap();
 
@@ -1999,7 +2014,7 @@ pub(crate) mod tests {
         if let Err(err) = &err {
             assert_eq!(err.kind(), std::io::ErrorKind::BrokenPipe);
         }
-        assert!(client.streams.lock().await.is_empty());
+        assert!(client.streams.lock().await.is_none());
 
         let _ = server.shutdown().await;
     }

@@ -13,7 +13,7 @@ making it harder to detect and block.
 ## Features
 
 - AnyTLS sessions run over TLS and authenticate with a password.
-- The client multiplexes logical streams over reusable sessions and accepts SOCKS5 and HTTP CONNECT traffic on one local listener.
+- The client uses one Session per active logical stream, reuses idle Sessions, and accepts SOCKS5 and HTTP CONNECT traffic on one local listener.
 - UDP-over-TCP protocol v2 framing is supported.
 - Configurable padding schemes control early TLS record payload sizes; the server can update the client's scheme.
 - The server supports custom TLS certificates, SNI probe handling, and optional HTTP(S) forwarding for unauthenticated probes.
@@ -96,7 +96,6 @@ See [URI Format](./docs/uri_scheme.md) for escaping, IPv6, and more examples.
 - `    --insecure [true|false]`: Skip normal server certificate verification. Prefer a trusted certificate or `--root-cert` when possible.
 - `    --client-id UUID`: Client UUID for panel-managed access.
 - `    --padding-scheme FILE`: Load a custom padding scheme.
-- `-m, --max-streams-per-session N`: Maximum logical streams per session [default: `16`]. Set to `1` to disable multiplexing.
 - `    --print-url`: Print the equivalent AnyTLS URI and exit.
 - `    --log LEVEL`: Log level (`off`, `error`, `warn`, `info`, `debug`, `trace`) [default: `info`].
 
@@ -109,7 +108,6 @@ See [URI Format](./docs/uri_scheme.md) for escaping, IPv6, and more examples.
 - `    --forward URL`: Forward unauthenticated TLS probes to an `http://` or `https://` target.
   Without it, matching SNI probes may be relayed to the SNI host on port 443.
 - `    --padding-scheme FILE`: Load the server's padding scheme.
-- `-m, --max-streams-per-session N`: Maximum logical streams per authenticated session [default: `1024`].
 - `    --panel-webapi-url URL`, `--panel-webapi-token TOKEN`, `--panel-node-id ID`: Enable panel synchronization; all three are required together.
 - `    --panel-update-interval-secs SECS`: Panel update interval [default: `10`; minimum: `5`].
 - `    --print-args`: Print server arguments with the detected public IP and exit.
