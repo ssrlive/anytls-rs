@@ -224,6 +224,29 @@ mod tests {
     use crate::{DEFAULT_MAX_SESSION_AGE, DEFAULT_SCHEME};
     use std::sync::atomic::Ordering;
 
+    async fn close_stream_cleanly(stream: &mut Stream, server: &Arc<Session>) {
+        let server_stream = server.accept_stream().await.unwrap();
+        server_stream.shutdown_write_by_send_fin_to_remote().await.unwrap();
+        let mut buffer = [0u8; 1];
+        tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                if stream.read(&mut buffer).await.unwrap() == 0 {
+                    break;
+                }
+            }
+        })
+        .await
+        .expect("client should observe the server FIN and drain it");
+        stream.close().await.unwrap();
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while !server.is_idle().await {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("server should remove the stream after both FINs");
+    }
+
     #[tokio::test]
     async fn blocked_syn_does_not_block_independent_session_creation() {
         let gates = Arc::new(std::sync::Mutex::new(Vec::new()));
@@ -261,8 +284,8 @@ mod tests {
         let healthy = client.create_stream().await.unwrap();
         assert_ne!(first.session_id(), second.session_id());
         assert_ne!(second.session_id(), healthy.session_id());
-        first.close().await.unwrap();
-        tokio::task::yield_now().await;
+        let first_server = Arc::clone(&servers.lock().await[0]);
+        close_stream_cleanly(&mut first, &first_server).await;
         let gate = Arc::clone(&gates.lock().unwrap()[0]);
         gate.block();
         let blocked = tokio::spawn({
@@ -332,8 +355,15 @@ mod tests {
             async move { client.create_stream().await }
         });
         tokio::time::timeout(Duration::from_secs(1), dial_started.notified()).await.unwrap();
-        first.close().await.unwrap();
-        tokio::task::yield_now().await;
+        let first_server = Arc::clone(&servers.lock().await[0]);
+        close_stream_cleanly(&mut first, &first_server).await;
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while client.idle_pool.lock().await.is_empty() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("fully closed session should be available while another dial stalls");
         let reused = tokio::time::timeout(Duration::from_secs(1), client.create_stream())
             .await
             .unwrap()
@@ -467,17 +497,78 @@ mod tests {
         let mut second = client.create_stream().await.unwrap();
         assert_ne!(session.id(), second.session_id());
         assert_eq!(dial_count.load(Ordering::Relaxed), 2);
-        first.close().await.unwrap();
-        tokio::task::yield_now().await;
+        let first_server = Arc::clone(&server_sessions.lock().await[0]);
+        close_stream_cleanly(&mut first, &first_server).await;
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while client.idle_pool.lock().await.len() != 1 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("fully closed session should enter the idle pool");
         assert_eq!(client.idle_pool.lock().await.len(), 1);
         let mut third = client.create_stream().await.unwrap();
         assert_eq!(session.id(), third.session_id());
         assert_eq!(dial_count.load(Ordering::Relaxed), 2);
-        second.close().await.unwrap();
-        third.close().await.unwrap();
-        tokio::task::yield_now().await;
+        let second_server = Arc::clone(&server_sessions.lock().await[1]);
+        close_stream_cleanly(&mut second, &second_server).await;
+        close_stream_cleanly(&mut third, &first_server).await;
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while client.idle_pool.lock().await.len() != 2 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("both fully closed sessions should enter the idle pool");
 
         assert_eq!(client.idle_pool.lock().await.len(), 2);
+        for server in server_sessions.lock().await.drain(..) {
+            let _ = server.shutdown().await;
+        }
+    }
+
+    #[tokio::test]
+    async fn does_not_reuse_session_until_peer_stream_finishes() {
+        let dial_count = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let server_sessions = Arc::new(Mutex::new(Vec::new()));
+        let dial_count_for_dialer = Arc::clone(&dial_count);
+        let servers_for_dialer = Arc::clone(&server_sessions);
+        let dialer: Dialer = Arc::new(move || {
+            let sequence = dial_count_for_dialer.fetch_add(1, Ordering::Relaxed);
+            let servers = Arc::clone(&servers_for_dialer);
+            Box::pin(async move {
+                let (client_io, server_io) = tokio::io::duplex(128 * 1024);
+                let server = Session::new_server(
+                    sequence,
+                    Box::new(server_io),
+                    Arc::new(RwLock::new(PaddingFactory::new(DEFAULT_SCHEME).unwrap())),
+                    DEFAULT_MAX_SESSION_AGE,
+                );
+                server.run().await?;
+                servers.lock().await.push(server);
+                Ok(Box::new(client_io) as BoxTransport)
+            })
+        });
+        let client = Client::new(
+            dialer,
+            Arc::new(RwLock::new(PaddingFactory::new(DEFAULT_SCHEME).unwrap())),
+            Duration::from_secs(60),
+            Duration::from_secs(60 * 60),
+        );
+
+        let mut first = client.create_stream().await.unwrap();
+        let first_session = first.session().unwrap();
+        let first_server = Arc::clone(&server_sessions.lock().await[0]);
+        let _server_stream = first_server.accept_stream().await.unwrap();
+        first.close().await.unwrap();
+        assert!(!first_session.is_closed(), "session should stay open while the peer stream drains");
+        assert!(!first_session.is_idle().await, "stream slot must stay reserved until peer FIN");
+
+        let second = client.create_stream().await.unwrap();
+        assert_ne!(first_session.id(), second.session_id());
+        assert_eq!(dial_count.load(Ordering::Relaxed), 2);
+
+        client.shutdown().await.unwrap();
         for server in server_sessions.lock().await.drain(..) {
             let _ = server.shutdown().await;
         }
@@ -513,7 +604,8 @@ mod tests {
         let active_session = active_stream.session().unwrap();
         let mut idle_stream = client.create_stream().await.unwrap();
         let idle_session = idle_stream.session().unwrap();
-        idle_stream.close().await.unwrap();
+        let idle_server = Arc::clone(&server_sessions.lock().await[1]);
+        close_stream_cleanly(&mut idle_stream, &idle_server).await;
         tokio::time::timeout(Duration::from_secs(1), async {
             while client.idle_pool.lock().await.is_empty() {
                 tokio::task::yield_now().await;
@@ -670,18 +762,16 @@ mod tests {
 
         assert_eq!(streams.len(), 100);
         assert_eq!(dial_count.load(Ordering::Relaxed), 100);
+        let sessions = streams.iter().map(|stream| stream.session().unwrap()).collect::<Vec<_>>();
         drop(streams);
+        client.shutdown().await.unwrap();
         tokio::time::timeout(Duration::from_secs(1), async {
-            loop {
-                if client.idle_pool.lock().await.len() == MAX_IDLE_SESSIONS {
-                    break;
-                }
+            while sessions.iter().any(|session| !session.is_closed()) {
                 tokio::task::yield_now().await;
             }
         })
         .await
-        .expect("idle pool should retain only the configured cap");
-        assert_eq!(client.idle_pool.lock().await.len(), MAX_IDLE_SESSIONS);
+        .expect("client shutdown should close all sessions with dropped streams");
         for server in server_sessions.lock().await.drain(..) {
             let _ = server.shutdown().await;
         }

@@ -19,6 +19,7 @@ const WRITE_TIMEOUT: Duration = Duration::from_secs(15);
 const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(15);
 const HEARTBEAT_QUEUE_TIMEOUT: Duration = Duration::from_secs(15);
 const HEARTBEAT_TIMEOUT: Duration = Duration::from_secs(10);
+const STREAM_CLOSE_TIMEOUT: Duration = Duration::from_secs(15);
 const INBOUND_PUSH_QUEUE_BYTES: usize = 1024 * 1024;
 const INBOUND_PUSH_QUEUE_MESSAGES: usize = 64;
 pub const DEFAULT_MAX_SESSION_AGE: Duration = Duration::from_secs(60 * 60);
@@ -638,7 +639,7 @@ impl Session {
             return Ok(());
         }
         let result = self.send_fin_by_id(stream_id).await;
-        self.remove_stream_by_id(stream_id).await;
+        self.finish_or_retire_stream(stream_id, result.is_ok()).await;
         if let Err(error) = result
             && error.kind() != std::io::ErrorKind::BrokenPipe
         {
@@ -842,12 +843,15 @@ impl Session {
                 Command::Settings => self.on_receive_settings(&frame.data).await?,
                 Command::SynAck => {
                     if !frame.data.is_empty() {
-                        self.remove_stream_by_id(stream_id).await;
                         let i = String::from_utf8_lossy(&frame.data);
                         let peer = self.peer_session_id();
                         log::warn!(
                             "{mn} -- Session {session_id} peer={peer:?} stream {stream_id} received SynAck with unexpected data: {i}",
                         );
+                        if self.is_client {
+                            let _ = self.shutdown().await;
+                        }
+                        self.remove_stream_by_id(stream_id).await;
                     }
                     // TODO: Handle additional SynAck logic if necessary
                 }
@@ -992,6 +996,38 @@ impl Session {
         }
     }
 
+    async fn finish_or_retire_stream(self: &Arc<Self>, stream_id: u32, fin_sent: bool) {
+        if !self.is_client {
+            self.remove_stream_by_id(stream_id).await;
+            return;
+        }
+        if !fin_sent || self.is_expired() {
+            let _ = self.shutdown().await;
+            return;
+        }
+
+        let session = Arc::downgrade(self);
+        tokio::spawn(async move {
+            tokio::time::sleep(STREAM_CLOSE_TIMEOUT).await;
+            let Some(session) = session.upgrade() else {
+                return;
+            };
+            let still_active = session
+                .streams
+                .lock()
+                .await
+                .as_ref()
+                .is_some_and(|(active_id, _)| *active_id == stream_id);
+            if still_active {
+                let mn = method_name_unstable!();
+                let peer = session.peer_session_id();
+                let id = session.id();
+                log::warn!("{mn} -- Session {id} peer={peer:?} stream {stream_id} close handshake timed out; closing session");
+                let _ = session.shutdown().await;
+            }
+        });
+    }
+
     async fn helper_drop_stream_by_id(self: &Arc<Self>, stream_id: u32) {
         let session_id = self.id();
         let should_send_fin = {
@@ -1004,12 +1040,17 @@ impl Session {
                 Some(_) | None => false,
             }
         };
-        if should_send_fin && let Err(error) = self.enqueue_fin(stream_id).await {
+        let fin_result = if should_send_fin {
+            self.enqueue_fin(stream_id).await
+        } else {
+            Ok(())
+        };
+        if let Err(error) = &fin_result {
             let mn = method_name_unstable!();
             let psid = self.peer_session_id();
             log::warn!("{mn} -- Session {session_id} peer={psid:?} failed to send FIN for stream {stream_id}: {error}");
         }
-        self.remove_stream_by_id(stream_id).await;
+        self.finish_or_retire_stream(stream_id, fin_result.is_ok()).await;
     }
 
     /// Finish the stream state identified by `stream_id` by removing it from the container of active stream states and dropping its resources.
@@ -1025,10 +1066,11 @@ impl Session {
             } else {
                 None
             };
-            if let Some((_, entry)) = removed {
-                entry.close_token.cancel();
-                log::trace!("{mn} -- Session {session_id} peer={psid:?} removed stream {stream_id}");
-            }
+            let Some((_, entry)) = removed else {
+                return;
+            };
+            entry.close_token.cancel();
+            log::trace!("{mn} -- Session {session_id} peer={psid:?} removed stream {stream_id}");
             active.is_none()
         };
 
@@ -1985,8 +2027,9 @@ pub(crate) mod tests {
 
         let client_stream = client.open_stream().await.unwrap();
         client_stream.write(b"x").await.unwrap();
-        let _server_stream = server.accept_stream().await.unwrap();
+        let server_stream = server.accept_stream().await.unwrap();
         drop(client_stream);
+        server_stream.shutdown_write_by_send_fin_to_remote().await.unwrap();
 
         tokio::time::timeout(Duration::from_secs(1), async {
             while client.streams.lock().await.is_some() {
