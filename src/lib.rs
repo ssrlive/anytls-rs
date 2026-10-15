@@ -24,7 +24,7 @@ mod uot;
 mod url_util;
 
 #[cfg(feature = "uot")]
-pub use ::socks5_impl::protocol::{Address, ProxyParameters};
+pub use ::socks5_impl::{Address, ProxyParameters};
 #[cfg(feature = "client")]
 pub use cli::ClientArgs;
 #[cfg(feature = "server")]

@@ -14,7 +14,7 @@ use rustls::{
     ClientConfig, RootCertStore, ServerConfig,
     pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer},
 };
-use socks5_impl::protocol::{Address, AsyncStreamOperation};
+use socks5_impl::{Address, AsyncStreamOperation};
 use std::{
     collections::HashSet,
     net::SocketAddr,
