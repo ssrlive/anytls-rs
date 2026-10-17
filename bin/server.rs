@@ -167,6 +167,7 @@ async fn run_server(cancel_token: CancellationToken) -> std::io::Result<()> {
                     }
                     Err(error) => break Err(error),
                 };
+                let _ = tcp.set_nodelay(true);
                 session_id = session_id.wrapping_add(1);
                 let tls_state = tls_state_rx.borrow().clone();
                 let padding = padding.clone();
@@ -404,7 +405,10 @@ async fn relay_stream(
     .await
     .unwrap_or_else(|_| Err(Error::new(TimedOut, format!("proxy target connection to {destination} timed out"))));
     let outbound = match connected {
-        Ok(outbound) => outbound,
+        Ok(outbound) => {
+            let _ = outbound.set_nodelay(true);
+            outbound
+        }
         Err(error) => {
             let _ = stream_io.handshake_failure(&error.to_string()).await;
             return Err(error);
