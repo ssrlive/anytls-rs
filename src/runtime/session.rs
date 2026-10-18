@@ -187,6 +187,7 @@ pub struct Session {
     streams: Mutex<HashMap<u32, StreamState>>,
     /// Indicates whether the session has been closed.
     closed: Arc<std::sync::atomic::AtomicBool>,
+    poolable: std::sync::atomic::AtomicBool,
     is_client: bool,
     peer_session_id: std::sync::RwLock<Option<usize>>,
     peer_version: std::sync::atomic::AtomicU8,
@@ -268,6 +269,7 @@ impl Session {
             data_sender,
             streams: Mutex::new(HashMap::new()),
             closed,
+            poolable: std::sync::atomic::AtomicBool::new(true),
             is_client,
             peer_session_id: std::sync::RwLock::new(None),
             peer_version: std::sync::atomic::AtomicU8::new(0),
@@ -432,7 +434,7 @@ impl Session {
 
     #[inline]
     pub async fn has_stream_capacity(&self) -> bool {
-        self.streams.lock().await.len() < self.max_streams
+        self.poolable.load(std::sync::atomic::Ordering::Acquire) && self.streams.lock().await.len() < self.max_streams
     }
 
     pub(crate) async fn is_idle(&self) -> bool {
@@ -610,6 +612,9 @@ impl Session {
         if self.is_closed() {
             return Err(Error::new(BrokenPipe, format!("session {session_id} closed")));
         }
+        if !self.poolable.load(std::sync::atomic::Ordering::Acquire) {
+            return Err(Error::new(BrokenPipe, format!("session {session_id} is retiring")));
+        }
         let id = allocate_stream_id(&NEXT_STREAM_ID);
         let (local, remote) = tokio::io::duplex(64 * 1024);
 
@@ -618,6 +623,9 @@ impl Session {
             // Re-check under the streams lock so we cannot insert after shutdown drained.
             if self.is_closed() {
                 return Err(Error::new(BrokenPipe, format!("session {session_id} closed")));
+            }
+            if !self.poolable.load(std::sync::atomic::Ordering::Acquire) {
+                return Err(Error::new(BrokenPipe, format!("session {session_id} is retiring")));
             }
             if self.is_expired() {
                 return Err(Error::new(TimedOut, format!("session {session_id} reached its maximum age")));
@@ -639,10 +647,12 @@ impl Session {
         let session_id = self.id();
         let stream_id = stream.id();
         if let Err(error) = self.enqueue_frame(Frame::new(Command::Syn, stream_id), true).await {
+            self.poolable.store(false, std::sync::atomic::Ordering::Release);
             self.remove_stream_by_id(stream_id).await;
             return Err(error);
         }
         if self.is_closed() {
+            self.poolable.store(false, std::sync::atomic::Ordering::Release);
             self.remove_stream_by_id(stream_id).await;
             return Err(Error::new(BrokenPipe, format!("session {session_id} closed")));
         }
@@ -693,7 +703,7 @@ impl Session {
             return Ok(());
         }
         let result = self.send_fin_by_id(stream_id).await;
-        self.remove_stream_by_id(stream_id).await;
+        self.finish_or_retire_stream(stream_id, result.is_ok()).await;
         if let Err(error) = result
             && error.kind() != std::io::ErrorKind::BrokenPipe
         {
@@ -889,7 +899,10 @@ impl Session {
                                         "{mn} -- Session {session_id} peer={psid:?} stream {stream_id} push worker closed: {error}"
                                     );
                                     if !self.is_closed() {
-                                        self.queue_control(Frame::new(Command::Fin, stream_id))?;
+                                        if self.is_client {
+                                            self.poolable.store(false, std::sync::atomic::Ordering::Release);
+                                        }
+                                        self.enqueue_fin(stream_id).await?;
                                         self.remove_stream_by_id(stream_id).await;
                                     }
                                 }
@@ -898,7 +911,10 @@ impl Session {
                                 log::warn!(
                                     "{mn} -- Session {session_id} peer={psid:?} stream {stream_id} inbound PUSH limit reached; closing stream"
                                 );
-                                self.queue_control(Frame::new(Command::Fin, stream_id))?;
+                                if self.is_client {
+                                    self.poolable.store(false, std::sync::atomic::Ordering::Release);
+                                }
+                                self.enqueue_fin(stream_id).await?;
                                 self.remove_stream_by_id(stream_id).await;
                             }
                         }
@@ -910,12 +926,16 @@ impl Session {
                 Command::Settings => self.on_receive_settings(&frame.data).await?,
                 Command::SynAck => {
                     if !frame.data.is_empty() {
-                        self.remove_stream_by_id(stream_id).await;
                         let i = String::from_utf8_lossy(&frame.data);
                         let peer = self.peer_session_id();
                         log::warn!(
                             "{mn} -- Session {session_id} peer={peer:?} stream {stream_id} received SynAck with unexpected data: {i}",
                         );
+                        if self.is_client {
+                            let _ = self.shutdown().await;
+                        } else {
+                            self.remove_stream_by_id(stream_id).await;
+                        }
                     }
                     // TODO: Handle additional SynAck logic if necessary
                 }
@@ -1053,6 +1073,37 @@ impl Session {
         }
     }
 
+    async fn finish_or_retire_stream(self: &Arc<Self>, stream_id: u32, fin_sent: bool) {
+        if !self.is_client {
+            self.remove_stream_by_id(stream_id).await;
+            return;
+        }
+        if !fin_sent {
+            self.poolable.store(false, std::sync::atomic::Ordering::Release);
+            let _ = self.shutdown().await;
+            return;
+        }
+        if self.is_expired() {
+            self.poolable.store(false, std::sync::atomic::Ordering::Release);
+        }
+
+        let session = Arc::downgrade(self);
+        tokio::spawn(async move {
+            tokio::time::sleep(STREAM_CLOSE_TIMEOUT).await;
+            let Some(session) = session.upgrade() else {
+                return;
+            };
+            let still_active = session.streams.lock().await.contains_key(&stream_id);
+            if still_active {
+                let mn = method_name_unstable!();
+                let peer = session.peer_session_id();
+                let id = session.id();
+                log::warn!("{mn} -- Session {id} peer={peer:?} stream {stream_id} close handshake timed out; closing session");
+                let _ = session.shutdown().await;
+            }
+        });
+    }
+
     async fn helper_drop_stream_by_id(self: &Arc<Self>, stream_id: u32) {
         let session_id = self.id();
         let should_send_fin = {
@@ -1065,12 +1116,18 @@ impl Session {
                 Some(_) | None => false,
             }
         };
-        if should_send_fin && let Err(error) = self.enqueue_fin(stream_id).await {
+        let fin_result = if should_send_fin {
+            self.enqueue_fin(stream_id).await
+        } else {
+            Ok(())
+        };
+        if let Err(error) = &fin_result {
             let mn = method_name_unstable!();
             let psid = self.peer_session_id();
             log::warn!("{mn} -- Session {session_id} peer={psid:?} failed to send FIN for stream {stream_id}: {error}");
         }
-        self.remove_stream_by_id(stream_id).await;
+        self.finish_stream_if_closed(stream_id).await;
+        self.finish_or_retire_stream(stream_id, fin_result.is_ok()).await;
     }
 
     /// Finish the stream state identified by `stream_id` by removing it from the container of active stream states and dropping its resources.
@@ -1091,8 +1148,8 @@ impl Session {
         };
 
         if became_idle {
-            if self.is_expired() {
-                log::debug!("{mn} -- Session {session_id} peer={psid:?} expired session drained; shutting it down");
+            if self.is_expired() || !self.poolable.load(std::sync::atomic::Ordering::Acquire) {
+                log::debug!("{mn} -- Session {session_id} peer={psid:?} expired or non-reusable session drained; shutting it down");
                 let _ = self.shutdown().await;
                 return;
             }
@@ -1533,6 +1590,56 @@ pub(crate) mod tests {
     }
 
     #[tokio::test]
+    async fn server_fin_does_not_overtake_queued_data_frames() {
+        let (transport, mut peer, gate) = gated_transport();
+        let session = Session::new_server(
+            1,
+            transport,
+            Arc::new(RwLock::new(PaddingFactory::new(b"stop=0").unwrap())),
+            1,
+            DEFAULT_MAX_SESSION_AGE,
+        );
+
+        let mut first_data = Frame::new(Command::Push, 1);
+        first_data.data = b"first".to_vec();
+        gate.block();
+        let first_session = Arc::clone(&session);
+        let first_write = tokio::spawn(async move { first_session.enqueue_bytes(first_data.encode().unwrap(), false).await });
+        gate.wait_pending().await;
+
+        let mut second_data = Frame::new(Command::Push, 1);
+        second_data.data = b"second".to_vec();
+        let second_session = Arc::clone(&session);
+        let second_write = tokio::spawn(async move { second_session.enqueue_bytes(second_data.encode().unwrap(), false).await });
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while session.data_sender.capacity() != 63 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("second data frame should be queued behind the blocked write");
+
+        let fin_session = Arc::clone(&session);
+        let fin_write = tokio::spawn(async move { fin_session.enqueue_fin(1).await });
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while session.data_sender.capacity() != 62 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("FIN should be queued behind the second data frame");
+
+        gate.release();
+        assert_eq!(Frame::read_from(&mut peer).await.unwrap().data, b"first");
+        assert_eq!(Frame::read_from(&mut peer).await.unwrap().data, b"second");
+        assert_eq!(Frame::read_from(&mut peer).await.unwrap().command, Command::Fin);
+        first_write.await.unwrap().unwrap();
+        second_write.await.unwrap().unwrap();
+        fin_write.await.unwrap().unwrap();
+        session.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
     async fn blocked_heart_response_does_not_block_inbound_data() {
         let (transport, mut peer, gate) = gated_transport();
         let session = Session::new_client(1, transport, padding(), 1, DEFAULT_MAX_SESSION_AGE);
@@ -1795,10 +1902,12 @@ pub(crate) mod tests {
 
     #[tokio::test]
     async fn direct_session_api_rejects_new_streams_after_max_age_and_drains_existing_streams() {
-        let (local, _peer) = tokio::io::duplex(128 * 1024);
+        let (local, mut peer) = tokio::io::duplex(128 * 1024);
         let session = Session::new_client(1, Box::new(local), padding(), 2, Duration::from_millis(30));
         session.run().await.unwrap();
         let mut existing = session.open_stream().await.unwrap();
+        assert_eq!(Frame::read_from(&mut peer).await.unwrap().command, Command::Settings);
+        assert_eq!(Frame::read_from(&mut peer).await.unwrap().command, Command::Syn);
         tokio::time::sleep(Duration::from_millis(40)).await;
 
         let error = match session.open_stream().await {
@@ -1809,6 +1918,15 @@ pub(crate) mod tests {
         assert!(!session.is_closed(), "existing streams should be allowed to drain");
 
         existing.close().await.unwrap();
+        loop {
+            let frame = Frame::read_from(&mut peer).await.unwrap();
+            if frame.command == Command::Fin {
+                peer.write_all(&Frame::new(Command::Fin, existing.id()).encode().unwrap())
+                    .await
+                    .unwrap();
+                break;
+            }
+        }
         tokio::time::timeout(Duration::from_secs(1), session.close_token.cancelled())
             .await
             .expect("expired session should close after its final stream drains");
@@ -1948,7 +2066,7 @@ pub(crate) mod tests {
     }
 
     #[tokio::test]
-    async fn local_stream_close_drains_queued_tail_after_releasing_stream() {
+    async fn local_stream_waits_for_peer_fin_before_removal() {
         let (client_io, mut peer) = tokio::io::duplex(512 * 1024);
         let client = Session::new_client(1, Box::new(client_io), padding(), 2, DEFAULT_MAX_SESSION_AGE);
         client.run().await.unwrap();
@@ -1973,7 +2091,17 @@ pub(crate) mod tests {
         }
 
         client_stream.close().await.unwrap();
-        assert!(!client.streams.lock().await.contains_key(&client_stream.id()));
+        assert!(client.streams.lock().await.contains_key(&client_stream.id()));
+        loop {
+            let frame = Frame::read_from(&mut peer).await.unwrap();
+            if frame.command == Command::Fin {
+                assert_eq!(frame.stream_id, client_stream.id());
+                break;
+            }
+        }
+        peer.write_all(&Frame::new(Command::Fin, client_stream.id()).encode().unwrap())
+            .await
+            .unwrap();
 
         let mut received = Vec::with_capacity(expected.len());
         let mut buffer = [0u8; 8192];
@@ -1989,7 +2117,37 @@ pub(crate) mod tests {
         }
 
         assert_eq!(received, expected);
+        assert!(!client.streams.lock().await.contains_key(&client_stream.id()));
         let _ = client.shutdown().await;
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn missing_peer_fin_retires_client_session_after_timeout() {
+        let (client_io, mut peer) = tokio::io::duplex(128 * 1024);
+        let client = Session::new_client(1, Box::new(client_io), padding(), 1, DEFAULT_MAX_SESSION_AGE);
+        client.run().await.unwrap();
+        let mut stream = client.open_stream().await.unwrap();
+        assert_eq!(Frame::read_from(&mut peer).await.unwrap().command, Command::Settings);
+        assert_eq!(Frame::read_from(&mut peer).await.unwrap().command, Command::Syn);
+
+        stream.close().await.unwrap();
+        loop {
+            let frame = Frame::read_from(&mut peer).await.unwrap();
+            if frame.command == Command::Fin {
+                break;
+            }
+        }
+        assert!(!client.is_closed());
+        assert!(client.streams.lock().await.contains_key(&stream.id()));
+
+        for _turn in 0..10 {
+            tokio::task::yield_now().await;
+        }
+        tokio::time::advance(STREAM_CLOSE_TIMEOUT).await;
+        for _turn in 0..10 {
+            tokio::task::yield_now().await;
+        }
+        assert!(client.is_closed(), "missing peer FIN should retire the client session");
     }
 
     #[tokio::test]
@@ -2099,7 +2257,7 @@ pub(crate) mod tests {
     }
 
     #[tokio::test]
-    async fn slow_inbound_stream_is_closed_without_closing_session() {
+    async fn slow_inbound_stream_retires_session_without_peer_fin() {
         let (transport, mut peer, _gate) = gated_transport();
         let padding = Arc::new(RwLock::new(PaddingFactory::new(b"stop=0").unwrap()));
         let session = Session::new_client(1, transport, padding, 1, DEFAULT_MAX_SESSION_AGE);
@@ -2118,24 +2276,11 @@ pub(crate) mod tests {
             .await
             .unwrap();
 
-        let mut received_fin = false;
-        loop {
-            let frame = tokio::time::timeout(Duration::from_secs(1), Frame::read_from(&mut peer))
-                .await
-                .expect("session should keep processing control frames")
-                .unwrap();
-            if frame.command == Command::Fin && frame.stream_id == stream.id() {
-                received_fin = true;
-            }
-            if frame.command == Command::HeartResponse {
-                break;
-            }
-        }
-
-        assert!(received_fin, "overloaded stream should be closed with FIN");
-        assert!(!session.is_closed(), "one slow stream should not close the session");
+        tokio::time::timeout(Duration::from_secs(1), session.close_token.cancelled())
+            .await
+            .expect("session with an unconfirmed overflowed stream should be retired");
+        assert!(session.is_closed());
         assert!(!session.streams.lock().await.contains_key(&stream.id()));
-        session.shutdown().await.unwrap();
     }
 
     #[tokio::test]
@@ -2174,7 +2319,13 @@ pub(crate) mod tests {
 
         let client_stream = client.open_stream().await.unwrap();
         client_stream.write(b"x").await.unwrap();
-        let _server_stream = server.accept_stream().await.unwrap();
+        let mut server_stream = server.accept_stream().await.unwrap();
+        let server_close = tokio::spawn(async move {
+            let mut buffer = [0u8; 1];
+            while server_stream.read(&mut buffer).await.unwrap() > 0 {}
+            server_stream.shutdown_write_by_send_fin_to_remote().await.unwrap();
+            server_stream.close().await.unwrap();
+        });
         drop(client_stream);
 
         tokio::time::timeout(Duration::from_secs(1), async {
@@ -2184,6 +2335,7 @@ pub(crate) mod tests {
         })
         .await
         .expect("dropped stream should be released");
+        server_close.await.unwrap();
 
         let _ = server.shutdown().await;
         let _ = client.shutdown().await;

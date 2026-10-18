@@ -274,8 +274,127 @@ impl Client {
 mod tests {
     use super::*;
     use crate::runtime::session::tests::gated_transport;
-    use crate::{DEFAULT_MAX_SESSION_AGE, DEFAULT_SCHEME};
+    use crate::{Command, DEFAULT_MAX_SESSION_AGE, DEFAULT_SCHEME, Frame};
     use std::sync::atomic::Ordering;
+    use tokio::io::AsyncWriteExt;
+
+    fn spawn_fin_responder(server: Arc<Session>) {
+        tokio::spawn(async move {
+            while let Ok(mut stream) = server.accept_stream().await {
+                tokio::spawn(async move {
+                    let mut buffer = [0u8; 8192];
+                    loop {
+                        match stream.read(&mut buffer).await {
+                            Ok(0) | Err(_) => break,
+                            Ok(_) => {}
+                        }
+                    }
+                    let _ = stream.shutdown_write_by_send_fin_to_remote().await;
+                    let _ = stream.close().await;
+                });
+            }
+        });
+    }
+
+    async fn wait_for_session_capacity(session: &Arc<Session>) {
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while !session.has_stream_capacity().await {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("peer FIN should release the stream slot");
+    }
+
+    #[tokio::test]
+    async fn client_does_not_pool_session_until_peer_fin_arrives() {
+        let (peer_sender, mut peer_receiver) = mpsc::unbounded_channel::<tokio::io::DuplexStream>();
+        let dialer: Dialer = Arc::new(move || {
+            let peer_sender = peer_sender.clone();
+            Box::pin(async move {
+                let (client_io, peer_io) = tokio::io::duplex(128 * 1024);
+                peer_sender.send(peer_io).map_err(|_| std::io::Error::other("test peer closed"))?;
+                Ok(Box::new(client_io) as BoxTransport)
+            })
+        });
+        let client = Client::new(
+            dialer,
+            Arc::new(RwLock::new(PaddingFactory::new(DEFAULT_SCHEME).unwrap())),
+            Duration::from_secs(60),
+            1,
+            Duration::from_secs(3600),
+        );
+
+        let mut stream = client.create_stream().await.unwrap();
+        let stream_id = stream.id();
+        let mut peer = peer_receiver.recv().await.unwrap();
+        assert_eq!(Frame::read_from(&mut peer).await.unwrap().command, Command::Settings);
+        assert_eq!(Frame::read_from(&mut peer).await.unwrap().command, Command::Syn);
+
+        stream.close().await.unwrap();
+        let fin = loop {
+            let frame = Frame::read_from(&mut peer).await.unwrap();
+            if frame.command == Command::Fin {
+                break frame;
+            }
+        };
+        assert_eq!(fin.command, Command::Fin);
+        assert_eq!(fin.stream_id, stream_id);
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        assert!(client.idle_pool.lock().await.is_empty());
+
+        peer.write_all(&Frame::new(Command::Fin, stream_id).encode().unwrap())
+            .await
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while client.idle_pool.lock().await.is_empty() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("session should become idle after peer FIN");
+
+        client.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn rejected_syn_closes_session_instead_of_pooling_it() {
+        let (peer_sender, mut peer_receiver) = mpsc::unbounded_channel::<tokio::io::DuplexStream>();
+        let dialer: Dialer = Arc::new(move || {
+            let peer_sender = peer_sender.clone();
+            Box::pin(async move {
+                let (client_io, peer_io) = tokio::io::duplex(128 * 1024);
+                peer_sender.send(peer_io).map_err(|_| std::io::Error::other("test peer closed"))?;
+                Ok(Box::new(client_io) as BoxTransport)
+            })
+        });
+        let client = Client::new(
+            dialer,
+            Arc::new(RwLock::new(PaddingFactory::new(DEFAULT_SCHEME).unwrap())),
+            Duration::from_secs(60),
+            1,
+            Duration::from_secs(3600),
+        );
+
+        let stream = client.create_stream().await.unwrap();
+        let session = stream.session().unwrap();
+        let mut peer = peer_receiver.recv().await.unwrap();
+        assert_eq!(Frame::read_from(&mut peer).await.unwrap().command, Command::Settings);
+        assert_eq!(Frame::read_from(&mut peer).await.unwrap().command, Command::Syn);
+        let mut rejection = Frame::new(Command::SynAck, stream.id());
+        rejection.data = b"session stream limit reached".to_vec();
+        peer.write_all(&rejection.encode().unwrap()).await.unwrap();
+
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while !session.is_closed() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("rejected SYN should retire the unusable session");
+        assert!(client.idle_pool.lock().await.is_empty());
+        client.shutdown().await.unwrap();
+    }
 
     #[tokio::test]
     async fn blocked_syn_does_not_block_allocation_on_healthy_session() {
@@ -299,6 +418,7 @@ mod tests {
                 let servers = Arc::clone(&servers);
                 Box::pin(async move {
                     server.run().await?;
+                    spawn_fin_responder(Arc::clone(&server));
                     servers.lock().await.push(server);
                     Ok(transport)
                 })
@@ -316,7 +436,9 @@ mod tests {
         let healthy = client.create_stream().await.unwrap();
         assert_eq!(first.session_id(), second.session_id());
         assert_ne!(second.session_id(), healthy.session_id());
+        let first_session = first.session().unwrap();
         first.close().await.unwrap();
+        wait_for_session_capacity(&first_session).await;
         let gate = Arc::clone(&gates.lock().unwrap()[0]);
         gate.block();
         let blocked = tokio::spawn({
@@ -369,6 +491,7 @@ mod tests {
                         DEFAULT_MAX_SESSION_AGE,
                     );
                     server.run().await?;
+                    spawn_fin_responder(Arc::clone(&server));
                     servers.lock().await.push(server);
                     Ok(Box::new(transport) as BoxTransport)
                 })
@@ -388,7 +511,9 @@ mod tests {
             async move { client.create_stream().await }
         });
         tokio::time::timeout(Duration::from_secs(1), dial_started.notified()).await.unwrap();
+        let first_session_handle = first.session().unwrap();
         first.close().await.unwrap();
+        wait_for_session_capacity(&first_session_handle).await;
         let reused = tokio::time::timeout(Duration::from_secs(1), client.create_stream())
             .await
             .unwrap()
@@ -453,6 +578,7 @@ mod tests {
                         DEFAULT_MAX_SESSION_AGE,
                     );
                     server.run().await?;
+                    spawn_fin_responder(Arc::clone(&server));
                     servers.lock().await.push(server);
                     Ok(Box::new(client_io) as BoxTransport)
                 })
@@ -511,6 +637,7 @@ mod tests {
                     DEFAULT_MAX_SESSION_AGE,
                 );
                 server.run().await?;
+                spawn_fin_responder(Arc::clone(&server));
                 server_sessions.lock().await.push(server);
                 Ok(Box::new(client_io) as BoxTransport)
             })
@@ -560,6 +687,7 @@ mod tests {
                     DEFAULT_MAX_SESSION_AGE,
                 );
                 server.run().await?;
+                spawn_fin_responder(Arc::clone(&server));
                 servers.lock().await.push(Arc::clone(&server));
                 Ok(Box::new(client_io) as BoxTransport)
             })
@@ -613,6 +741,7 @@ mod tests {
                     DEFAULT_MAX_SESSION_AGE,
                 );
                 server.run().await?;
+                spawn_fin_responder(Arc::clone(&server));
                 server_sessions.lock().await.push(server);
                 Ok(Box::new(client_io) as BoxTransport)
             })
@@ -657,6 +786,7 @@ mod tests {
                     DEFAULT_MAX_SESSION_AGE,
                 );
                 server.run().await?;
+                spawn_fin_responder(Arc::clone(&server));
                 servers.lock().await.push(server);
                 Ok(Box::new(client_io) as BoxTransport)
             })
@@ -707,6 +837,7 @@ mod tests {
                     DEFAULT_MAX_SESSION_AGE,
                 );
                 server.run().await?;
+                spawn_fin_responder(Arc::clone(&server));
                 server_sessions.lock().await.push(server);
                 Ok(Box::new(client_io) as BoxTransport)
             })
@@ -767,6 +898,7 @@ mod tests {
                     DEFAULT_MAX_SESSION_AGE,
                 );
                 server.run().await?;
+                spawn_fin_responder(Arc::clone(&server));
                 server_sessions.lock().await.push(server);
                 Ok(Box::new(client_io) as BoxTransport)
             })
