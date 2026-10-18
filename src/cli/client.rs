@@ -1,6 +1,6 @@
 use clap::Parser;
 use percent_encoding::{AsciiSet, CONTROLS, percent_decode_str, utf8_percent_encode};
-use socks5_impl::protocol::{Address, ProxyParameters, ProxyType};
+use socks5_impl::{Address, ProxyParameters, ProxyType};
 use std::path::PathBuf;
 use url::Url;
 use uuid::Uuid;

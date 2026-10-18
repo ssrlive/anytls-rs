@@ -10,7 +10,8 @@ use rustls::{
 };
 use socks_hub_core::{BoxedStream, HttpConnector, UserKey, run_http_service};
 use socks5_impl::{
-    protocol::{Address, AsyncStreamOperation, ProxyType, Reply},
+    Address, AsyncStreamOperation, ProxyType,
+    protocol::Reply,
     server::{AssociatedUdpSocket, ClientConnection, IncomingConnection, UdpAssociate, auth::NoAuth, connection::associate},
 };
 use std::{
@@ -332,7 +333,7 @@ mod listener_tests {
         ListenerProtocol, could_be_http_request_prefix, insecure_tls_enabled, is_http_request, listener_supports_protocol,
         negotiate_socks5_request,
     };
-    use socks5_impl::protocol::ProxyType;
+    use socks5_impl::ProxyType;
     use socks5_impl::server::IncomingConnection;
     use std::{path::Path, sync::Arc, time::Duration};
     use tokio::{
@@ -520,7 +521,7 @@ async fn dial(
 ) -> std::io::Result<BoxTransport> {
     let mn = method_name_unstable!();
     use std::io::Error;
-    let addresses = tokio::net::lookup_host(server.to_string()).await?.collect::<Vec<_>>();
+    let addresses = server.resolve_tokio().await?.collect::<Vec<_>>();
     let tcp = TcpStream::connect(&addresses[..]).await?;
     log::trace!("{mn} -- connecting to AnyTLS server {server}");
     let name = match sni {

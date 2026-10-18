@@ -1,5 +1,5 @@
 use bytes::{BufMut, BytesMut};
-use socks5_impl::protocol::{Address, AsyncStreamOperation, StreamOperation};
+use socks5_impl::{Address, AsyncStreamOperation, StreamOperation};
 use tokio::io::{AsyncRead, AsyncReadExt};
 
 pub const V2_MAGIC_ADDRESS: &str = "sp.v2.udp-over-tcp.arpa";

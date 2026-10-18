@@ -14,7 +14,7 @@ use rustls::{
     ClientConfig, RootCertStore, ServerConfig,
     pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer},
 };
-use socks5_impl::protocol::{Address, AsyncStreamOperation};
+use socks5_impl::{Address, AsyncStreamOperation};
 use std::{
     collections::HashSet,
     net::SocketAddr,
@@ -407,7 +407,7 @@ async fn relay_stream(
     let mn = method_name_unstable!();
     log::debug!("{mn} -- session {session_id} stream {stream_id}: connecting to {destination}");
     let connected = tokio::time::timeout(Duration::from_secs(15), async {
-        let addresses = tokio::net::lookup_host(destination.to_string()).await?.collect::<Vec<_>>();
+        let addresses = destination.resolve_tokio().await?.collect::<Vec<_>>();
         TcpStream::connect(&addresses[..]).await
     })
     .await
