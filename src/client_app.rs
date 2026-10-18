@@ -523,6 +523,7 @@ async fn dial(
     use std::io::Error;
     let addresses = server.resolve_tokio().await?.collect::<Vec<_>>();
     let tcp = TcpStream::connect(&addresses[..]).await?;
+    let _ = tcp.set_nodelay(true);
     log::trace!("{mn} -- connecting to AnyTLS server {server}");
     let name = match sni {
         Some(sni) => ServerName::try_from(sni.to_owned()).map_err(Error::other)?,

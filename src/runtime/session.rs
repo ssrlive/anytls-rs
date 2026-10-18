@@ -16,6 +16,7 @@ use tokio_util::sync::CancellationToken;
 use crate::{CHECK_MARK, Command, Frame, HEADER_OVERHEAD_SIZE, PaddingFactory, from_bytes, runtime::BoxTransport, to_bytes};
 
 const WRITE_TIMEOUT: Duration = Duration::from_secs(15);
+const STREAM_CLOSE_TIMEOUT: Duration = Duration::from_secs(15);
 const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(15);
 const HEARTBEAT_QUEUE_TIMEOUT: Duration = Duration::from_secs(15);
 const HEARTBEAT_TIMEOUT: Duration = Duration::from_secs(10);
@@ -121,6 +122,7 @@ impl StreamState {
     ) {
         let result = loop {
             let message = tokio::select! {
+                biased;
                 message = push_receiver.recv() => message,
                 _ = task_close_token.cancelled() => break Ok(()),
             };
@@ -140,11 +142,28 @@ impl StreamState {
                     break Ok(());
                 }
             };
-            let result = tokio::select! {
-                result = async { task_writer.lock().await.write_all(&data).await } => result,
-                _ = task_close_token.cancelled() => break Ok(()),
+            let write_fut = async { task_writer.lock().await.write_all(&data).await };
+            tokio::pin!(write_fut);
+            let result = if task_close_token.is_cancelled() {
+                match tokio::time::timeout(STREAM_CLOSE_TIMEOUT, &mut write_fut).await {
+                    Ok(result) => result,
+                    Err(_) => break Ok(()),
+                }
+            } else {
+                tokio::select! {
+                    result = &mut write_fut => result,
+                    _ = task_close_token.cancelled() => {
+                        match tokio::time::timeout(STREAM_CLOSE_TIMEOUT, &mut write_fut).await {
+                            Ok(result) => result,
+                            Err(_) => break Ok(()),
+                        }
+                    }
+                }
             };
             if let Err(e) = result {
+                if let Some(session) = session.upgrade() {
+                    session.on_stream_read_closed(stream_id).await;
+                }
                 break Err(e);
             }
         };
@@ -176,6 +195,7 @@ pub struct Session {
     reader: Mutex<Option<tokio::io::ReadHalf<BoxTransport>>>,
     close_token: CancellationToken,
     heart_response: Notify,
+    inbound_activity: Arc<Notify>,
     incoming: Mutex<Option<mpsc::Receiver<Stream>>>,
     incoming_sender: Option<mpsc::Sender<Stream>>,
     idle_sender: Mutex<Option<mpsc::UnboundedSender<Arc<Session>>>>,
@@ -226,6 +246,8 @@ impl Session {
         let writer_padding = Arc::clone(&padding);
         let closed = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let writer_closed = Arc::clone(&closed);
+        let inbound_activity = Arc::new(Notify::new());
+        let writer_inbound_activity = Arc::clone(&inbound_activity);
         tokio::spawn(Self::background_task(
             writer,
             is_client,
@@ -235,6 +257,7 @@ impl Session {
             writer_close_token,
             writer_closed,
             writer_padding,
+            writer_inbound_activity,
         ));
         Self {
             session_id,
@@ -253,6 +276,7 @@ impl Session {
             reader: Mutex::new(Some(reader)),
             close_token,
             heart_response: Notify::new(),
+            inbound_activity,
             incoming: Mutex::new(incoming.map(|(_, receiver)| receiver)),
             incoming_sender,
             idle_sender: Mutex::new(None),
@@ -269,6 +293,7 @@ impl Session {
         writer_close_token: CancellationToken,
         writer_closed: Arc<std::sync::atomic::AtomicBool>,
         writer_padding: Arc<RwLock<PaddingFactory>>,
+        writer_inbound_activity: Arc<Notify>,
     ) {
         let mut writer = Writer {
             transport: writer,
@@ -289,20 +314,38 @@ impl Session {
             };
             let queue_wait = request.enqueued_at.elapsed();
             let write_started = std::time::Instant::now();
-            let result = tokio::select! {
-                biased;
-                _ = writer_close_token.cancelled() => break,
-                result = tokio::time::timeout(WRITE_TIMEOUT, async {
-                    writer.write_conn(request.bytes, &writer_padding).await?;
-                    if request.disable_buffering_after {
-                        writer.buffering = false;
-                        if !writer.buffered.is_empty() {
-                            writer.write_conn(Vec::new(), &writer_padding).await?;
-                        }
+            let write_fut = async {
+                writer.write_conn(request.bytes, &writer_padding).await?;
+                if request.disable_buffering_after {
+                    writer.buffering = false;
+                    if !writer.buffered.is_empty() {
+                        writer.write_conn(Vec::new(), &writer_padding).await?;
                     }
-                    Ok(())
-                }) => result.unwrap_or_else(|_| Err(std::io::Error::new(std::io::ErrorKind::TimedOut, "AnyTLS transport write timed out"))),
+                }
+                Ok(())
             };
+            tokio::pin!(write_fut);
+            let mut cancelled = false;
+            let result = loop {
+                let activity = writer_inbound_activity.notified();
+                tokio::pin!(activity);
+                activity.as_mut().enable();
+                tokio::select! {
+                    biased;
+                    _ = writer_close_token.cancelled() => {
+                        cancelled = true;
+                        break Err(std::io::Error::new(std::io::ErrorKind::BrokenPipe, "session closed"));
+                    }
+                    result = &mut write_fut => break result,
+                    () = activity => continue,
+                    _ = tokio::time::sleep(WRITE_TIMEOUT) => {
+                        break Err(std::io::Error::new(std::io::ErrorKind::TimedOut, "AnyTLS transport write timed out"));
+                    }
+                }
+            };
+            if cancelled {
+                break;
+            }
             let completion = WriteCompletion {
                 result,
                 timings: WriteTimings {
@@ -488,16 +531,23 @@ impl Session {
                 timings.write_duration,
             );
             let response_started = std::time::Instant::now();
-            let result = tokio::select! {
-                _ = close_token.cancelled() => break,
-                result = tokio::time::timeout(HEARTBEAT_TIMEOUT, response.as_mut()) => result,
+            let result = loop {
+                let activity = session.inbound_activity.notified();
+                tokio::pin!(activity);
+                activity.as_mut().enable();
+                tokio::select! {
+                    _ = close_token.cancelled() => return,
+                    () = response.as_mut() => break Ok(()),
+                    () = activity => continue,
+                    _ = tokio::time::sleep(HEARTBEAT_TIMEOUT) => break Err(()),
+                }
             };
             match result {
                 Ok(()) => log::trace!(
                     "{mn} -- Session {session_id} peer={peer_session_id:?} heartbeat response received after {:?}",
                     response_started.elapsed()
                 ),
-                Err(_) => {
+                Err(()) => {
                     log::warn!(
                         "{mn} -- Session {session_id} peer={peer_session_id:?} heartbeat response timed out after {:?}: enqueue_wait={:?} queue_depth={} queue_wait={:?} transport_write={:?}; closing stalled transport",
                         response_started.elapsed(),
@@ -635,7 +685,7 @@ impl Session {
     }
 
     async fn enqueue_fin(&self, stream_id: u32) -> std::io::Result<()> {
-        self.write_control(Frame::new(Command::Fin, stream_id)).await
+        self.enqueue_bytes(Frame::new(Command::Fin, stream_id).encode()?, false).await
     }
 
     pub(crate) async fn close_stream_by_id(self: &Arc<Self>, stream_id: u32) -> std::io::Result<()> {
@@ -801,7 +851,10 @@ impl Session {
             };
             let psid = self.peer_session_id();
             let frame = match result {
-                Ok(Some(frame)) => frame,
+                Ok(Some(frame)) => {
+                    self.inbound_activity.notify_waiters();
+                    frame
+                }
                 Ok(None) => {
                     log::debug!("{mn} -- Session {session_id} peer={psid:?} peer closed transport");
                     break Ok(());
@@ -1892,6 +1945,157 @@ pub(crate) mod tests {
         drop(client_stream);
         let _ = client.shutdown().await;
         let _ = server.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn local_stream_close_drains_queued_tail_after_releasing_stream() {
+        let (client_io, mut peer) = tokio::io::duplex(512 * 1024);
+        let client = Session::new_client(1, Box::new(client_io), padding(), 2, DEFAULT_MAX_SESSION_AGE);
+        client.run().await.unwrap();
+
+        let mut client_stream = client.open_stream().await.unwrap();
+        assert_eq!(Frame::read_from(&mut peer).await.unwrap().command, Command::Settings);
+        assert_eq!(Frame::read_from(&mut peer).await.unwrap().command, Command::Syn);
+        let expected = vec![0x3c; 512 * 1024];
+        for chunk in expected.chunks(16 * 1024) {
+            let mut push = Frame::new(Command::Push, client_stream.id());
+            push.data.extend_from_slice(chunk);
+            peer.write_all(&push.encode().unwrap()).await.unwrap();
+        }
+        peer.write_all(&Frame::new(Command::HeartRequest, 0).encode().unwrap())
+            .await
+            .unwrap();
+        loop {
+            let frame = Frame::read_from(&mut peer).await.unwrap();
+            if frame.command == Command::HeartResponse {
+                break;
+            }
+        }
+
+        client_stream.close().await.unwrap();
+        assert!(!client.streams.lock().await.contains_key(&client_stream.id()));
+
+        let mut received = Vec::with_capacity(expected.len());
+        let mut buffer = [0u8; 8192];
+        loop {
+            let size = tokio::time::timeout(Duration::from_secs(5), client_stream.read(&mut buffer))
+                .await
+                .expect("queued stream data should drain after local close")
+                .unwrap();
+            if size == 0 {
+                break;
+            }
+            received.extend_from_slice(&buffer[..size]);
+        }
+
+        assert_eq!(received, expected);
+        let _ = client.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn peer_transport_close_after_burst_drains_queued_push_frames() {
+        let (client_io, mut peer) = tokio::io::duplex(512 * 1024);
+        let session = Session::new_client(1, Box::new(client_io), padding(), 1, DEFAULT_MAX_SESSION_AGE);
+        session.run().await.unwrap();
+        let stream = session.open_stream().await.unwrap();
+        assert_eq!(Frame::read_from(&mut peer).await.unwrap().command, Command::Settings);
+        assert_eq!(Frame::read_from(&mut peer).await.unwrap().command, Command::Syn);
+
+        let expected = vec![0x7b; 256 * 1024];
+        for chunk in expected.chunks(16 * 1024) {
+            let mut push = Frame::new(Command::Push, stream.id());
+            push.data.extend_from_slice(chunk);
+            peer.write_all(&push.encode().unwrap()).await.unwrap();
+        }
+        drop(peer);
+
+        tokio::time::timeout(Duration::from_secs(1), session.close_token.cancelled())
+            .await
+            .expect("session should close when peer drops transport");
+
+        let mut received = Vec::with_capacity(expected.len());
+        let mut buffer = [0u8; 8192];
+        loop {
+            let size = tokio::time::timeout(Duration::from_secs(1), stream.read(&mut buffer))
+                .await
+                .expect("queued push data should drain after transport EOF")
+                .unwrap();
+            if size == 0 {
+                break;
+            }
+            received.extend_from_slice(&buffer[..size]);
+        }
+        assert_eq!(received, expected);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn inbound_push_activity_resets_unanswered_heartbeat_timeout() {
+        let (client_io, mut peer) = tokio::io::duplex(128 * 1024);
+        let session = Session::new_client(1, Box::new(client_io), padding(), 1, DEFAULT_MAX_SESSION_AGE);
+        session.run().await.unwrap();
+        let stream = session.open_stream().await.unwrap();
+        assert_eq!(Frame::read_from(&mut peer).await.unwrap().command, Command::Settings);
+        assert_eq!(Frame::read_from(&mut peer).await.unwrap().command, Command::Syn);
+        session.peer_version.store(2, std::sync::atomic::Ordering::Release);
+
+        tokio::time::advance(HEARTBEAT_INTERVAL).await;
+        loop {
+            let frame = Frame::read_from(&mut peer).await.unwrap();
+            if frame.command == Command::HeartRequest {
+                break;
+            }
+        }
+
+        for byte in 0..3 {
+            tokio::time::advance(HEARTBEAT_TIMEOUT - Duration::from_secs(2)).await;
+            let mut push = Frame::new(Command::Push, stream.id());
+            push.data.push(byte);
+            peer.write_all(&push.encode().unwrap()).await.unwrap();
+
+            let mut received = [0u8; 1];
+            assert_eq!(stream.read(&mut received).await.unwrap(), 1);
+            assert_eq!(received[0], byte);
+            for _turn in 0..10 {
+                tokio::task::yield_now().await;
+            }
+            assert!(!session.is_closed(), "inbound Push activity should reset the heartbeat timeout");
+        }
+
+        tokio::time::advance(HEARTBEAT_TIMEOUT + Duration::from_secs(1)).await;
+        tokio::task::yield_now().await;
+        assert!(
+            session.is_closed(),
+            "session should close after inbound activity stops and no heartbeat response arrives"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn inbound_activity_resets_blocked_writer_timeout() {
+        let (transport, mut peer, gate) = gated_transport();
+        let session = Session::new_server(1, transport, padding(), 1, DEFAULT_MAX_SESSION_AGE);
+        session.received_settings.store(true, std::sync::atomic::Ordering::Release);
+        session.run().await.unwrap();
+        peer.write_all(&Frame::new(Command::Syn, 1).encode().unwrap()).await.unwrap();
+        let stream = session.accept_stream().await.unwrap();
+
+        gate.block();
+        let write = tokio::spawn(async move { stream.write(b"payload").await });
+        gate.wait_pending().await;
+
+        for _ in 0..3 {
+            tokio::time::advance(WRITE_TIMEOUT - Duration::from_secs(2)).await;
+            peer.write_all(&Frame::new(Command::HeartRequest, 0).encode().unwrap())
+                .await
+                .unwrap();
+            for _turn in 0..10 {
+                tokio::task::yield_now().await;
+            }
+            assert!(!session.is_closed(), "inbound HeartRequest should reset blocked writer timeout");
+        }
+
+        gate.release();
+        assert_eq!(write.await.unwrap().unwrap(), 7);
+        session.shutdown().await.unwrap();
     }
 
     #[tokio::test]
