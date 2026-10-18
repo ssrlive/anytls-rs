@@ -15,9 +15,23 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, macos-latest, windows-latest]
+        include:
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+            do_testing: true
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-musl
+            use_cross: true
+          - os: macos-latest
+            target: x86_64-apple-darwin
+          - os: macos-latest
+            target: aarch64-apple-darwin
+            do_testing: true
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+            do_testing: true
 
-    name: Build and test on ${{ matrix.os }}
+    name: Build and test for ${{ matrix.target }}
     runs-on: ${{ matrix.os }}
 
     steps:
@@ -29,18 +43,53 @@ jobs:
         with:
           components: clippy,rustfmt
 
+      - name: Prepare build tools
+        shell: bash
+        run: |
+          rustup target add ${{ matrix.target }}
+          if [[ "${{ matrix.use_cross }}" == "true" ]]; then
+            cargo install cross --git https://github.com/cross-rs/cross.git --rev 1d07d3f
+          fi
+
       - name: Check formatting
         if: ${{ !cancelled() }}
         run: cargo fmt --all -- --check
 
       - name: Run clippy
         if: ${{ !cancelled() }}
-        run: cargo clippy --workspace -- -D warnings
+        run: cargo clippy -r --workspace -- -D warnings
 
-      - name: Build (all targets)
+      - name: Build targets
         if: ${{ !cancelled() }}
-        run: cargo build --workspace --all-targets --verbose
+        shell: bash
+        run: |
+          if [[ "${{ matrix.use_cross }}" == "true" ]]; then
+            cross build -r --workspace --all-targets --verbose --target ${{ matrix.target }}
+          else
+            cargo build -r --workspace --all-targets --verbose --target ${{ matrix.target }}
+          fi
 
       - name: Run tests
+        if: ${{ !cancelled() && matrix.do_testing }}
+        run: cargo test -r --workspace --verbose --target ${{ matrix.target }}
+
+      - name: Copy binaries to mypubdir
         if: ${{ !cancelled() }}
-        run: cargo test --workspace --verbose
+        shell: bash
+        run: |
+          if [[ "$RUNNER_OS" == "Windows" ]]; then
+            exe_suffix=".exe"
+          else
+            exe_suffix=""
+          fi
+          mkdir -p mypubdir
+          cp "target/${{ matrix.target }}/release/anytls-client${exe_suffix}" mypubdir/
+          cp "target/${{ matrix.target }}/release/anytls-server${exe_suffix}" mypubdir/
+
+      - name: Upload artifacts
+        if: ${{ !cancelled() }}
+        uses: actions/upload-artifact@v7
+        with:
+          name: anytls-rs-${{ matrix.target }}
+          path: mypubdir/
+          if-no-files-found: error
