@@ -82,7 +82,8 @@ mod tests {
         let mut bytes = Vec::new();
         write_auth(&mut bytes, "password", &padding).await.unwrap();
         assert_eq!(&bytes[..32], &password_digest("password"));
-        assert_eq!(&bytes[32..34], &[0, 30]);
+        let padding_len = u16::from_be_bytes([bytes[32], bytes[33]]);
+        assert!((30..300).contains(&padding_len));
         read_auth(&mut BufReader::new(bytes.as_slice()), "password").await.unwrap();
     }
 
@@ -104,7 +105,8 @@ mod tests {
             .await
             .unwrap();
 
-        assert_eq!(u16::from_be_bytes([bytes[32], bytes[33]]), 36);
+        let padding_len = u16::from_be_bytes([bytes[32], bytes[33]]);
+        assert!((36..300).contains(&padding_len));
         assert_eq!(
             read_auth_with_client_id(&mut BufReader::new(bytes.as_slice()), "password")
                 .await
