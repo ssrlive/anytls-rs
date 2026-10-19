@@ -4,7 +4,7 @@ use rand::RngExt;
 use super::string_map::{self, StringMap};
 
 pub const CHECK_MARK: i32 = -1;
-pub const DEFAULT_SCHEME: &[u8] = b"stop=8\n0=30-30\n1=100-400\n2=400-500,c,500-1000,c,500-1000,c,500-1000,c,500-1000\n3=9-9,500-1000\n4=500-1000\n5=500-1000\n6=500-1000\n7=500-1000";
+pub const DEFAULT_SCHEME: &[u8] = b"stop=8\n0=30-300\n1=100-400\n2=400-500,c,500-1000,c,500-1000,c,500-1000,c,500-1000\n3=9-9,500-1000\n4=500-1000\n5=500-1000\n6=500-1000\n7=500-1000";
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct PaddingFactory {
@@ -73,8 +73,10 @@ mod tests {
     fn matches_default_scheme_metadata_and_ranges() {
         let factory = PaddingFactory::new(DEFAULT_SCHEME).unwrap();
         assert_eq!(factory.stop, 8);
-        assert_eq!(factory.md5, "75cff2ad89aadf5e257059ee571ebe11");
-        assert_eq!(factory.generate_record_payload_sizes(0), vec![30]);
+        assert_eq!(factory.md5, "f585d57a3596aef04b6c7bf0e52c8ef1");
+        let padding0 = factory.generate_record_payload_sizes(0);
+        assert_eq!(padding0.len(), 1);
+        assert!((30..300).contains(&padding0[0]));
         assert_eq!(factory.generate_record_payload_sizes(2).len(), 9);
         assert!(factory.generate_record_payload_sizes(2).contains(&CHECK_MARK));
     }
