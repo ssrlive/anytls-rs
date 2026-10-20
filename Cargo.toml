@@ -117,12 +117,12 @@ serde = { version = "1.0.229", features = ["derive"], optional = true }
 serde_json = { version = "1.0.154", optional = true }
 shlex = { version = "2.0.1", optional = true }
 sha2 = { version = "0.11.1", optional = true }
-socks-hub = { version = "0.2.12", default-features = false, optional = true }
-socks5-impl = { version = "0.10.2", features = [
+socks-hub = { version = "0.2.13", default-features = false, optional = true }
+socks5-impl = { version = "0.10.3", features = [
     "server",
     "serde",
 ], optional = true }
-tokio = { version = "1.53.3", default-features = false, optional = true }
+tokio = { version = "1.54.0", default-features = false, optional = true }
 tokio-rustls = { version = "0.26.6", optional = true }
 tokio-util = { version = "0.7.20", features = ["rt"], optional = true }
 url = { version = "2.5.8", features = ["serde"], optional = true }
@@ -130,7 +130,7 @@ uuid = { version = "1.28.0", features = ["serde", "v4"], optional = true }
 x509-parser = { version = "0.18.1", optional = true }
 
 [dev-dependencies]
-tokio = { version = "1.53.3", default-features = false, features = [
+tokio = { version = "1.54.0", default-features = false, features = [
     "io-util",
     "macros",
     "rt",

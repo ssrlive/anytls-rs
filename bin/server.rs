@@ -408,7 +408,7 @@ async fn relay_stream(
     let mn = method_name_unstable!();
     log::debug!("{mn} -- session {session_id} stream {stream_id}: connecting to {destination}");
     let connected = tokio::time::timeout(Duration::from_secs(15), async {
-        let addresses = destination.resolve_tokio().await?.collect::<Vec<_>>();
+        let addresses = destination.resolve_using_tokio().await?.collect::<Vec<_>>();
         TcpStream::connect(&addresses[..]).await
     })
     .await

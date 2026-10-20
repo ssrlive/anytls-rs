@@ -521,7 +521,7 @@ async fn dial(
 ) -> std::io::Result<BoxTransport> {
     let mn = method_name_unstable!();
     use std::io::Error;
-    let addresses = server.resolve_tokio().await?.collect::<Vec<_>>();
+    let addresses = server.resolve_using_tokio().await?.collect::<Vec<_>>();
     let tcp = TcpStream::connect(&addresses[..]).await?;
     let _ = tcp.set_nodelay(true);
     log::trace!("{mn} -- connecting to AnyTLS server {server}");
@@ -561,7 +561,7 @@ async fn handle_socks5(incoming: IncomingConnection, client: Arc<Client>, contex
     let stream = client.create_stream().await?;
     let mut remote = TrafficCounter::new(StreamIo::new(stream), TrafficDirection::Tx);
     target.write_to_async_stream(&mut remote).await?;
-    let ready = match connect.reply(Reply::Succeeded, Address::unspecified()).await {
+    let ready = match connect.reply(Reply::Succeeded, Address::unspecified_v4()).await {
         Ok(ready) => ready,
         Err(error) if relay::is_peer_disconnect(&error) => {
             log::debug!("{mn} -- Proxy peer disconnected before SOCKS5 reply: {}: {error}", context.label());
@@ -598,7 +598,7 @@ async fn handle_udp_associate(associate: UdpAssociate<associate::NeedReply>, cli
     {
         Ok(result) => result,
         Err(error) => {
-            let mut reply = associate.reply(Reply::GeneralFailure, Address::unspecified()).await?;
+            let mut reply = associate.reply(Reply::GeneralFailure, Address::unspecified_v4()).await?;
             reply.shutdown().await?;
             return Err(error);
         }
@@ -606,7 +606,7 @@ async fn handle_udp_associate(associate: UdpAssociate<associate::NeedReply>, cli
     let mut proxy_reader = match client.create_stream().await {
         Ok(stream) => StreamIo::new(stream),
         Err(error) => {
-            let mut reply = associate.reply(Reply::GeneralFailure, Address::unspecified()).await?;
+            let mut reply = associate.reply(Reply::GeneralFailure, Address::unspecified_v4()).await?;
             reply.shutdown().await?;
             return Err(error);
         }
@@ -614,16 +614,16 @@ async fn handle_udp_associate(associate: UdpAssociate<associate::NeedReply>, cli
     let proxy_stream = proxy_reader.stream();
 
     let outer_address: Vec<u8> = uot_sentinel_destination().into();
-    let request: Vec<u8> = UotRequest::new(UotMode::Datagram, Address::unspecified()).into();
+    let request: Vec<u8> = UotRequest::new(UotMode::Datagram, Address::unspecified_v4()).into();
     if let Err(error) = write_stream_all(&proxy_stream, &outer_address).await {
         let _ = proxy_stream.shutdown_write_by_send_fin_to_remote().await;
-        let mut reply = associate.reply(Reply::GeneralFailure, Address::unspecified()).await?;
+        let mut reply = associate.reply(Reply::GeneralFailure, Address::unspecified_v4()).await?;
         reply.shutdown().await?;
         return Err(error);
     }
     if let Err(error) = write_stream_all(&proxy_stream, &request).await {
         let _ = proxy_stream.shutdown_write_by_send_fin_to_remote().await;
-        let mut reply = associate.reply(Reply::GeneralFailure, Address::unspecified()).await?;
+        let mut reply = associate.reply(Reply::GeneralFailure, Address::unspecified_v4()).await?;
         reply.shutdown().await?;
         return Err(error);
     }
