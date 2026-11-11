@@ -58,6 +58,8 @@ The Rust Client also applies a configurable maximum Session age through `Client:
 
 Each flow reserves an idle Session or dials independently; there is no client-wide lock serializing stream allocation or Session creation. A stalled SYN write therefore cannot hold an allocation lock, and a stalled dial does not prevent another request from reusing an idle Session or starting its own dial. Each new dial has a 15-second deadline.
 
+The application client bounds local proxy connections and upstream Sessions separately. On Unix each limit is calculated from the soft file-descriptor limit, reserving 32 descriptors and allocating one connection per three remaining descriptors, up to 128; other platforms use 128. Excess connections wait for capacity, including HTTP CONNECT upgrades, and a listener that encounters descriptor exhaustion logs the error and retries. When the Session limit is reached, a waiting request can reuse a newly idle Session. Cancelling a Session allocation closes the partially opened Session and releases its transport.
+
 Transport write requests have a 15-second deadline. A timeout closes the whole Session because a partially written frame cannot safely be resumed on that transport. Session shutdown cancels an in-flight write and releases both transport halves, even when a closed Session remains referenced by the pool.
 
 After a client receives version-2 server settings, it sends a heartbeat every 15 seconds. Each probe has a 10-second deadline covering both transmission and the response. Missing responses close the Session; version-1 peers are not proactively probed. Control replies are queued without waiting for transport writes in the receive loop. A full control queue closes the Session instead of blocking that loop or silently dropping a required reply.
@@ -81,8 +83,8 @@ A Session enters the idle pool after its only active logical stream closes.
 
 Both closure paths check whether the Session can return to the pool:
 
-- Local `Stream::close` sends `FIN`, removes the stream, and checks whether the Session has no remaining streams.
-- Dropping a `Stream` schedules the same cleanup on the Tokio runtime, removes the stream without waiting for the peer FIN, and then best-effort sends `FIN`.
+- Local `Stream::close` sends `FIN`. On the client, the Session waits for the peer FIN and inbound data to drain before reuse, or closes after a 15-second close timeout.
+- Dropping a `Stream` schedules cleanup on the Tokio runtime and best-effort sends `FIN`; client Sessions follow the same close-handshake timeout.
 - Remote `FIN` closes the local read half after queued data drains. The stream remains available for reverse-direction writes until the local side also sends `FIN`; then it is removed and the Session may return to the idle pool.
 - Remote `SYNACK` failure closes the local stream endpoint, removes the stream, and performs the same check.
 

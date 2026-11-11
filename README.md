@@ -73,6 +73,12 @@ Start a local mixed SOCKS5 + HTTP CONNECT proxy (default listen address: `mixed:
 `--insecure` is appropriate only for the self-signed local example. For a trusted certificate,
 configure the client's system trust or provide `--root-cert FILE` instead.
 
+The client bounds concurrent local connections and upstream Sessions to avoid exhausting file
+descriptors. On Unix, each limit is one third of the soft descriptor limit after reserving 32
+descriptors, capped at 128 and with a minimum of one; on other platforms it is 128. Connections
+above the limit wait for capacity, and an exhausted listener retries rather than exiting. Other
+process activity can still consume descriptors, so increase the process limit when necessary.
+
 The server can also be configured with a single AnyTLS URI on the client:
 
 ```bash

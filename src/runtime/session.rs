@@ -1774,7 +1774,8 @@ pub(crate) mod tests {
                     let data = vec![0xa5; 16 * 1024];
                     for _chunk in 0..256 {
                         assert_eq!(writer.write(&data).await.unwrap(), data.len());
-                        tokio::task::yield_now().await;
+                        // Keep the burst below the inbound queue limit on slow CI runners.
+                        tokio::time::sleep(Duration::from_millis(5)).await;
                     }
                 });
                 transfers.spawn(async move {
@@ -1782,7 +1783,11 @@ pub(crate) mod tests {
                     let mut data = vec![0; 16 * 1024];
                     while remaining > 0 {
                         let size = endpoint.read(&mut data).await.unwrap();
-                        assert!(size > 0 && size <= remaining);
+                        assert!(
+                            size > 0 && size <= remaining,
+                            "stream {} read {size} bytes with {remaining} expected",
+                            endpoint.id()
+                        );
                         assert!(data[..size].iter().all(|byte| *byte == 0xa5));
                         remaining -= size;
                     }

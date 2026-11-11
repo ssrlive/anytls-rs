@@ -23,6 +23,7 @@ use std::{
 };
 use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt, ReadBuf};
 use tokio::net::{TcpStream, UdpSocket};
+use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 use tokio_rustls::TlsConnector;
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
@@ -82,12 +83,16 @@ pub async fn run_client(
         let server = server.clone();
         Box::pin(async move { dial(&server, sni.as_deref(), &password, padding, tls_config, client_id).await })
     });
-    let client = Client::new(
+    let connection_limit = proxy_connection_limit();
+    log::info!("{mn} -- limiting local proxy connections and upstream sessions to {connection_limit}");
+    let client = Client::new_with_session_limit(
         dialer,
         padding,
         std::time::Duration::from_secs(30),
         std::time::Duration::from_secs(3600),
+        connection_limit,
     );
+    let connection_slots = Arc::new(Semaphore::new(connection_limit));
     let connector_client = Arc::clone(&client);
     let connector: HttpConnector = Arc::new(move |destination: Address| {
         let client = Arc::clone(&connector_client);
@@ -103,16 +108,28 @@ pub async fn run_client(
     let accept_result = loop {
         tokio::select! {
             _ = cancel_token.cancelled() => break Ok(()),
-            result = listener.accept() => {
-                let (stream, _) = match result {
+            result = async {
+                let permit = Arc::clone(&connection_slots).acquire_owned().await.expect("connection semaphore is never closed");
+                listener.accept().await.map(|connection| (connection, permit))
+            } => {
+                let ((stream, _), permit) = match result {
                     Ok(connection) => connection,
+                    Err(error) if descriptor_limit_reached(&error) => {
+                        log::warn!("{mn} -- Proxy listener temporarily out of file descriptors: {error}; retrying");
+                        tokio::select! {
+                            _ = cancel_token.cancelled() => break Ok(()),
+                            _ = tokio::time::sleep(std::time::Duration::from_secs(1)) => {}
+                        }
+                        continue;
+                    }
                     Err(error) => break Err(error),
                 };
                 let client = client.clone();
                 let connector = connector.clone();
                 let context = Arc::new(ProxyConnectionContext::new(stream.peer_addr().ok()));
+                let permit = Arc::new(permit);
                 connection_tasks.spawn(async move {
-                    if let Err(error) = handle_listener_stream(stream, client, connector, proxy_type, Arc::clone(&context)).await {
+                    if let Err(error) = handle_listener_stream(stream, client, connector, proxy_type, Arc::clone(&context), permit).await {
                         log::warn!("{} -- Proxy connection failed: {}: {error}", method_name_unstable!(), context.label());
                     }
                 });
@@ -145,6 +162,50 @@ pub async fn run_client(
 
     accept_result?;
     cleanup_result
+}
+
+const MAX_PROXY_CONNECTIONS: usize = 128;
+const RESERVED_FILE_DESCRIPTORS: usize = 32;
+
+fn connection_limit_for_descriptors(limit: usize) -> usize {
+    (limit.saturating_sub(RESERVED_FILE_DESCRIPTORS) / 3).clamp(1, MAX_PROXY_CONNECTIONS)
+}
+
+#[cfg(unix)]
+fn proxy_connection_limit() -> usize {
+    let mut limit = libc::rlimit { rlim_cur: 0, rlim_max: 0 };
+    // getrlimit initializes the supplied rlimit on success.
+    if unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &mut limit) } != 0 {
+        log::warn!(
+            "Failed to read file descriptor limit: {}; using conservative connection limit",
+            std::io::Error::last_os_error()
+        );
+        return connection_limit_for_descriptors(128);
+    }
+    connection_limit_for_descriptors(usize::try_from(limit.rlim_cur).unwrap_or(usize::MAX))
+}
+
+#[cfg(not(unix))]
+fn proxy_connection_limit() -> usize {
+    connection_limit_for_descriptors(usize::MAX)
+}
+
+fn descriptor_limit_reached(error: &std::io::Error) -> bool {
+    #[cfg(unix)]
+    {
+        matches!(error.raw_os_error(), Some(libc::EMFILE | libc::ENFILE))
+    }
+    #[cfg(windows)]
+    {
+        const ERROR_TOO_MANY_OPEN_FILES: i32 = 4;
+        const WSAEMFILE: i32 = 10024;
+        matches!(error.raw_os_error(), Some(ERROR_TOO_MANY_OPEN_FILES | WSAEMFILE))
+    }
+    #[cfg(not(any(unix, windows)))]
+    {
+        let _ = error;
+        false
+    }
 }
 
 struct ProxyConnectionContext {
@@ -184,6 +245,7 @@ async fn handle_listener_stream(
     connector: HttpConnector,
     proxy_type: ProxyType,
     context: Arc<ProxyConnectionContext>,
+    permit: Arc<OwnedSemaphorePermit>,
 ) -> std::io::Result<()> {
     let mn = method_name_unstable!();
     let c_l = context.label();
@@ -228,7 +290,12 @@ async fn handle_listener_stream(
             let request_context = Arc::clone(&context);
             let contextual_connector: HttpConnector = Arc::new(move |destination: Address| {
                 request_context.set_target(destination.to_string());
-                connector(destination)
+                let future = connector(destination);
+                let permit = Arc::clone(&permit);
+                Box::pin(async move {
+                    let inner = future.await?;
+                    Ok(Box::new(LimitedHttpStream { inner, _permit: permit }) as BoxedStream)
+                })
             });
             run_http_service(stream, contextual_connector, UserKey::default()).await
         }
@@ -249,6 +316,31 @@ async fn handle_listener_stream(
             }
             stream.shutdown().await
         }
+    }
+}
+
+struct LimitedHttpStream {
+    inner: BoxedStream,
+    _permit: Arc<OwnedSemaphorePermit>,
+}
+
+impl AsyncRead for LimitedHttpStream {
+    fn poll_read(mut self: Pin<&mut Self>, cx: &mut Context<'_>, buf: &mut ReadBuf<'_>) -> Poll<std::io::Result<()>> {
+        Pin::new(&mut self.inner).poll_read(cx, buf)
+    }
+}
+
+impl AsyncWrite for LimitedHttpStream {
+    fn poll_write(mut self: Pin<&mut Self>, cx: &mut Context<'_>, buf: &[u8]) -> Poll<std::io::Result<usize>> {
+        Pin::new(&mut self.inner).poll_write(cx, buf)
+    }
+
+    fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+        Pin::new(&mut self.inner).poll_flush(cx)
+    }
+
+    fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+        Pin::new(&mut self.inner).poll_shutdown(cx)
     }
 }
 
@@ -329,16 +421,81 @@ fn http_methods() -> &'static [&'static [u8]] {
 #[cfg(test)]
 mod listener_tests {
     use super::{
-        ListenerProtocol, could_be_http_request_prefix, insecure_tls_enabled, is_http_request, listener_supports_protocol,
-        negotiate_socks5_request,
+        ListenerProtocol, ProxyConnectionContext, connection_limit_for_descriptors, could_be_http_request_prefix, descriptor_limit_reached,
+        handle_listener_stream, insecure_tls_enabled, is_http_request, listener_supports_protocol, negotiate_socks5_request,
     };
+    use crate::{Client, DEFAULT_MAX_SESSION_AGE, DEFAULT_SCHEME, Dialer, PaddingFactory};
+    use socks_hub_core::{BoxedStream, HttpConnector};
     use socks5_impl::ProxyType;
     use socks5_impl::server::IncomingConnection;
     use std::{path::Path, sync::Arc, time::Duration};
     use tokio::{
         io::{AsyncReadExt, AsyncWriteExt},
         net::{TcpListener, TcpStream},
+        sync::{RwLock, Semaphore},
     };
+
+    #[test]
+    fn connection_limit_reserves_descriptors_and_caps_concurrency() {
+        assert_eq!(connection_limit_for_descriptors(64), 10);
+        assert_eq!(connection_limit_for_descriptors(256), 74);
+        assert_eq!(connection_limit_for_descriptors(10_000), 128);
+        assert_eq!(connection_limit_for_descriptors(16), 1);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn identifies_descriptor_exhaustion_errors() {
+        assert!(descriptor_limit_reached(&std::io::Error::from_raw_os_error(libc::EMFILE)));
+        assert!(descriptor_limit_reached(&std::io::Error::from_raw_os_error(libc::ENFILE)));
+        assert!(!descriptor_limit_reached(&std::io::Error::from(
+            std::io::ErrorKind::ConnectionAborted
+        )));
+    }
+
+    #[tokio::test]
+    async fn http_connect_upgrade_keeps_connection_slot_until_tunnel_closes() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let mut peer = TcpStream::connect(listener.local_addr().unwrap()).await.unwrap();
+        let (socket, _) = listener.accept().await.unwrap();
+        let (upstream, remote) = tokio::io::duplex(1024);
+        let upstream = Arc::new(std::sync::Mutex::new(Some(upstream)));
+        let connector: HttpConnector = Arc::new(move |_| {
+            let stream = upstream.lock().unwrap().take().unwrap();
+            Box::pin(async move { Ok(Box::new(stream) as BoxedStream) })
+        });
+        let dialer: Dialer = Arc::new(|| Box::pin(std::future::pending()));
+        let client = Client::new(
+            dialer,
+            Arc::new(RwLock::new(PaddingFactory::new(DEFAULT_SCHEME).unwrap())),
+            Duration::from_secs(30),
+            DEFAULT_MAX_SESSION_AGE,
+        );
+        let slots = Arc::new(Semaphore::new(1));
+        let permit = Arc::new(Arc::clone(&slots).acquire_owned().await.unwrap());
+        let context = Arc::new(ProxyConnectionContext::new(socket.peer_addr().ok()));
+        let task = tokio::spawn(handle_listener_stream(socket, client, connector, ProxyType::Http, context, permit));
+        peer.write_all(b"CONNECT example.com:443 HTTP/1.1\r\nHost: example.com:443\r\n\r\n")
+            .await
+            .unwrap();
+        let mut response = [0; 512];
+        let len = tokio::time::timeout(Duration::from_secs(1), peer.read(&mut response))
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(std::str::from_utf8(&response[..len]).unwrap().contains("200"));
+        tokio::time::timeout(Duration::from_secs(1), task).await.unwrap().unwrap().unwrap();
+        assert_eq!(slots.available_permits(), 0);
+        drop(peer);
+        drop(remote);
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while slots.available_permits() != 1 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("HTTP tunnel must release its connection slot");
+    }
 
     #[test]
     fn root_certificate_forces_secure_tls_even_when_insecure_is_true() {

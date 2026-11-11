@@ -53,25 +53,32 @@ jobs:
 
       - name: Check formatting
         if: ${{ !cancelled() }}
-        run: cargo fmt --all -- --check
+        shell: bash
+        run: |
+          cargo fmt --all -- --check
 
       - name: Run clippy
         if: ${{ !cancelled() }}
-        run: cargo clippy -r --workspace -- -D warnings
+        shell: bash
+        run: |
+          cargo clippy -r --workspace -- -D warnings
+          cargo clippy -r --workspace --all-features -- -D warnings
 
       - name: Build targets
         if: ${{ !cancelled() }}
         shell: bash
         run: |
           if [[ "${{ matrix.use_cross }}" == "true" ]]; then
-            cross build -r --workspace --all-targets --verbose --target ${{ matrix.target }}
+            cross build -r --workspace --all-features --all-targets --verbose --target ${{ matrix.target }}
           else
-            cargo build -r --workspace --all-targets --verbose --target ${{ matrix.target }}
+            cargo build -r --workspace --all-features --all-targets --verbose --target ${{ matrix.target }}
           fi
 
       - name: Run tests
         if: ${{ !cancelled() && matrix.do_testing }}
-        run: cargo test -r --workspace --verbose --target ${{ matrix.target }}
+        shell: bash
+        run: |
+          cargo test -r --workspace --all-features --verbose --target ${{ matrix.target }}
 
       - name: Copy binaries to mypubdir
         if: ${{ !cancelled() }}

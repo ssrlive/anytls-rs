@@ -48,6 +48,7 @@ panel-sync = [
 client = [
     "runtime",
     "uot",
+    "dep:libc",
     "dep:clap",
     "dep:env_logger",
     "dep:percent-encoding",
@@ -98,6 +99,7 @@ ctrlc2 = { version = "4.0.0", optional = true, default-features = false, feature
 ] }
 env_logger = { version = "0.11.11", optional = true }
 log = { version = "0.4.34", features = ["serde"], optional = true }
+libc = { version = "0.2", optional = true }
 md-5 = { version = "0.11.0", optional = true }
 method_name = { version = "0.3.4", default-features = false, features = [
     "unstable",
